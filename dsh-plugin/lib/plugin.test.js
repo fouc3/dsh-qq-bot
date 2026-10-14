@@ -543,7 +543,7 @@ test('端到端：发送 / 延迟发送 / 停止 / 归档', async (t) => {
 	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-2', msgId: 'M1' })
 	await waitFor(async () => (await pumpQueue(boot.socketPath)).length > 0)
 
-	// 发送：不打断（agent 处于 idle，仍然只投递一次）
+	// 发送：单次投递（和输入态的「发送」同义＝会打断目标会话正在跑的轮次）
 	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '发送 session-1 帮我看下', msgId: 'M2' })
 	await waitFor(() => agent.followed.length === 1)
 	assert.equal(agent.followed[0].content[0].text, '帮我看下')
@@ -558,13 +558,18 @@ test('端到端：发送 / 延迟发送 / 停止 / 归档', async (t) => {
 	assert.match(receipt.args.content, /已登记/)
 	assert.equal(agent.followed.length, 1, '延迟发送不该立即投递')
 
-	// 无参延迟发送 → 回用法（不再"查看待发消息"）
+	// 无参延迟发送 → 和 `发送` **共用同一套输入态面板**（只是 mode=delay）
 	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '延迟发送', msgId: 'M4' })
-	const usage = await waitFor(async () => {
+	const delayCard = await waitFor(async () => {
 		const list = await pumpQueue(boot.socketPath)
-		return list.find((c) => c.kind === 'send_c2c' && /作用：/.test(String(c.args.content))) ?? null
+		return list.filter((c) => c.kind === 'send_c2c' && c.args.keyboard).at(-1) ?? null
 	})
-	assert.match(usage.args.content, /延迟发送 <会话id> <内容>/)
+	assert.match(delayCard.args.content, /输入框（延迟投递）/)
+	assert.match(delayCard.args.content, /不打断/)
+	assert.match(delayCard.args.content, /session-2/, '裸发作用于当前绑定会话')
+	const delayLabels = delayCard.args.keyboard.content.rows.flatMap((r) => r.buttons).map((b) => b.render_data.label)
+	assert.ok(delayLabels.includes('延迟发送'), `延迟输入态的主按钮应叫「延迟发送」，实际：${delayLabels.join('/')}`)
+	assert.equal(agent.followed.length, 1, '进输入态不该投递')
 
 	// 停止（无参=当前会话 session-2；此刻 session-2 没有活 agent，应给出明确失败提示）
 	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '停止', msgId: 'M5' })

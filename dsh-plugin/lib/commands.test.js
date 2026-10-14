@@ -44,8 +44,8 @@ function makeRunner({ seed = {} } = {}) {
 		reply: async ({ openid, content }) => calls.replies.push({ openid, content }),
 		showSessionCard: async ({ openid, dir }) => calls.cards.push({ openid, dir }),
 		deliver: async (req) => calls.delivered.push(req),
-		beginInput: async ({ openid, sessionId }) => {
-			calls.inputs.push({ openid, sessionId })
+		beginInput: async ({ openid, sessionId, mode = 'send' }) => {
+			calls.inputs.push({ openid, sessionId, ...(mode === 'send' ? {} : { mode }) })
 			return { ok: true }
 		},
 		stopSession: async (sessionId) => {
@@ -74,7 +74,7 @@ test('parseCommand：可带一个前导斜杠，非命令返回 null', () => {
 	assert.equal(parseCommand('/'), null)
 	assert.equal(parseCommand(''), null)
 	assert.equal(requiresArgs('发送'), false, '裸发 `发送` 要能进输入态，所以不算"必须带参"')
-	assert.equal(requiresArgs('延迟发送'), true)
+	assert.equal(requiresArgs('延迟发送'), false, '裸发 `延迟发送` 也要能进输入态')
 	assert.equal(requiresArgs('停止'), false)
 })
 
@@ -136,7 +136,7 @@ test('发送：裸发进输入态；缺内容回用法；带目标与内容则�
 	assert.equal(calls.delivered.length, 1)
 	assert.equal(calls.delivered[0].sessionId, 'session-2')
 	assert.equal(calls.delivered[0].text, '帮我看下这个')
-	assert.equal(calls.delivered[0].interrupt, false, '发送不打断')
+	assert.equal(calls.delivered[0].interrupt, true, '发送＝打断当前轮次（不想打断用 延迟发送）')
 	assert.match(calls.replies.at(-1).content, /已投递/)
 })
 
@@ -159,16 +159,34 @@ test('发送：没绑定会话时裸发不进输入态，而是回用法', async
 	assert.match(calls.replies.at(-1).content, /没有绑定会话/)
 })
 
-test('延迟发送：带目标与内容登记；无参/缺内容回用法', async () => {
+test('延迟发送：与发送共用输入态面板（mode=delay）；带内容则直接登记', async () => {
 	const { runner, calls, state: s } = makeRunner({ seed: boundSeed() })
 
+	// 裸发 → 进当前会话的**延迟**输入态
 	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('延迟发送'))
-	assert.match(calls.replies.at(-1).content, /用法/)
+	assert.deepEqual(calls.inputs, [{ openid: 'U1', sessionId: 'session-1', mode: 'delay' }])
 
+	// 只给目标 → 进那个会话的延迟输入态
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('延迟发送 session-2'))
+	assert.deepEqual(calls.inputs.at(-1), { openid: 'U1', sessionId: 'session-2', mode: 'delay' })
+
+	// 带内容 → 直接登记（覆盖该会话原有待发消息）
 	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('延迟发送 session-2 打完了叫我'))
 	assert.equal(s.delayedOf('session-2').content, '打完了叫我')
 	assert.equal(s.delayedOf('session-2').openid, 'U1')
 	assert.match(calls.replies.at(-1).content, /已登记/)
+})
+
+test('延迟发送：目标不存在时报错、认不出目标时回用法（都不会误进输入态）', async () => {
+	const { runner, calls } = makeRunner({ seed: boundSeed() })
+
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('延迟发送 hello'))
+	assert.equal(calls.inputs.length, 0)
+	assert.match(calls.replies.at(-1).content, /用法/)
+
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('延迟发送 session-nope'))
+	assert.equal(calls.inputs.length, 0)
+	assert.match(calls.replies.at(-1).content, /没找到会话|目录/)
 })
 
 test('停止/归档：无参作用于当前会话，带参作用于指定会话', async () => {

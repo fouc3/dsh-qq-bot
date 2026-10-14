@@ -52,11 +52,13 @@ export const COMMANDS = [
 	},
 	{
 		name: '延迟发送',
-		desc: '本轮正常结束后投递',
-		requiresArgs: true,
-		purpose: '为指定会话登记一条待发消息，等该会话当前这一轮 AI 正常结束后再投递；每个会话同时只有一条（重复登记会覆盖）。',
-		usage: '延迟发送 <会话id> <内容>',
-		usageAlt: '延迟发送 <目录> <会话id> <内容>',
+		desc: '进输入态（本轮结束后投递）',
+		purpose:
+			'和 `发送` **共用同一套输入态面板**，区别只有投递时机：**不打断**当前轮次，等它**正常结束后**再投递' +
+			'（被停止/被顶替/出错都不投）。`延迟发送 <会话id> <内容>` 是直接登记（覆盖该会话原有待发消息）。',
+		usage: '延迟发送',
+		usageAlt: '延迟发送 <会话id>                # 进那个会话的延迟输入态',
+		usageAlt2: '延迟发送 <会话id> <内容>         # 直接登记（不带附件）',
 	},
 ]
 
@@ -305,15 +307,18 @@ export function createCommandRunner(deps) {
 			await deps.beginInput?.({ openid, sessionId: target.sessionId, replyContext })
 			return { handled: true }
 		}
+		// 单次投递和输入态的「发送」同义：**打断**目标会话正在跑的轮次，立刻投过去。
+		// 不想打断就用 `延迟发送`（本轮正常结束后才投）。
 		await deps.deliver({
 			sessionId: target.sessionId,
 			openid,
 			text: target.content,
-			interrupt: false,
+			interrupt: true,
+			origin: 'qq',
 		})
 		await deps.reply({
 			openid,
-			content: `已投递到 ${sessions.describe(target.sessionId)}（不打断，忙则排队；这种单次投递不带附件，附件请走输入态）。`,
+			content: `已投递到 ${sessions.describe(target.sessionId)}（会打断正在跑的轮次；不想打断就用 \`延迟发送\`。这种单次投递不带附件，附件请走输入态）。`,
 			markdown: true,
 			replyContext,
 		})
@@ -365,18 +370,41 @@ export function createCommandRunner(deps) {
 	}
 
 	async function delaySend({ openid, replyContext }, parsed) {
+		// 裸发 `延迟发送` / 只给目标：和 `发送` **共用同一套输入态面板**，
+		// 区别只是投递时机（本轮正常结束后），所以这里同样进输入态，只是 mode=delay。
+		if (parsed.tokens.length === 0) {
+			const sessionId = currentSessionId(openid)
+			if (!sessionId || sessionId === 'none') {
+				await deps.reply({
+					openid,
+					content:
+						'当前没有绑定会话，没法进入输入态。先 `切换会话`，或用 `延迟发送 <会话id>` 进那个会话的输入态，' +
+						'或用 `延迟发送 <会话id> <内容>` 直接登记。',
+					markdown: true,
+					replyContext,
+				})
+				return { handled: true }
+			}
+			await deps.beginInput?.({ openid, sessionId, replyContext, mode: 'delay' })
+			return { handled: true }
+		}
 		const target = sessions.resolveRef(parsed.tokens)
 		if (target?.error) {
 			await deps.reply({ openid, content: `${target.error}\n\n${usageText('延迟发送')}`, replyContext })
 			return { handled: true }
 		}
-		if (!target || target.sessionId === 'none' || !target.content) {
+		if (!target || target.sessionId === 'none') {
 			await deps.reply({ openid, content: usageText('延迟发送'), replyContext })
 			return { handled: true }
 		}
 		const session = sessions.get(target.sessionId)
 		if (!session) {
 			await deps.reply({ openid, content: `没找到会话 \`${target.sessionId}\`。`, markdown: true, replyContext })
+			return { handled: true }
+		}
+		if (!target.content) {
+			// 只给了目标：进那个会话的**延迟**输入态（和 `发送 <会话id>` 对称）。
+			await deps.beginInput?.({ openid, sessionId: target.sessionId, replyContext, mode: 'delay' })
 			return { handled: true }
 		}
 		state.setDelayed(target.sessionId, {

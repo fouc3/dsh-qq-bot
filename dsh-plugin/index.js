@@ -343,7 +343,7 @@ export function apply(ctx, rawConfig) {
 
 	// ── 输入态（"输入框"）：附件先入列，点卡片上的「发送」才投递 ──────────────
 	/** 把当前输入态渲染成预览卡片（每次都重发，用户看到的就是"输入框"的当前样子）。 */
-	async function showInboxCard({ openid, sessionId, context = {}, page = 1 }) {
+	async function showInboxCard({ openid, sessionId, context = {}, page = 1, mode }) {
 		const entry = inbox.active(openid)
 		if (!entry) return null
 		const card = buildInboxCard({
@@ -354,17 +354,20 @@ export function apply(ctx, rawConfig) {
 			voice: inbox.voiceText(entry),
 			page,
 			pageSize: Number(config.sessionPageSize) || 8,
+			mode: mode ?? entry.mode,
 		})
 		await io.sendCard({ openid, content: card.content, keyboard: card.keyboard, context })
 		return card
 	}
 
 	/**
-	 * 进入输入态（裸发 `发送` = 当前会话；`发送 <会话id>` = 指定会话）。
+	 * 进入输入态（`发送` = 立即投递；`延迟发送` = 本轮正常结束后投递）。
 	 *
+	 * 两个命令**共用同一套面板**，区别只有投递时机；输入态本身带 `mode`。
 	 * 已经有内容时**不让静默换目标**：那会把攒好的正文/附件一起丢掉。
 	 */
-	async function beginInput({ openid, sessionId, replyContext = {} }) {
+	async function beginInput({ openid, sessionId, replyContext = {}, mode = 'send' }) {
+		const delayed = mode === 'delay'
 		const before = inbox.active(openid)
 		const pendingItems = (before?.items ?? []).length
 		const pendingText = inbox.textOf(before)
@@ -378,28 +381,32 @@ export function apply(ctx, rawConfig) {
 				markdown: true,
 				context: replyContext,
 			})
-			await showInboxCard({ openid, sessionId: before.sessionId, context: replyContext })
+			await showInboxCard({ openid, sessionId: before.sessionId, context: replyContext, mode: before.mode })
 			return { ok: false, reason: 'inbox-other-session' }
 		}
 		if (hasContent) {
 			await sendText({
 				openid,
-				content: '已经有一个没发出去的输入框了，接着往里加就行；不想留就点卡片上的「取消」。',
+				content: delayed
+					? '已经有一个没发出去的输入框了：接着往里加就行，点卡片上的「延迟发送」再交出去（不想留就点「取消」）。'
+					: '已经有一个没发出去的输入框了，接着往里加就行；不想留就点卡片上的「取消」。',
 				markdown: true,
 				context: replyContext,
 			})
 		}
-		inbox.begin({ openid, sessionId })
+		inbox.begin({ openid, sessionId, mode })
 		await sendText({
 			openid,
 			content:
-				`已进入 **${sessions.label(sessionId)}** 的输入态。\n` +
+				`已进入 **${sessions.label(sessionId)}** 的输入态${delayed ? '（延迟投递）' : ''}。\n` +
 				'> 下面发的文字会攒成正文，图片/文件/语音/视频自动入列；\n' +
-				'> 点卡片上的「发送」才真正交给 AI，「删除 A1」可以单独去掉某个附件。',
+				(delayed
+					? '> 点卡片上的「延迟发送」= 登记为延迟投递：**不打断**这一轮，等它**正常结束**后再交给 AI。'
+					: '> 点卡片上的「发送」才真正交给 AI，「删除 A1」可以单独去掉某个附件。'),
 			markdown: true,
 			context: replyContext,
 		})
-		await showInboxCard({ openid, sessionId, context: replyContext })
+		await showInboxCard({ openid, sessionId, context: replyContext, mode })
 		return { ok: true }
 	}
 
@@ -464,16 +471,31 @@ export function apply(ctx, rawConfig) {
 
 		const sessionId = entry.sessionId
 		const label = sessions.label(sessionId)
+		const delayed = entry.mode === 'delay'
 		inbox.rememberDelivery({ sessionId, items })
 		inbox.drain({ openid })
 		const cardId = state.lastCardOf(openid)
 		if (cardId) await io.recallCard(openid, cardId)
 		const body = text || '（用户没有写正文：内容见上面的分节，请按语音转写/附件回应）'
-		await deliver({ sessionId, openid, text: body, interrupt: true, origin: 'qq', context, images, sections })
+		if (delayed) {
+			// 延迟投递：只登记，不打断当前轮次；等这一轮**正常结束**后由 rounds 投递。
+			state.setDelayed(sessionId, {
+				content: body,
+				openid,
+				at: new Date().toISOString(),
+				images,
+				sections,
+				itemCount: items.length,
+			})
+			state.flush()
+			logger.info?.('输入态已登记延迟消息', { sessionId, items: items.length })
+		} else {
+			await deliver({ sessionId, openid, text: body, interrupt: true, origin: 'qq', context, images, sections })
+		}
 		// 卡片撤回后留一条**最终预览**：把真正发出去的内容复述一遍（用户要求）。
 		await sendText({
 			openid,
-			content: buildInboxResult({ label, sessionId, text, items, voice: voiceItems }),
+			content: buildInboxResult({ label, sessionId, text, items, voice: voiceItems, mode: entry.mode }),
 			markdown: true,
 			context,
 		})
@@ -511,8 +533,8 @@ export function apply(ctx, rawConfig) {
 			}),
 		agentFor,
 		nextSeqFor: (sessionId) => nextSeq(`session:${sessionId}`),
-		onDeliver: async ({ sessionId, openid, text, origin }) => {
-			await deliver({ sessionId, openid, text, interrupt: false, origin: origin ?? 'delayed', context: {} })
+		onDeliver: async ({ sessionId, openid, text, origin, images = [], sections = [] }) => {
+			await deliver({ sessionId, openid, text, interrupt: false, origin: origin ?? 'delayed', context: {}, images, sections })
 		},
 	})
 
@@ -528,7 +550,7 @@ export function apply(ctx, rawConfig) {
 		showNewSessionCard: ({ openid, replyContext }) => showNewSessionCard({ openid, replyContext }),
 		createSession: ({ openid, cwd }) => createSessionHere({ openid, cwd }),
 		// 裸发 `发送` 进入输入态（详细设计见 lib/inbox.js 顶部注释）。
-		beginInput: ({ openid, sessionId, replyContext }) => beginInput({ openid, sessionId, replyContext }),
+		beginInput: ({ openid, sessionId, replyContext, mode }) => beginInput({ openid, sessionId, replyContext, mode }),
 		// 进度是**只读**的：只用 agents.get（不 resume、不 cancel）；拿不到活跃 agent 就如实说没在跑。
 		progress: async ({ sessionId }) => {
 			const label = sessions.get(sessionId) ? sessions.label(sessionId) : sessionId

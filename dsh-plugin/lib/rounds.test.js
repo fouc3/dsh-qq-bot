@@ -182,6 +182,22 @@ test('延迟发送：只在"正常结束"时投递；被停止/出错不投递',
 	assert.equal(state.delayedOf('session-1'), null, '投递后应清槽')
 })
 
+test('延迟发送：输入态登记的图片/分节也要一起投出去', async () => {
+	const { rounds, state, delivered, agent } = setup()
+	const images = [{ attachmentId: 'img-1', mediaType: 'image/png', bytes: 3, width: 1, height: 1 }]
+	const sections = [{ name: '用户随消息附带的附件', text: '- A1 图片 cat.png' }]
+	state.setDelayed('session-1', { content: '看看图', openid: 'U1', at: 'now', images, sections, itemCount: 1 })
+
+	rounds.beginRound({ sessionId: 'session-1', openid: 'U1', origin: 'qq' })
+	sessionEvent(agent, { type: 'turn/start', data: { turn: 7 } })
+	sessionEvent(agent, { type: 'turn/end', data: { turn: 7, reason: { kind: 'completed' } } })
+	await tick()
+
+	assert.equal(delivered.length, 1)
+	assert.deepEqual(delivered[0].images, images, '延迟投递要带上图片')
+	assert.deepEqual(delivered[0].sections, sections, '延迟投递要带上附件/语音分节')
+})
+
 test('每轮把用户级上下文注入进会话（每个 turn 只注入一次）', async () => {
 	const { rounds, agent } = setup()
 	const round = rounds.beginRound({ sessionId: 'session-1', openid: 'U1', origin: 'qq' })

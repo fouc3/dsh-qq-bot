@@ -256,8 +256,16 @@ export function createRounds({
 			const delayed = state.takeDelayed(sessionId)
 			state.flush()
 			if (delayed) {
-				logger?.info?.('投递延迟消息', { sessionId, from: delayed.openid })
-				await onDeliver({ sessionId, openid: delayed.openid, text: delayed.content, origin: 'delayed' })
+				logger?.info?.('投递延迟消息', { sessionId, from: delayed.openid, items: delayed.itemCount ?? 0 })
+				await onDeliver({
+					sessionId,
+					openid: delayed.openid,
+					text: delayed.content,
+					origin: 'delayed',
+					// 输入态登记的延迟消息可能带图片与附件/语音分节：一起带过去。
+					images: delayed.images ?? [],
+					sections: delayed.sections ?? [],
+				})
 			}
 		}
 

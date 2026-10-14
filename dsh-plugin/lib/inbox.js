@@ -115,7 +115,13 @@ export function createInbox({ state, attachments, config = {}, logger, fetchImpl
 	function entryOf(openid) {
 		const entry = state.inboxOf(openid)
 		if (!entry) return null
-		return { sessionId: entry.sessionId ?? null, segments: [...(entry.segments ?? [])], items: clone(entry.items), seq: Number(entry.seq) || 0 }
+		return {
+			sessionId: entry.sessionId ?? null,
+			mode: entry.mode === 'delay' ? 'delay' : 'send',
+			segments: [...(entry.segments ?? [])],
+			items: clone(entry.items),
+			seq: Number(entry.seq) || 0,
+		}
 	}
 
 	function save(openid, entry) {
@@ -127,11 +133,22 @@ export function createInbox({ state, attachments, config = {}, logger, fetchImpl
 		return (entry?.segments ?? []).join('\n\n').trim()
 	}
 
-	/** 进入输入态：同一个会话重复进入不清空；换了会话才重置。 */
-	function begin({ openid, sessionId }) {
+	/**
+	 * 进入输入态。
+	 *
+	 * 同一个会话重复进入不清空（`发送` 与 `延迟发送` 只是**投递方式**不同，
+	 * 切换方式时攒好的正文/附件照样留着）；换了会话才重置。
+	 *
+	 * @param {{openid:string, sessionId:string, mode?:'send'|'delay'}} input
+	 */
+	function begin({ openid, sessionId, mode = 'send' }) {
+		const wanted = mode === 'delay' ? 'delay' : 'send'
 		const existing = entryOf(openid)
-		if (existing && existing.sessionId === sessionId) return existing
-		return save(openid, { sessionId, segments: [], items: [], seq: 0 })
+		if (existing && existing.sessionId === sessionId) {
+			if (existing.mode !== wanted) save(openid, { ...existing, mode: wanted })
+			return { ...existing, mode: wanted }
+		}
+		return save(openid, { sessionId, mode: wanted, segments: [], items: [], seq: 0 })
 	}
 
 	function active(openid) {

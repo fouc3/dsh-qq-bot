@@ -500,13 +500,14 @@ export function describeInboxItem(item) {
  * @param {number} [input.pageSize]
  * @returns {{content:string, keyboard:object}}
  */
-export function buildInboxCard({ label, sessionId, text, items = [], voice = [], page = 1, pageSize = 8 }) {
+export function buildInboxCard({ label, sessionId, text, items = [], voice = [], page = 1, pageSize = 8, mode = 'send' }) {
+	const delayed = mode === 'delay'
 	const total = items.length
 	const pages = Math.max(1, Math.ceil(total / Math.max(1, pageSize)))
 	const current = Math.min(Math.max(1, Number(page) || 1), pages)
 	const slice = items.slice((current - 1) * pageSize, current * pageSize)
 
-	const lines = [`**输入框** · ${label ?? sessionId}`, `> 会话：\`${sessionId}\``, '']
+	const lines = [`**输入框${delayed ? '（延迟投递）' : ''}** · ${label ?? sessionId}`, `> 会话：\`${sessionId}\``, '']
 	lines.push('**正文**')
 	if (String(text ?? '').trim()) {
 		for (const line of String(text).split('\n')) lines.push(`> ${line || ' '}`)
@@ -526,7 +527,12 @@ export function buildInboxCard({ label, sessionId, text, items = [], voice = [],
 		for (const item of slice) lines.push(describeInboxItem(item))
 	}
 	if (pages > 1) lines.push('', `> 第 ${current}/${pages} 页（每页 ${pageSize} 个），用下面的「上一页/下一页」翻。`)
-	lines.push('', '> 点「发送」才真正交给 AI；「删除」只影响这一条附件。')
+	lines.push(
+		'',
+		delayed
+			? '> 点「延迟发送」= **登记为延迟投递**：不打断这一轮，等它**正常结束**后再交给 AI；「删除」只影响这一条附件。'
+			: '> 点「发送」才真正交给 AI；「删除」只影响这一条附件。',
+	)
 
 	const itemButtons = slice.map((item) => callbackButton(`删除 ${item.id}`, data.inbox('rm', item.id)))
 	const rows = rowsOf(itemButtons, 4)
@@ -539,7 +545,7 @@ export function buildInboxCard({ label, sessionId, text, items = [], voice = [],
 	// 按钮顺序按用户要求：**取消在最左、发送在最右**（发送放右侧才顺手）。
 	const actions = [callbackButton('取消', data.inbox('cancel'))]
 	if (String(text ?? '').trim()) actions.push(callbackButton('清空正文', data.inbox('clear')))
-	actions.push(callbackButton('发送', data.inbox('send'), { style: 4 }))
+	actions.push(callbackButton(delayed ? '延迟发送' : '发送', data.inbox('send'), { style: 4 }))
 	rows.push({ buttons: actions })
 
 	return { content: lines.join('\n'), keyboard: keyboardOf(rows) }
@@ -580,10 +586,14 @@ const RESULT_TEXT_LIMIT = 400
  *
  * @param {{label?:string, sessionId:string, text?:string, items?:Array<object>, voice?:Array<object>}} input
  */
-export function buildInboxResult({ label, sessionId, text = '', items = [], voice = [] } = {}) {
+export function buildInboxResult({ label, sessionId, text = '', items = [], voice = [], mode = 'send' } = {}) {
 	const voiceIds = new Set((voice ?? []).map((item) => item.id))
 	const body = String(text ?? '').trim()
-	const lines = [`**已发送** · ${label ?? sessionId}`, `> 会话：\`${sessionId}\``, '']
+	const title = mode === 'delay' ? '**已登记**（延迟投递）' : '**已发送**'
+	const note = mode === 'delay' ? '> 投递时机：这一轮**正常结束**后（被停止/被顶替/出错都不会投）' : ''
+	const lines = [`${title} · ${label ?? sessionId}`, `> 会话：\`${sessionId}\``]
+	if (note) lines.push(note)
+	lines.push('')
 
 	lines.push(`**正文（${body.length} 字）**`)
 	if (body) {
