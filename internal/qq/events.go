@@ -62,6 +62,8 @@ func DecideC2C(data *qqbotsdk.C2CMessageCreateData, allowed func(string) bool) D
 	}
 	openid := ""
 	if data.Author != nil {
+		// 单聊消息里官方给的就是 author.user_openid：SDK 的 User.UserOpenID
+		// （api_message.go，json tag `user_openid`），已对照 SDK 源码确认。
 		openid = data.Author.UserOpenID
 	}
 	if openid == "" {
