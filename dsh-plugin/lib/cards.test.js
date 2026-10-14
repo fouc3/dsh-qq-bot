@@ -116,6 +116,15 @@ test('提问卡片：多题一次性展示，并在正文里说明"不选直接�
 	assert.match(card.content, /跳过/)
 	// 已选项要有标记
 	assert.match(card.content, /✅ 否/)
+	// 命令照常生效的提示
+	assert.match(card.content, /命令.*照常生效/)
+
+	// 选中态**同时**用按钮自身的 style 表示（4 = 蓝色填充），未选中 1
+	const buttons = card.keyboard.content.rows.flatMap((row) => row.buttons)
+	const selected = buttons.find((b) => b.render_data.label === 'B') // 第一问的「否」
+	const unselected = buttons.find((b) => b.render_data.label === 'A') // 第一问的「是」
+	assert.equal(selected.render_data.style, 4, '选中的字母按钮要用填充样式')
+	assert.equal(unselected.render_data.style, 1, '未选中的保持普通样式')
 })
 
 test('提问卡片：按钮数超上限返回 null（调用方降级到 dsh GUI）', () => {

@@ -23,6 +23,13 @@ export const COMMANDS = [
 		usageAlt: '新建会话                 # 不带参数：用卡片选目录',
 	},
 	{
+		name: '进度',
+		desc: '看当前进展（只读不打断）',
+		purpose: '只读地看一眼某会话现在在干什么（状态/轮次/耗时/最近动作），**不会打断**正在跑的 AI。',
+		usage: '进度',
+		usageAlt: '进度 <会话id>                 # 看指定会话',
+	},
+	{
 		name: '发送',
 		desc: '把一条消息单次投递到指定会话',
 		requiresArgs: true,
@@ -131,6 +138,8 @@ export function createCommandRunner(deps) {
 				return switchSession(context, parsed)
 			case '新建会话':
 				return newSession(context, parsed)
+			case '进度':
+				return showProgress(context, parsed)
 			case '发送':
 				return sendOnce(context, parsed)
 			case '停止':
@@ -169,6 +178,43 @@ export function createCommandRunner(deps) {
 			markdown: true,
 			replyContext,
 		})
+		return { handled: true }
+	}
+
+	/**
+	 * 进度：只读快照，**不打断**正在跑的 AI。
+	 *
+	 * 无参 = 当前绑定会话；带参 = 指定会话（`<会话id>` 或 `<目录> <会话id>`）。
+	 */
+	async function showProgress({ openid, replyContext }, parsed) {
+		let sessionId = ''
+		if (parsed.tokens.length === 0) {
+			const bound = state.bindingOf(openid)
+			if (!bound || bound === 'none') {
+				await deps.reply({
+					openid,
+					content: '当前没有绑定会话。用 `进度 <会话id>` 可以直接看某个会话。',
+					markdown: true,
+					replyContext,
+				})
+				return { handled: true }
+			}
+			sessionId = bound
+		} else {
+			const target = sessions.resolveRef(parsed.tokens)
+			if (target?.error) {
+				await deps.reply({ openid, content: `${target.error}\n\n${usageText('进度')}`, replyContext })
+				return { handled: true }
+			}
+			if (!target) {
+				await deps.reply({ openid, content: usageText('进度'), replyContext })
+				return { handled: true }
+			}
+			sessionId = target.sessionId
+		}
+
+		const result = await deps.progress({ sessionId })
+		await deps.reply({ openid, content: result.content, markdown: true, replyContext })
 		return { handled: true }
 	}
 

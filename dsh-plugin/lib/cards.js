@@ -317,13 +317,17 @@ export function buildQuestionCard({ callId, questions, answers = {}, customFor =
 			lines.push('---', '')
 			options.forEach((option, oIndex) => {
 				const letter = LETTERS[oIndex] ?? `#${oIndex + 1}`
-				const mark = selected.has(option.label) ? '✅ ' : ''
+				const isSelected = selected.has(option.label)
+				const mark = isSelected ? '✅ ' : ''
 				lines.push(`**${letter}.** ${mark}${option.label}`)
 				if (option.description) lines.push(`> ${option.description}`)
 				lines.push('')
 				buttons.push(
 					callbackButton(letter, data.question(callId, qIndex, `opt-${oIndex}`), {
 						visited: letter,
+						// 选中态同时也用**按钮自身**的样式表示（4 = 蓝色填充）；
+						// 正文里的 ✅ 保留。平台上 style 就是给这种状态用的。
+						style: isSelected ? 4 : 1,
 					}),
 				)
 			})
@@ -346,6 +350,10 @@ export function buildQuestionCard({ callId, questions, answers = {}, customFor =
 	const allButtons = [...buttons, submit]
 	if (allButtons.length > maxButtons) return null
 
-	const content = [...blocks, '> 不选任何字母直接点「提交」= 跳过本题。'].join('\n---\n')
+	const content = [
+		...blocks,
+		'> 不选任何字母直接点「提交」= 跳过本题。',
+		'> 命令（如 进度 / 停止 / 切换会话）照常生效，不会被当成答案。',
+	].join('\n---\n')
 	return { content, keyboard: keyboardOf(rowsOf(allButtons, 4)) }
 }

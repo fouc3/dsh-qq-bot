@@ -268,10 +268,10 @@ test('register → panel：白名单快照 + 五条命令的面板定义（只�
 	assert.deepEqual(panel.value.userOpenIds, ['U1'])
 	assert.deepEqual(
 		panel.value.items.map((item) => item.name),
-		['切换会话', '新建会话', '发送', '停止', '归档', '延迟发送'],
+		['切换会话', '新建会话', '进度', '发送', '停止', '归档', '延迟发送'],
 	)
 	// 扁平键 menuItems：与 Go 侧 PanelDefinition.MenuItems 对齐（大小写不敏感匹配）
-	assert.equal(panel.value.menuItems.length, 6)
+	assert.equal(panel.value.menuItems.length, 7)
 	assert.equal(panel.value.menuItems[0].name, '切换会话')
 	assert.equal(panel.value.menuItems[0].sendMessage, '切换会话')
 	assert.equal(panel.value.menu, undefined)
@@ -579,7 +579,7 @@ test('端到端：dsh 内置命令从 QQ 直接执行（不进模型）；技能
 		'feedback 不收纳；技能本来就不在命令表里',
 	)
 	assert.equal(groups[0].children[0].sendMessage, '/compact', '点击把 /命令 填进输入框')
-	assert.equal(panel.value.menuItems.filter((i) => i.type !== 'menu').length, 6, '顶层仍是 6 条桥命令')
+	assert.equal(panel.value.menuItems.filter((i) => i.type !== 'menu').length, 7, '顶层仍是 7 条桥命令')
 
 	// 绑定会话
 	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M1' })
@@ -677,5 +677,67 @@ test('提问桥：ask_user_question 的 waterfall 在 QQ 侧发卡片，点选�
 	const result = await answer
 	assert.equal(nextCalled, false, 'QQ 侧答了就不该交回 GUI')
 	assert.deepEqual(result, { answers: [{ id: 'q1', selected: ['直接上线'] }] })
+	boot.dispose()
+})
+
+// 这条守卫是补票：用户发现"等提问作答时打命令，会被提问桥当成「其他」答案"。
+test('待答提问期间：桥命令优先执行，不会被当成「其他」答案', async (t) => {
+	const agent = makeAgent('session-1')
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': agent } })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M1' })
+	await waitFor(async () => (await pumpQueue(boot.socketPath)).length > 0)
+
+	const handler = boot.events.get('user-questions/request')?.[0]
+	assert.ok(handler, '应注册 user-questions/request 监听')
+	let nextCalled = false
+	const answer = handler(
+		{
+			agent,
+			questions: [{ id: 'q1', header: '随便问', question: '选一个？', options: [{ label: '甲' }, { label: '乙' }] }],
+			signal: { aborted: false, addEventListener() {} },
+		},
+		async () => {
+			nextCalled = true
+			return { answers: [] }
+		},
+	)
+
+	const card = await waitFor(async () => {
+		const list = await pumpQueue(boot.socketPath)
+		return list.find((c) => c.kind === 'send_c2c' && /提问/.test(String(c.args.content))) ?? null
+	})
+	const before = await rpc(boot.socketPath, 'health')
+	assert.equal(before.value.pendingQuestions, 1, '提问应处于待答状态')
+
+	// 关键：待答期间发一条桥命令 —— 必须执行命令，而不是当答案、也不该把提问消费掉
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '停止', msgId: 'M2' })
+	const stopReply = await waitFor(async () => {
+		const list = await pumpQueue(boot.socketPath)
+		return list.find((c) => c.kind === 'send_c2c' && /已请求停止|没停成/.test(String(c.args.content))) ?? null
+	})
+	assert.ok(stopReply, '命令必须真的执行（而不是被提问桥当「其他」答案吃掉）')
+	assert.equal(nextCalled, false, '命令不该让提问结算')
+
+	const after = await rpc(boot.socketPath, 'health')
+	assert.equal(after.value.pendingQuestions, 1, '命令之后提问仍然待答')
+
+	// 收尾：这题还能正常答完（命令没把提问搞坏）
+	const letterButton = card.args.keyboard.content.rows
+		.flatMap((row) => row.buttons)
+		.find((b) => b.render_data.label === 'A')
+	const clicked = parseCallback(letterButton.action.data)
+	await rpc(boot.socketPath, 'event', { kind: 'interaction', openid: 'U1', buttonData: letterButton.action.data, eventId: 'INT-C1', msgId: 'C1' })
+	await rpc(boot.socketPath, 'event', {
+		kind: 'interaction',
+		openid: 'U1',
+		buttonData: cardData.question(clicked.callId, 0, 'submit'),
+		eventId: 'INT-C2',
+		msgId: 'C2',
+	})
+	const settledAnswers = await answer
+	assert.deepEqual(settledAnswers, { answers: [{ id: 'q1', selected: ['甲'] }] })
+	assert.equal(nextCalled, false)
 	boot.dispose()
 })

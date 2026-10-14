@@ -26,6 +26,7 @@ import { createRounds } from './lib/rounds.js'
 import { buildReplyTool } from './lib/reply-tool.js'
 import { buildNewSessionCard, buildSessionCard, data as cardData, parseCallback } from './lib/cards.js'
 import { createCommandRunner, menuItems, panelItems, parseCommand } from './lib/commands.js'
+import { renderProgress, snapshotProgress } from './lib/progress.js'
 import {
 	EXCLUDED_COMMANDS,
 	buildMenuItems,
@@ -318,6 +319,18 @@ export function apply(ctx, rawConfig) {
 		showSessionCard: ({ openid, replyContext }) => showSessionCard({ openid, replyContext }),
 		showNewSessionCard: ({ openid, replyContext }) => showNewSessionCard({ openid, replyContext }),
 		createSession: ({ openid, cwd }) => createSessionHere({ openid, cwd }),
+		// 进度是**只读**的：只用 agents.get（不 resume、不 cancel）；拿不到活跃 agent 就如实说没在跑。
+		progress: async ({ sessionId }) => {
+			const label = sessions.get(sessionId) ? sessions.label(sessionId) : sessionId
+			const agent = ctx.agents.get(sessionId)
+			if (!agent) {
+				return {
+					content: `**进度快照**\n> 会话：${label}\n> 状态：没有活跃的 agent（这一轮没在跑）\n\n让它跑起来的话，直接发一条消息即可。`,
+				}
+			}
+			const snapshot = snapshotProgress(agent)
+			return { content: renderProgress({ label, snapshot, sessionId }) }
+		},
 		deliver: ({ sessionId, openid, text, interrupt }) =>
 			deliver({ sessionId, openid, text, interrupt, origin: 'qq', context: {} }),
 		stopSession: async (sessionId) => {
@@ -443,17 +456,15 @@ export function apply(ctx, rawConfig) {
 		const openid = event.openid
 		const context = { msgId: event.msgId ?? '' }
 
-		// 1) 有待答提问：文本优先当「其他」答案
-		if (questions.hasPending(openid) && (await questions.handleText(openid, event.text))) return
-
-		// 2) 命令
+		// 1) 桥命令最优先：**即使正在等提问作答，命令也必须先执行** ——
+		//    否则 `停止`/`进度` 这类命令会被提问桥当「其他」答案吃掉。
 		const parsed = parseCommand(event.text)
 		if (parsed) {
 			await commands.run({ openid, replyContext: context }, parsed)
 			return
 		}
 
-		// 3) dsh 内置命令：'/xxx' 直接交给 ctx.commands.execute（不经模型）。
+		// 2) dsh 内置命令：'/xxx' 直接交给 ctx.commands.execute（不经模型），同样优先于提问捕获。
 		//    不兼容的（如 feedback）当普通消息处理。
 		const slash = splitSlashLine(event.text)
 		if (slash && !EXCLUDED_COMMANDS.has(slash.name)) {
@@ -472,6 +483,9 @@ export function apply(ctx, rawConfig) {
 				}
 			}
 		}
+
+		// 3) 有待答提问：普通文本＝该题的「其他」答案
+		if (questions.hasPending(openid) && (await questions.handleText(openid, event.text))) return
 
 		// 4) 普通消息 → 当前绑定会话
 		const bound = state.bindingOf(openid)
