@@ -112,6 +112,8 @@ export const data = {
 	mkCancel: (path) => `${DATA_PREFIX}:mkx:${path}`,
 	rmdir: (path) => `${DATA_PREFIX}:rmdir:${path}`,
 	rmdirYes: (path) => `${DATA_PREFIX}:rmdir2:${path}`,
+	// 权限卡片：切成某个预设（value 是 dsh 的预设 key，如 danger-full-access）
+	perm: (value) => `${DATA_PREFIX}:perm:${value}`,
 }
 
 /** 解析回调 data；不是本插件的数据返回 null。 */
@@ -137,6 +139,9 @@ export function parseCallback(raw) {
 	}
 	if (raw.startsWith(`${DATA_PREFIX}:mkx:`)) {
 		return { kind: 'mkcancel', path: raw.slice(`${DATA_PREFIX}:mkx:`.length) }
+	}
+	if (raw.startsWith(`${DATA_PREFIX}:perm:`)) {
+		return { kind: 'perm', value: raw.slice(`${DATA_PREFIX}:perm:`.length) }
 	}
 	if (raw.startsWith(`${DATA_PREFIX}:rmdir2:`)) {
 		return { kind: 'rmdiryes', path: raw.slice(`${DATA_PREFIX}:rmdir2:`.length) }
@@ -365,6 +370,42 @@ export function buildNoticeCard({ label, sessionId, interrupted = false, source 
 		buttons.push(commandButton('发送消息', sendCommand(sessionId)))
 	}
 	return { content: lines.join('\n'), keyboard: keyboardOf([{ buttons }]) }
+}
+
+/**
+ * 权限卡片：一行一个级别的回调按钮（点了就切换）。
+ *
+ * 用户要求"每行尽可能放两个按钮；放不下（会超平台行数）就扩大，比如每行三个"：
+ * 所以先按 2 个/行排，如果行数超上限就依次加宽（3、4、5），确保整卡合法。
+ */
+export function buildPermissionCard({ options = [], current = '', sessionId = '', label = '' }) {
+	const lines = ['**权限**', `> 会话：${label || sessionId || '（当前会话）'}`]
+	if (current) {
+		const now = options.find((item) => item.value === current)
+		lines.push(`> 当前：**${now?.name ?? current}**`)
+	}
+	lines.push('', '点下面的级别即可切换（作用于当前会话）。')
+	for (const [index, item] of options.entries()) {
+		lines.push(`${index + 1}. **${item.name}**${item.description ? ` — ${item.description}` : ''}`)
+	}
+
+	const perRow = buttonsPerRowFor(options.length)
+	const buttons = options.map((item) =>
+		callbackButton(item.name, data.perm(item.value), {
+			style: item.value === current ? 4 : 1,
+			visited: item.value === current ? '当前' : item.name,
+		}),
+	)
+	return { content: lines.join('\n'), keyboard: keyboardOf(clampRows(rowsOf(buttons, perRow))) }
+}
+
+/** 选一个"每行几个按钮"：默认 2，行数不够就加宽到 5 为止。 */
+export function buttonsPerRowFor(count, { preferred = 2, maxRows = KEYBOARD_MAX_ROWS } = {}) {
+	if (count <= 0) return preferred
+	for (let perRow = preferred; perRow <= KEYBOARD_MAX_BUTTONS_PER_ROW; perRow += 1) {
+		if (Math.ceil(count / perRow) <= maxRows) return perRow
+	}
+	return KEYBOARD_MAX_BUTTONS_PER_ROW
 }
 
 /**

@@ -63,6 +63,10 @@ function makeCtx({ sessionSummaries = [], live = {}, commands = null } = {}) {
 	const archived = []
 
 	const ctx = {
+		// cordis 的 `ctx.get(name)`：按服务名取句柄（测试里就是同名属性；取不到返回 undefined）。
+		get(name) {
+			return typeof name === 'string' ? ctx[name] : undefined
+		},
 		logger: { info() {}, warn() {}, error() {}, debug() {} },
 		effect(callback) {
 			const disposer = callback()
@@ -130,6 +134,30 @@ function makeCtx({ sessionSummaries = [], live = {}, commands = null } = {}) {
 			},
 		},
 		attachments: makeAttachmentStore(),
+		permissionPresets: {
+			currentValue: 'workspace-write',
+			setCalls: [],
+			catalog() {
+				return {
+					options: [
+						{ value: 'read-only', name: '仅可查看', description: '只能看，不能改' },
+						{ value: 'workspace-write', name: '工作区内修改', description: '工作区内可写' },
+						{ value: 'danger-full-access', name: '完全权限', description: '不限制' },
+					],
+					defaultOptions: [],
+					defaultPreset: 'workspace-write',
+				}
+			},
+			current() {
+				return ctx.permissionPresets.currentValue
+			},
+			set(session, value) {
+				const known = ['read-only', 'workspace-write', 'danger-full-access']
+				if (!known.includes(value)) throw new Error(`unknown preset '${value}'`)
+				ctx.permissionPresets.currentValue = value
+				ctx.permissionPresets.setCalls.push({ sessionId: session?.id, value })
+			},
+		},
 	}
 
 	return {
@@ -332,7 +360,7 @@ test('插件导出形态正确，且 apply() 会建出 0600 的 socket', async (
 	boot.dispose()
 })
 
-test('register → panel：白名单快照 + 七条命令的面板定义（只绑定配置指定的私聊）', async (t) => {
+test('register → panel：白名单快照 + 八个命令的面板定义（只绑定配置指定的私聊）', async (t) => {
 	const boot = bootPlugin(t, { sessions: SUMMARIES })
 	await waitFor(() => existsSync(boot.socketPath))
 
@@ -352,10 +380,10 @@ test('register → panel：白名单快照 + 七条命令的面板定义（只�
 	assert.deepEqual(panel.value.userOpenIds, ['U1'])
 	assert.deepEqual(
 		panel.value.items.map((item) => item.name),
-		['切换会话', '新建会话', '进度', '发送', '停止', '归档', '延迟发送'],
+		['切换会话', '新建会话', '进度', '发送', '停止', '归档', '延迟发送', '权限'],
 	)
 	// 扁平键 menuItems：与 Go 侧 PanelDefinition.MenuItems 对齐（大小写不敏感匹配）
-	assert.equal(panel.value.menuItems.length, 7)
+	assert.equal(panel.value.menuItems.length, 8)
 	assert.equal(panel.value.menuItems[0].name, '切换会话')
 	assert.equal(panel.value.menuItems[0].sendMessage, '切换会话')
 	assert.equal(panel.value.menu, undefined)
@@ -674,7 +702,7 @@ test('端到端：dsh 内置命令从 QQ 直接执行（不进模型）；技能
 		'feedback 不收纳；技能本来就不在命令表里',
 	)
 	assert.equal(groups[0].children[0].sendMessage, '/compact', '点击把 /命令 填进输入框')
-	assert.equal(panel.value.menuItems.filter((i) => i.type !== 'menu').length, 7, '顶层仍是 7 条桥命令')
+	assert.equal(panel.value.menuItems.filter((i) => i.type !== 'menu').length, 8, '顶层仍是 8 条桥命令')
 
 	// 绑定会话
 	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M1' })
@@ -1368,6 +1396,77 @@ test('端到端：用 `发送 <会话id>` 说话的非绑定会话也能回 QQ�
 		return list.find((c) => c.kind === 'send_c2c' && /看完了，没问题/.test(String(c.args.content))) ?? null
 	})
 	assert.match(String(sent.args.content), /看完了，没问题/)
+
+	boot.dispose()
+})
+
+test('端到端：`权限` 发卡片（每行两个）／带参数直接设定／点按钮切换', async (t) => {
+	const agent = makeAgent('session-1')
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': agent } })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	await drainFor(boot.socketPath, 60)
+
+	// 没绑定会话 → 提示先切会话
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '权限', msgId: 'M0' })
+	const needBind = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 60)
+		return list.find((c) => c.kind === 'send_c2c' && /切换会话/.test(String(c.args.content))) ?? null
+	})
+	assert.match(String(needBind.args.content), /绑定会话/)
+
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M1' })
+	await drainFor(boot.socketPath, 60)
+
+	// 裸发 `权限` → 卡片：3 个级别、每行两个、正文标出"当前"
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '权限', msgId: 'M2' })
+	const card = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 60)
+		return list.filter((c) => c.kind === 'send_c2c' && c.args.keyboard).at(-1) ?? null
+	})
+	assert.match(String(card.args.content), /当前：\*\*工作区内修改\*\*/)
+	const rows = card.args.keyboard.content.rows.map((row) => row.buttons.map((b) => b.action.data))
+	assert.equal(rows.length, 2, '3 个级别 → 每行两个（2+1）')
+	assert.equal(rows[0].length, 2)
+	assert.deepEqual(rows[0], [cardData.perm('read-only'), cardData.perm('workspace-write')])
+	assert.deepEqual(rows[1], [cardData.perm('danger-full-access')])
+
+	// 点卡片上的「完全权限」→ 切换 + 回执 + 重发卡片（新的"当前"）
+	await rpc(boot.socketPath, 'event', {
+		kind: 'interaction',
+		openid: 'U1',
+		buttonData: cardData.perm('danger-full-access'),
+		eventId: 'INT-PERM',
+		msgId: 'CARD-1',
+	})
+	const afterSwitch = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.some((c) => c.kind === 'send_c2c' && /权限切成/.test(String(c.args.content))) ? list : null
+	})
+	const switched = afterSwitch.find((c) => /权限切成/.test(String(c.args.content)))
+	assert.match(String(switched.args.content), /完全权限/)
+	assert.deepEqual(boot.ctx.permissionPresets.setCalls, [{ sessionId: undefined, value: 'danger-full-access' }])
+	// 回执与重发的卡片在同一次 drain 里（别分两次取，否则第二条会被前一次消费掉）
+	const resent = afterSwitch.filter((c) => c.kind === 'send_c2c' && c.args.keyboard).at(-1)
+	assert.ok(resent, '切换后要重发权限卡片（标出新的"当前"）')
+	assert.match(String(resent.args.content), /当前：\*\*完全权限\*\*/)
+
+	// 带参数直接设定（中文名）
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '权限 仅可查看', msgId: 'M3' })
+	const direct = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 60)
+		return list.find((c) => c.kind === 'send_c2c' && /权限切成/.test(String(c.args.content))) ?? null
+	})
+	assert.match(String(direct.args.content), /仅可查看/)
+	assert.equal(boot.ctx.permissionPresets.setCalls.at(-1).value, 'read-only')
+
+	// 认不出的级别 → 报错 + 回用法
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '权限 瞎写', msgId: 'M4' })
+	const bad = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 60)
+		return list.find((c) => c.kind === 'send_c2c' && /认不出权限级别/.test(String(c.args.content))) ?? null
+	})
+	assert.match(String(bad.args.content), /用法：/)
 
 	boot.dispose()
 })

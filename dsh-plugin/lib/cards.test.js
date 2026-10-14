@@ -8,10 +8,12 @@ import {
 	buildMkdirPromptCard,
 	buildNewSessionCard,
 	buildNoticeCard,
+	buildPermissionCard,
 	buildQuestionCard,
 	buildQuestionCards,
 	buildQuestionResult,
 	buildSessionCard,
+	buttonsPerRowFor,
 	callbackButton,
 	clipLabel,
 	data,
@@ -460,4 +462,39 @@ test('结束通知：多一个「发送消息」指令按钮，填入 `发送 <�
 	// 不传 sendCommand 时保持只有一个按钮（向后兼容）
 	const plain = buildNoticeCard({ label: '项目甲(session-1)', sessionId: 'session-1' })
 	assert.deepEqual(plain.keyboard.content.rows[0].buttons.map((b) => b.render_data.label), ['我需要回复'])
+})
+
+test('权限卡片：每行两个按钮（放不下就加宽），当前项标记出来', () => {
+	const options = [
+		{ value: 'read-only', name: '仅可查看', description: '只能看' },
+		{ value: 'workspace-write', name: '工作区内修改', description: '工作区内可写' },
+		{ value: 'danger-full-access', name: '完全权限', description: '不限制' },
+		{ value: 'auto', name: 'Auto review', description: '自动审查' },
+	]
+	const card = buildPermissionCard({ options, current: 'danger-full-access', sessionId: 'session-1', label: '项目甲(session-1)' })
+	const rows = card.keyboard.content.rows.map((row) => row.buttons.map((b) => b.render_data.label))
+	assert.deepEqual(
+		rows,
+		[
+			[clipLabel('仅可查看'), clipLabel('工作区内修改')],
+			[clipLabel('完全权限'), clipLabel('Auto review')],
+		],
+		'默认每行两个（按钮 label 受平台宽度限制会截断，正文里有完整名字与序号）',
+	)
+	assert.match(card.content, /当前：\*\*完全权限\*\*/)
+	for (const [index, item] of options.entries()) {
+		assert.match(card.content, new RegExp(`${index + 1}\\. \\*\\*${item.name}\\*\\*`), '正文里给序号+名字')
+	}
+	const flat = card.keyboard.content.rows.flatMap((row) => row.buttons)
+	assert.equal(flat[2].render_data.style, 4, '当前项高亮')
+	assert.deepEqual(parseCallback(flat[0].action.data), { kind: 'perm', value: 'read-only' })
+
+	// 选项多到 2/行会超行数 → 自动加宽
+	assert.equal(buttonsPerRowFor(4), 2)
+	assert.equal(buttonsPerRowFor(10), 2)
+	assert.equal(buttonsPerRowFor(11), 3, '11 个选项时 2/行放不下（>5 行），加宽到 3/行')
+	assert.equal(buttonsPerRowFor(26), 5)
+	const wide = buildPermissionCard({ options: Array.from({ length: 11 }, (_, i) => ({ value: `p${i}`, name: `级别${i}` })), current: 'p0' })
+	assert.ok(wide.keyboard.content.rows.length <= 5, '整卡行数仍合法')
+	assert.equal(wide.keyboard.content.rows[0].buttons.length, 3)
 })

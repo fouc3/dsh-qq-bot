@@ -27,9 +27,11 @@ import { createRounds } from './lib/rounds.js'
 import { buildReplyTool } from './lib/reply-tool.js'
 import { ATTACHMENT_TOOL_NAME, buildAttachmentTool } from './lib/attachment-tool.js'
 import { DEFAULT_MAX_ATTACHMENT_BYTES, DEFAULT_MAX_FETCH_BYTES, createInbox, formatBytes } from './lib/inbox.js'
+import { createPermissions } from './lib/permissions.js'
 import {
 	QUESTION_MAX_BUTTONS,
 	buildInboxCard,
+	buildPermissionCard,
 	buildInboxResult,
 	buildMkdirPromptCard,
 	buildNewSessionCard,
@@ -139,6 +141,8 @@ export function apply(ctx, rawConfig) {
 	const sessions = createSessions({ ctx, logger, idStyle: config.idStyle })
 	// 输入态（"输入框"）：附件先进这里，点卡片上的「发送」才交给 AI。
 	const inbox = createInbox({ state, attachments: ctx.attachments, config, logger })
+	// 权限预设（就是 Web 里那个 仅可查看/工作区内修改/完全权限 选择器）：可选服务。
+	const permissions = createPermissions({ ctx, logger })
 
 	// ── 会话级序号：被动回复按 msg_id+msg_seq 去重，所以每条消息都要递增 ──────
 	const seqByKey = new Map()
@@ -147,6 +151,54 @@ export function apply(ctx, rawConfig) {
 		seqByKey.set(key, next)
 		if (seqByKey.size > 1000) seqByKey.clear()
 		return next
+	}
+
+	/**
+	 * 权限卡片：把 dsh 的权限预设列成按钮（每行 2 个，放不下自动加宽），点一下就切。
+	 */
+	async function showPermissionCard({ openid, sessionId, replyContext = {} }) {
+		const agent = await agentFor(sessionId)
+		if (!agent) {
+			await sendText({
+				openid,
+				content: `会话 \`${sessionId}\` 现在打不开，没法看权限。`,
+				markdown: true,
+				context: replyContext,
+			})
+			return null
+		}
+		const options = permissions.catalog()
+		if (options.length === 0) {
+			await sendText({
+				openid,
+				content: '这个部署没有权限服务（`ctx.permissionPresets`），看不了权限级别。',
+				markdown: true,
+				context: replyContext,
+			})
+			return null
+		}
+		const card = buildPermissionCard({
+			options,
+			current: permissions.current(agent.session),
+			sessionId,
+			label: sessions.label(sessionId),
+		})
+		await io.sendCard({ openid, content: card.content, keyboard: card.keyboard, context: replyContext })
+		return card
+	}
+
+	/**
+	 * 直接把某个会话的权限切成 tokens 指定的级别。
+	 * @returns {{ok:boolean, text?:string, error?:string}|null}
+	 */
+	async function setPermissionForSession({ openid, sessionId, tokens }) {
+		const agent = await agentFor(sessionId)
+		if (!agent) return { ok: false, error: `会话 \`${sessionId}\` 现在打不开。` }
+		const resolved = permissions.resolveToken(tokens)
+		if (!resolved.ok) return { ok: false, error: resolved.error }
+		const result = permissions.set(agent.session, resolved.value)
+		if (!result.ok) return result
+		return { ok: true, value: result.value, text: permissions.describe(result.value) }
 	}
 
 	/**
@@ -736,6 +788,10 @@ export function apply(ctx, rawConfig) {
 		showSessionCard: ({ openid, replyContext }) => showSessionCard({ openid, replyContext }),
 		showNewSessionCard: ({ openid, replyContext }) => showNewSessionCard({ openid, replyContext }),
 		createSession: ({ openid, cwd }) => createSessionHere({ openid, cwd }),
+		// 权限卡片 / 直接设定（dsh 的权限预设是 per-session 的，见 lib/permissions.js）。
+		showPermissionCard: ({ openid, sessionId, replyContext }) =>
+			showPermissionCard({ openid, sessionId, replyContext }),
+		setPermission: ({ openid, sessionId, tokens }) => setPermissionForSession({ openid, sessionId, tokens }),
 		// 裸发 `发送` 进入输入态（详细设计见 lib/inbox.js 顶部注释）。
 		beginInput: ({ openid, sessionId, replyContext, mode }) => beginInput({ openid, sessionId, replyContext, mode }),
 		// 进度是**只读**的：只用 agents.get（不 resume、不 cancel）；拿不到活跃 agent 就如实说没在跑。
@@ -1049,6 +1105,29 @@ export function apply(ctx, rawConfig) {
 			await sendText({ openid, content: '已取消新建目录。', markdown: true, context: ctxReply })
 			await showNewSessionCard({ openid, dir: parsed.path, replyContext: ctxReply })
 			code = 0
+		} else if (parsed.kind === 'perm') {
+			// 权限卡片上的级别按钮：切成这个预设，并把卡片重发一遍（标出新的"当前"）。
+			const ctxReply = { eventId: event.eventId, msgId: event.msgId ?? '' }
+			const bound = state.bindingOf(openid)
+			if (!bound || bound === 'none') {
+				await sendText({ openid, content: '当前没有绑定会话，先 `切换会话`。', markdown: true, context: ctxReply })
+				code = 1
+			} else {
+				const result = await setPermissionForSession({ openid, sessionId: bound, tokens: [parsed.value] })
+				if (!result?.ok) {
+					await sendText({ openid, content: result?.error ?? '切换权限失败。', markdown: true, context: ctxReply })
+					code = 1
+				} else {
+					await sendText({
+						openid,
+						content: `已把 **${sessions.describe(bound)}** 的权限切成 ${result.text}。`,
+						markdown: true,
+						context: ctxReply,
+					})
+					await showPermissionCard({ openid, sessionId: bound, replyContext: ctxReply })
+					code = 0
+				}
+			}
 		} else if (parsed.kind === 'rmdir') {
 			// 「删除目录」第一步：换成二次确认卡片，别的都不做。
 			await showNewSessionCard({

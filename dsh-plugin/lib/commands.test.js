@@ -88,8 +88,8 @@ test('需要参数的命令无参时回作用与用法', () => {
 
 test('面板条目与菜单条目都由同一张命令表派生', () => {
 	const items = panelItems()
-	assert.equal(items.length, 7)
-	assert.deepEqual(items.map((i) => i.name), ['切换会话', '新建会话', '进度', '发送', '停止', '归档', '延迟发送'])
+	assert.equal(items.length, 8)
+	assert.deepEqual(items.map((i) => i.name), ['切换会话', '新建会话', '进度', '发送', '停止', '归档', '延迟发送', '权限'])
 	assert.equal(menuItems()[0].sendMessage, '切换会话')
 })
 

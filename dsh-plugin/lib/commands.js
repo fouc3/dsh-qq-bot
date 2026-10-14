@@ -60,6 +60,16 @@ export const COMMANDS = [
 		usageAlt: '延迟发送 <会话id>                # 进那个会话的延迟输入态',
 		usageAlt2: '延迟发送 <会话id> <内容>         # 直接登记（不带附件）',
 	},
+	{
+		name: '权限',
+		desc: '看/切会话权限（卡片或直接设定）',
+		purpose:
+			'管理**当前会话**的权限级别（就是 dsh Web 里那个「仅可查看 / 工作区内修改 / 完全权限 / Auto review」选择器）：' +
+			'发 `权限`（不带参数）回一张卡片，每行两个按钮，点一下就切；也可以 `权限 <级别>` 直接设定' +
+			'（级别认中文名、英文 key、或卡片上的序号）。',
+		usage: '权限',
+		usageAlt: '权限 <级别>                   # 直接设定，如 `权限 完全权限`、`权限 read-only`、`权限 2`',
+	},
 ]
 
 const BY_NAME = new Map(COMMANDS.map((cmd) => [cmd.name, cmd]))
@@ -153,6 +163,8 @@ export function createCommandRunner(deps) {
 				return archiveSession(context, parsed)
 			case '延迟发送':
 				return delaySend(context, parsed)
+			case '权限':
+				return permissionMode(context, parsed)
 			default:
 				return { handled: false }
 		}
@@ -363,6 +375,43 @@ export function createCommandRunner(deps) {
 			content: result.ok
 				? `已归档 ${sessions.describe(sessionId)}（已从卡片移除，并解除相关绑定）。`
 				: `没归档成：${result.reason ?? '未知原因'}（${sessions.describe(sessionId)}）`,
+			markdown: true,
+			replyContext,
+		})
+		return { handled: true }
+	}
+
+	/**
+	 * 权限：不带参数发卡片，带参数直接设定。
+	 *
+	 * 作用对象是**当前绑定会话**（dsh 的权限预设是 per-session 的）。
+	 */
+	async function permissionMode({ openid, replyContext }, parsed) {
+		const sessionId = currentSessionId(openid)
+		if (!sessionId || sessionId === 'none') {
+			await deps.reply({
+				openid,
+				content: '当前没有绑定会话。先 `切换会话`，再发 `权限` 看这台的权限卡片。',
+				markdown: true,
+				replyContext,
+			})
+			return { handled: true }
+		}
+		if (parsed.tokens.length === 0) {
+			await deps.showPermissionCard?.({ openid, sessionId, replyContext })
+			return { handled: true }
+		}
+		// 带参数：直接设定（认中文名/英文 key/序号）
+		const result = await deps.setPermission?.({ openid, sessionId, tokens: parsed.tokens })
+		if (!result) {
+			await deps.reply({ openid, content: usageText('权限'), replyContext })
+			return { handled: true }
+		}
+		await deps.reply({
+			openid,
+			content: result.ok
+				? `已把 **${sessions.describe(sessionId)}** 的权限切成 ${result.text}。`
+				: `${result.error}\n\n${usageText('权限')}`,
 			markdown: true,
 			replyContext,
 		})
