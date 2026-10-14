@@ -492,8 +492,13 @@ test('端到端：命令 → 会话卡片；绑定后普通消息进会话；一
 	})
 	// 标题缺失时用 cwd 末段兜底：所以这里是 proj-a(session-1)
 	assert.equal(notice.args.content, 'proj-a(session-1)已结束')
-	assert.equal(notice.args.keyboard.content.rows[0].buttons[0].render_data.label, '我需要回复')
-	assert.equal(notice.args.keyboard.content.rows[0].buttons[0].action.data, cardData.needReply('session-1'))
+	const noticeButtons = notice.args.keyboard.content.rows[0].buttons
+	assert.equal(noticeButtons[0].render_data.label, '我需要回复')
+	assert.equal(noticeButtons[0].action.data, cardData.needReply('session-1'))
+	// 「发送消息」是指令按钮：只把「发送 <会话id>」填进输入框（进那个会话的输入态）
+	assert.equal(noticeButtons[1].render_data.label, '发送消息')
+	assert.equal(noticeButtons[1].action.type, 2)
+	assert.equal(noticeButtons[1].action.data, '发送 session-1')
 
 	boot.dispose()
 })

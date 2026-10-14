@@ -353,12 +353,18 @@ function oneLine(text, limit = 60) {
  *   - 被打断：`标题(id)被打断`，并尽量带上"打断来自哪条消息"（`> 打断来自：…`）；
  *     拿不到那条消息时照样报被打断，只是不带引用行。
  */
-export function buildNoticeCard({ label, sessionId, interrupted = false, source = '' }) {
+export function buildNoticeCard({ label, sessionId, interrupted = false, source = '', sendCommand }) {
 	const lines = [interrupted ? `${label}被打断` : `${label}已结束`]
 	const quoted = interrupted ? oneLine(source) : ''
 	if (quoted) lines.push(`> 打断来自：${quoted}`)
-	const button = callbackButton('我需要回复', data.needReply(sessionId), { visited: '已触发' })
-	return { content: lines.join('\n'), keyboard: keyboardOf([{ buttons: [button] }]) }
+	const buttons = [callbackButton('我需要回复', data.needReply(sessionId), { visited: '已触发' })]
+	if (typeof sendCommand === 'function') {
+		// 「发送消息」是指令按钮：只把 `发送 <会话id>` 填进 QQ 输入框（由用户自己按发送）。
+		// 填的是"只给目标"的形式 → 那条命令会**进入该会话的输入态**，可以慢慢写正文、
+		// 加附件，最后点输入态卡片上的「发送」才真正投递。
+		buttons.push(commandButton('发送消息', sendCommand(sessionId)))
+	}
+	return { content: lines.join('\n'), keyboard: keyboardOf([{ buttons }]) }
 }
 
 /**

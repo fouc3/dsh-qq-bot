@@ -706,6 +706,8 @@ export function apply(ctx, rawConfig) {
 			}),
 		agentFor,
 		nextSeqFor: (sessionId) => nextSeq(`session:${sessionId}`),
+		// 「已结束」卡片上的「发送消息」：填 `发送 <会话id>` → 进该会话的输入态。
+		sendCommand: (sessionId) => `发送 ${sessionId}`,
 		onDeliver: async ({ sessionId, openid, text, origin, images = [], sections = [] }) => {
 			await deliver({ sessionId, openid, text, interrupt: false, origin: origin ?? 'delayed', context: {}, images, sections })
 		},

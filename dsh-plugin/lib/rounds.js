@@ -43,6 +43,7 @@ export function createRounds({
 	agentFor,
 	onDeliver,
 	onPlan,
+	sendCommand,
 	nextSeqFor,
 }) {
 	const rounds = new Map()
@@ -105,6 +106,7 @@ export function createRounds({
 			sessionId: round.sessionId,
 			interrupted,
 			source,
+			sendCommand,
 		})
 		outbox.enqueue('send_c2c', {
 			openid: round.openid,

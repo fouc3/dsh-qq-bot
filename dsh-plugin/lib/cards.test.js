@@ -445,3 +445,19 @@ test('新建会话卡片：空目录的「删除目录」单独占一行（不�
 	assert.deepEqual(rows.at(-2), ['返回上级', '新建目录', '在这里新建'])
 	assert.ok(card.keyboard.content.rows.length <= 5)
 })
+
+test('结束通知：多一个「发送消息」指令按钮，填入 `发送 <会话id>`', () => {
+	const card = buildNoticeCard({
+		label: '项目甲(session-1)',
+		sessionId: 'session-1',
+		sendCommand: (sessionId) => `发送 ${sessionId}`,
+	})
+	const buttons = card.keyboard.content.rows[0].buttons
+	assert.deepEqual(buttons.map((b) => b.render_data.label), ['我需要回复', '发送消息'])
+	assert.equal(buttons[1].action.type, 2, '指令按钮（type=2）才会填输入框')
+	assert.equal(buttons[1].action.data, '发送 session-1')
+	assert.equal(buttons[1].action.permission.type, 2)
+	// 不传 sendCommand 时保持只有一个按钮（向后兼容）
+	const plain = buildNoticeCard({ label: '项目甲(session-1)', sessionId: 'session-1' })
+	assert.deepEqual(plain.keyboard.content.rows[0].buttons.map((b) => b.render_data.label), ['我需要回复'])
+})
