@@ -929,6 +929,45 @@ test('端到端：dsh 内置命令从 QQ 直接执行（不进模型）；技能
 	assert.equal(agent.followed[1].content[0].text, '/unknown 参数')
 })
 
+test('端到端：`/goal resume` 这类命令要原样透传（模型工具不许恢复 paused 目标，命令通道可以）', async (t) => {
+	const agent = makeAgent('session-1')
+	const executed = []
+	const boot = bootPlugin(t, {
+		sessions: SUMMARIES,
+		live: { 'session-1': agent },
+		commands: {
+			async list() {
+				return [{ name: 'goal', description: '设置或查看长期任务目标' }]
+			},
+			async execute(target, line) {
+				executed.push({ sessionId: target.id, line })
+				return { commandId: 'g1', result: { kind: 'success', text: 'Goal resumed（目标已恢复）' } }
+			},
+		},
+	})
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M0' })
+	await drainFor(boot.socketPath, 60)
+
+	// 作用：dsh 的 **模型工具** `update_goal resume` 明确拒绝恢复 paused 目标
+	// （GOAL_TOOL_RESUME_PAUSED："the model cannot resume a paused goal; the user must resume it"），
+	// 而 `/goal resume` 这个**命令**直接调 `ctx.goals.resume`，没有那层限制 —— 所以 QQ 侧
+	// 恢复暂停目标的正路是发 `/goal resume`，本桥必须原样透传。
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '/goal resume', msgId: 'M1' })
+	await waitFor(() => executed.length === 1)
+	assert.equal(executed[0].sessionId, 'session-1')
+	assert.equal(executed[0].line, '/goal resume', '命令要原样交给 ctx.commands.execute')
+	assert.equal(agent.followed.length, 0, '命令不该被当成提示词发给模型')
+	const ack = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /Goal resumed/.test(String(c.args.content))) ?? null
+	})
+	assert.ok(ack, '命令结果要回给 QQ')
+
+	boot.dispose()
+})
+
 test('提问桥：ask_user_question 的 waterfall 在 QQ 侧发卡片，点选项后结算', async (t) => {
 	const agent = makeAgent('session-1')
 	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': agent } })
