@@ -20,6 +20,14 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// 接口地址约定（与 QQ-Group-Management-Bot 一致）：base_url > sandbox > SDK 默认。
+const (
+	// ProductionBaseURL 是官方生产地址（SDK 默认值，留空即用它）。
+	ProductionBaseURL = "https://api.bot.qq.com"
+	// SandboxBaseURL 是沙箱请求地址。
+	SandboxBaseURL = "https://sandbox.api.sgroup.qq.com"
+)
+
 // DefaultPath 是未指定 -config 时的默认配置路径。
 const DefaultPath = "config.yaml"
 
@@ -212,6 +220,17 @@ func (c *Config) Validate() error {
 // CredentialsConfigured 报告是否配置了凭据（供启动期检查，不在 Validate 里强制）。
 func (c *Config) CredentialsConfigured() bool {
 	return c.QQ.AccessToken != "" || (c.QQ.AppID != "" && c.QQ.ClientSecret != "")
+}
+
+// ResolvedBaseURL 返回实际使用的接口地址：base_url 优先，其次 sandbox，最后空串（= SDK 默认）。
+func (c *Config) ResolvedBaseURL() string {
+	if c.QQ.BaseURL != "" {
+		return c.QQ.BaseURL
+	}
+	if c.QQ.Sandbox {
+		return SandboxBaseURL
+	}
+	return ""
 }
 
 // Allowed 报告某个 openid 是否在白名单里。
