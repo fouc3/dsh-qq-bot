@@ -1,0 +1,70 @@
+# DSH-QQ-Bot（QQ 侧网关）配置模板
+#
+# 用法：
+#   cp config.example.yaml config.yaml   # config.yaml 已在 .gitignore 里
+#   go run ./cmd/qqbot -config config.yaml
+#   go run ./cmd/qqbot -config config.yaml -check-config   # 只校验并打印摘要，不连 QQ、不连 dsh
+#
+# 约定：
+#   * 未知键名 = 启动失败（拼错会立刻报错，不会被静默忽略）
+#   * 任意字符串值里可以写 ${ENV_VAR} 从环境变量取；**引用了未设置的变量即启动失败**
+#     （不想用环境变量就留空字符串，不要写 ${X} 占位）
+#   * 密钥与令牌永不写入日志；-check-config 只报告"是否已设置"
+
+# ── QQ 开放平台凭据（二选一）──────────────────────────────────────────────
+qq:
+  # 方式一：机器人凭据，SDK 自动获取并刷新 access_token
+  appid: ""
+  client_secret: ""
+  # 方式二：已签发的凭证（设置后直接使用，不再自动获取）
+  access_token: ""
+  # 留空 = 官方 https://api.bot.qq.com；只有走代理/沙箱时才填
+  base_url: ""
+  sandbox: false
+
+# ── 与 dsh 插件的本地通道（UNIX domain socket）────────────────────────────
+bridge:
+  # 必须与 dsh 插件 cordis.patch.yml 里的 socketPath 完全一致。
+  # 目录会被设为 0700、socket 文件 0600：权限即认证，仅当前账户可访问。
+  socket: "~/.dsh/dsh-qq-bot/bridge.sock"
+  # 可选加固：非空时连接后必须先发 {"token":"…"} 握手帧（须与插件侧一致）
+  token: ""
+  dial_timeout_seconds: 10
+  # outbox 长轮询的等待秒数（最长一次的等待，不是轮询间隔）
+  poll_wait_seconds: 25
+  # 通道不可用时的重连退避上限
+  reconnect_max_seconds: 30
+
+# ── 白名单：只有这里列出的 QQ 私聊可以控制 bot（空 = 谁都不能用）──────────
+# openid 的拿法：让目标账号给机器人发一条私聊消息，日志里会打出
+# 「已丢弃非白名单用户的私聊」并附 openid，把它填到这里即可。
+whitelist:
+  # 第一道门守在网关：不在名单里的账号，消息与按钮互动一律丢弃，只记一条 WARN。
+  # 空列表（或空文件）表示"谁都不能控制 bot"——这是安全默认值。
+  users: []
+  # 照抄下面三行并填入 openid 即可：
+  #   - openid: "2A3B4C5D6E7F…"   # QQ 单聊的 user_openid，日志里能拿到
+  #     note: "运维者"            # 仅用于日志与摘要，可选
+  #     panel: true               # 把指令面板绑定到这个私聊（自定义菜单是全局的，不受此项影响）
+
+# ── 命令面板 ──────────────────────────────────────────────────────────────
+panel:
+  enabled: true
+  # 用 remark 在平台侧定位已存在的面板（重启后复用同一面板，不依赖本地保存的 panel_id）
+  remark: "DSH-QQ-BOT 指令面板"
+  # 单聊窗口底部的自定义菜单（send_message 型 = 点击把命令填进输入框）
+  menu_enabled: true
+
+# ── 富媒体（图片 / 视频 / 语音 / 文件）────────────────────────────────────
+media:
+  # 允许发送的本机路径前缀；空 = 不限制（收件人只有白名单本人，与 bot 同机）
+  allowed_roots: []
+  # 单文件上限；平台硬上限 200MB，可下调
+  max_upload_bytes: 209715200
+  # 分片并发；0 = 用平台返回的 UploadConfig.concurrency
+  upload_concurrency: 0
+
+# ── 日志 ──────────────────────────────────────────────────────────────────
+log:
+  level: "info"      # debug | info | warn | error
+  format: "text"     # text | json

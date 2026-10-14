@@ -1,0 +1,18 @@
+# 本机配置（含密钥与 openid），一律不入库
+config.yaml
+config.local.yaml
+*.local.yaml
+
+# 构建产物
+/bin/
+/qqbot
+*.test
+*.out
+
+# 运行期状态（默认在 ~/.dsh/dsh-qq-bot，若被指到仓库内也不要提交）
+/run/
+*.sock
+state.json
+
+# Node
+node_modules/
