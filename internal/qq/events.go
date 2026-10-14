@@ -44,7 +44,21 @@ func quotedText(data *qqbotsdk.C2CMessageCreateData) string {
 		}
 		return ""
 	}
-	return walk(data.MsgElements, 0)
+	return normalizeQuoted(walk(data.MsgElements, 0))
+}
+
+// normalizeQuoted 还原引用摘要里的转义。
+//
+// 引用一条 **markdown 消息**时，平台把 markdown 源码当摘要给出，换行写作字面量
+// `\n`（客户端里也会显示成反斜杠N）。这里还原成真换行，让 AI 与日志看到正常文本。
+// 取舍：被引用正文里本来就有反斜杠+n 的字面量（如 Windows 路径 C:\new）会被改写，
+// 引用摘要场景下这个代价可以接受。
+func normalizeQuoted(text string) string {
+	if !strings.Contains(text, `\`) {
+		return text
+	}
+	replacer := strings.NewReplacer(`\r\n`, "\n", `\n`, "\n", `\t`, "\t")
+	return strings.TrimSpace(replacer.Replace(text))
 }
 
 // Emitter 把归一化事件交给本地通道。

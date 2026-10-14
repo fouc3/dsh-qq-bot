@@ -1,6 +1,7 @@
 package qq
 
 import (
+	"strings"
 	"testing"
 
 	qqbotsdk "github.com/fouc3/qq-bot-sdk"
@@ -62,5 +63,30 @@ func TestDecideC2CExtractsQuote(t *testing.T) {
 	}
 	if got := DecideC2C(image, nil); got.Forward {
 		t.Errorf("没有文本可用的引用应丢弃：%+v", got.Event)
+	}
+}
+
+// 引用一条 markdown 消息时，平台把源码当摘要，换行是字面量 \n —— 要还原成真换行，
+// 否则 AI 与日志里都是反斜杠N（用户报过这个问题）。
+func TestQuotedTextUnescapesMarkdownSummary(t *testing.T) {
+	data := &qqbotsdk.C2CMessageCreateData{
+		ID:          "MSG-Q",
+		MessageType: qqbotsdk.EventMsgTypeQuote,
+		Content:     "看看这个",
+		Author:      &qqbotsdk.User{UserOpenID: "U1"},
+		MsgElements: []qqbotsdk.MsgElement{
+			{Content: `第一行\n第二行\t带制表符\r\n第三行`},
+		},
+	}
+	d := DecideC2C(data, nil)
+	want := "第一行\n第二行\t带制表符\n第三行"
+	if d.Event.Quote != want {
+		t.Errorf("引用摘要未正确还原：\n得到 %q\n期望 %q", d.Event.Quote, want)
+	}
+	if strings.Contains(d.Event.Quote, `\n`) {
+		t.Error("还原后不该再有字面量反斜杠n")
+	}
+	if got := normalizeQuoted("普通一条没有转义的引用"); got != "普通一条没有转义的引用" {
+		t.Errorf("普通文本被改动了：%q", got)
 	}
 }

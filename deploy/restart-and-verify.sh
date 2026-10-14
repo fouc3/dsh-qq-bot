@@ -31,8 +31,10 @@ if [ ! -S "$SOCKET" ]; then
 fi
 log "通道已就绪：$(stat -c '%A %n' "$SOCKET")"
 
-systemctl --user start dsh-qq-bot
-log "网关已启动"
+# 必须用 restart：网关是独立服务，dsh-web 重启不会让它退出，
+# 对 active 的服务调 start 是空操作 —— 会继续跑旧二进制（踩过：quote 字段没上线）。
+systemctl --user restart dsh-qq-bot
+log "网关已重启（加载最新二进制）"
 sleep 8
 
 log "--- 网关日志（末尾）---"
