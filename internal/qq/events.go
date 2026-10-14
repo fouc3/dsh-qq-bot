@@ -31,6 +31,14 @@ type Registrar interface {
 
 var _ Registrar = (*qqbotsdk.Client)(nil)
 
+// 白名单拒绝的原因常量：日志层要用它们判断"是否该打完整 openid"。
+const (
+	// ReasonNotAllowed 是非白名单账号发来的私聊消息。
+	ReasonNotAllowed = "非白名单用户"
+	// ReasonNotAllowedTap 是非白名单账号点了按钮。
+	ReasonNotAllowedTap = "非白名单用户点击按钮"
+)
+
 // EventKind 取值。
 const (
 	KindC2CMessage  = "c2c_message"
@@ -70,7 +78,7 @@ func DecideC2C(data *qqbotsdk.C2CMessageCreateData, allowed func(string) bool) D
 		return Decision{Reason: "缺少单聊 openid"}
 	}
 	if allowed != nil && !allowed(openid) {
-		return Decision{OpenID: openid, Reason: "非白名单用户"}
+		return Decision{OpenID: openid, Reason: ReasonNotAllowed}
 	}
 	text := strings.TrimSpace(data.Content)
 	if text == "" {
@@ -118,7 +126,7 @@ func DecideInteraction(data *qqbotsdk.InteractionCreateData, allowed func(string
 	}
 	if allowed != nil && !allowed(openid) {
 		deny := qqbotsdk.InteractionCodeNoPermission
-		return Decision{OpenID: openid, Respond: &deny, Reason: "非白名单用户点击按钮"}
+		return Decision{OpenID: openid, Respond: &deny, Reason: ReasonNotAllowedTap}
 	}
 	return Decision{
 		Forward: true,
@@ -132,6 +140,22 @@ func DecideInteraction(data *qqbotsdk.InteractionCreateData, allowed func(string
 			At:         nowRFC3339(),
 		},
 	}
+}
+
+// logDrop 记一条"丢弃"日志。
+//
+// 白名单拒绝时故意打**完整 openid**：这是引导用户把自己的 openid 填进
+// config.yaml 的唯一途径（openid 只能从事件里拿）。其他原因仍保持脱敏。
+func logDrop(log *slog.Logger, msg string, d Decision) {
+	if d.Reason == ReasonNotAllowed || d.Reason == ReasonNotAllowedTap {
+		log.Warn(msg,
+			"reason", d.Reason,
+			"openid", d.OpenID,
+			"hint", "把上面的 openid 填进 config.yaml 的 whitelist.users[]（该条可加 panel: true 绑定指令面板），然后重启网关",
+		)
+		return
+	}
+	log.Warn(msg, "reason", d.Reason, "openid", RedactOpenID(d.OpenID))
 }
 
 // RegisterHandlers 登记单聊消息、按钮互动与就绪事件。
@@ -154,7 +178,7 @@ func RegisterHandlers(reg Registrar, client *Client, allowed func(string) bool, 
 		}
 		d := DecideC2C(data, allowed)
 		if !d.Forward {
-			log.Warn("丢弃私聊消息", "reason", d.Reason, "openid", RedactOpenID(d.OpenID))
+			logDrop(log, "丢弃私聊消息（不在白名单）", d)
 			return nil
 		}
 		return emit(ctx, d.Event)
@@ -176,7 +200,7 @@ func RegisterHandlers(reg Registrar, client *Client, allowed func(string) bool, 
 			}
 		}
 		if !d.Forward {
-			log.Warn("丢弃按钮互动", "reason", d.Reason, "openid", RedactOpenID(d.OpenID))
+			logDrop(log, "丢弃按钮互动", d)
 			return nil
 		}
 		return emit(ctx, d.Event)
