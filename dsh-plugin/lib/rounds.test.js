@@ -100,22 +100,66 @@ test('AI 调过 qq_reply 也照发结束通知（只是记录状态不同）', a
 	assert.ok(enqueued.some((e) => String(e.args.content).includes('已结束')))
 })
 
-test('被顶替/未认领的轮次不发通知；用户显式停止也不发', async () => {
-	const { rounds, enqueued, agent } = setup()
-	rounds.beginRound({ sessionId: 'session-1', openid: 'U1', origin: 'qq' })
-	// 还没认领任何轮次：这是被我们打断的那一轮在收尾
-	sessionEvent(agent, { type: 'turn/end', data: { turn: 2, reason: { kind: 'aborted' } } })
-	await tick()
-	assert.equal(enqueued.filter((e) => String(e.args.content).includes('已结束')).length, 0)
+test('被打断与正常结束要区分：被顶替/显式停止发「被打断」通知并带上打断来源', async () => {
+	const noticesOf = (list) =>
+		list.filter((e) => e.kind === 'send_c2c' && /已结束|被打断/.test(String(e.args.content))).map((e) => String(e.args.content))
 
-	// 用户显式停止
-	const second = setup()
-	second.rounds.beginRound({ sessionId: 'session-1', openid: 'U1', origin: 'qq' })
-	second.rounds.markStopped('session-1')
-	sessionEvent(second.agent, { type: 'turn/start', data: { turn: 9 } })
-	sessionEvent(second.agent, { type: 'turn/end', data: { turn: 9, reason: { kind: 'aborted' } } })
+	// 被新消息顶替：旧轮要发「被打断」，并带上打断它的那条消息
+	const first = setup()
+	first.rounds.beginRound({ sessionId: 'session-1', openid: 'U1', origin: 'qq' })
+	first.rounds.beginRound({ sessionId: 'session-1', openid: 'U1', origin: 'qq', interruptSource: '帮我看下这个报错' })
 	await tick()
-	assert.equal(second.enqueued.filter((e) => String(e.args.content).includes('已结束')).length, 0)
+	const interrupted = noticesOf(first.enqueued)
+	assert.equal(interrupted.length, 1, '被顶替的轮要有一条被打断通知')
+	assert.match(interrupted[0], /被打断/)
+	assert.doesNotMatch(interrupted[0], /已结束/)
+	assert.match(interrupted[0], /打断来自：帮我看下这个报错/)
+
+	// 拿不到打断来源时：照样报被打断，只是不带引用行
+	const noSource = setup()
+	noSource.rounds.beginRound({ sessionId: 'session-1', openid: 'U1', origin: 'qq' })
+	noSource.rounds.beginRound({ sessionId: 'session-1', openid: 'U1', origin: 'qq' })
+	await tick()
+	const withoutSource = noticesOf(noSource.enqueued)
+	assert.equal(withoutSource.length, 1)
+	assert.match(withoutSource[0], /被打断/)
+	assert.doesNotMatch(withoutSource[0], /打断来自/)
+
+	// 用户显式停止：也算被打断
+	const stopped = setup()
+	stopped.rounds.beginRound({ sessionId: 'session-1', openid: 'U1', origin: 'qq' })
+	stopped.rounds.markStopped('session-1', '用户发送了「停止」命令')
+	await tick()
+	const stoppedNotices = noticesOf(stopped.enqueued)
+	assert.equal(stoppedNotices.length, 1, '显式停止也要通知，且是「被打断」')
+	assert.match(stoppedNotices[0], /被打断/)
+	assert.match(stoppedNotices[0], /停止/)
+
+	// 还没认领任何轮次时的 turn/end（被我们打断的那一轮收尾）不该重复发通知
+	const unclaimed = setup()
+	unclaimed.rounds.beginRound({ sessionId: 'session-1', openid: 'U1', origin: 'qq' })
+	unclaimed.agent.handlers['session/event'](null, { type: 'turn/end', data: { turn: 2, reason: { kind: 'aborted' } } })
+	await tick()
+	assert.equal(noticesOf(unclaimed.enqueued).length, 0)
+})
+
+test('正常结束发「已结束」；认领到的轮次 abort（非顶替）也算被打断', async () => {
+	const done = setup()
+	done.rounds.beginRound({ sessionId: 'session-1', openid: 'U1', origin: 'qq' })
+	sessionEvent(done.agent, { type: 'turn/start', data: { turn: 1 } })
+	sessionEvent(done.agent, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+	await tick()
+	const ok = done.enqueued.filter((e) => e.kind === 'send_c2c').map((e) => String(e.args.content)).join('|')
+	assert.match(ok, /已结束/)
+	assert.doesNotMatch(ok, /被打断/)
+
+	const aborted = setup()
+	aborted.rounds.beginRound({ sessionId: 'session-1', openid: 'U1', origin: 'qq' })
+	sessionEvent(aborted.agent, { type: 'turn/start', data: { turn: 4 } })
+	sessionEvent(aborted.agent, { type: 'turn/end', data: { turn: 4, reason: { kind: 'aborted' } } })
+	await tick()
+	const bad = aborted.enqueued.filter((e) => e.kind === 'send_c2c').map((e) => String(e.args.content)).join('|')
+	assert.match(bad, /被打断/)
 })
 
 test('延迟发送：只在"正常结束"时投递；被停止/出错不投递', async () => {

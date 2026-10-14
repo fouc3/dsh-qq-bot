@@ -259,10 +259,29 @@ export function buildNewSessionCard({ dir, dirs, page = 1, pageSize = 8, parentP
  *
  * 按钮是回调按钮：点了由插件校验后向会话注入一条唤醒消息（不再自动催促 AI）。
  */
-export function buildNoticeCard({ label, sessionId }) {
-	const content = `${label}已结束`
+/** 把多行文本压成一行并截断（通知里的"打断来自"用）。 */
+function oneLine(text, limit = 60) {
+	const flat = String(text ?? '')
+		.replace(/\s+/g, ' ')
+		.trim()
+	if (!flat) return ''
+	return flat.length > limit ? `${flat.slice(0, limit)}…` : flat
+}
+
+/**
+ * 一轮结束的通知卡。
+ *
+ * 用户要求区分两种收尾：
+ *   - 正常结束：`标题(id)已结束`
+ *   - 被打断：`标题(id)被打断`，并尽量带上"打断来自哪条消息"（`> 打断来自：…`）；
+ *     拿不到那条消息时照样报被打断，只是不带引用行。
+ */
+export function buildNoticeCard({ label, sessionId, interrupted = false, source = '' }) {
+	const lines = [interrupted ? `${label}被打断` : `${label}已结束`]
+	const quoted = interrupted ? oneLine(source) : ''
+	if (quoted) lines.push(`> 打断来自：${quoted}`)
 	const button = callbackButton('我需要回复', data.needReply(sessionId), { visited: '已触发' })
-	return { content, keyboard: keyboardOf([{ buttons: [button] }]) }
+	return { content: lines.join('\n'), keyboard: keyboardOf([{ buttons: [button] }]) }
 }
 
 /**

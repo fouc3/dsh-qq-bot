@@ -42,12 +42,18 @@ export function createRounds({
 		return rounds.get(sessionId) ?? null
 	}
 
-	/** 开一轮：会顶替掉上一轮（被顶替的轮不发结束通知）。 */
-	function beginRound({ sessionId, openid, origin = 'qq', context = {}, pendingContext = null }) {
+	/**
+	 * 开一轮：会顶替掉上一轮。
+	 *
+	 * 被顶替 = 被打断：给上一轮补一条「被打断」通知，并尽量带上打断它的那条消息
+	 * （interruptSource 拿不到就不带引用行，照样提示被打断）。
+	 */
+	function beginRound({ sessionId, openid, origin = 'qq', context = {}, pendingContext = null, interruptSource = '' }) {
 		const previous = rounds.get(sessionId)
 		if (previous) {
 			previous.superseded = true
 			if (previous.fallbackTimer) clearTimeout(previous.fallbackTimer)
+			notifyInterrupted(previous, interruptSource)
 		}
 		const round = {
 			sessionId,
@@ -69,10 +75,53 @@ export function createRounds({
 		return round
 	}
 
-	/** 标记"用户显式停止"：这一轮结束时不发结束通知。 */
-	function markStopped(sessionId) {
+	/**
+	 * 标记"用户显式停止"：这也算被打断（不是正常结束），所以立刻发一条「被打断」通知。
+	 * source 一般是那条停止动作（QQ 命令原文 / GUI 取消）。
+	 */
+	function markStopped(sessionId, source = '') {
 		const round = rounds.get(sessionId)
-		if (round) round.stopped = true
+		if (!round) return
+		round.stopped = true
+		notifyInterrupted(round, source)
+	}
+
+	/** 发一条结束/被打断通知（按 会话+轮次 去重）。 */
+	function enqueueNotice(round, { interrupted = false, source = '' } = {}) {
+		if (!round || round.origin !== 'qq' || !round.openid) return
+		const key = `${round.sessionId}:${round.turn ?? round.startedAt}`
+		if (state.noticeSeen(key)) return
+		const card = buildNoticeCard({
+			label: sessions.label(round.sessionId),
+			sessionId: round.sessionId,
+			interrupted,
+			source,
+		})
+		outbox.enqueue('send_c2c', {
+			openid: round.openid,
+			markdown: true,
+			content: card.content,
+			keyboard: card.keyboard,
+			replyToMsgId: round.context.msgId ?? '',
+			replyToEventId: round.context.eventId ?? '',
+			msgSeq: nextSeq(round.sessionId),
+		})
+		state.markNotice(key)
+		logger?.info?.(interrupted ? '已发被打断通知' : '已发结束通知', {
+			sessionId: round.sessionId,
+			hasSource: Boolean(source),
+		})
+	}
+
+	/** 被打断（被新消息顶替 / 用户显式停止）：立刻通知，并尽量带上打断来源。 */
+	function notifyInterrupted(round, source = '') {
+		if (!round || round.ended) return
+		round.ended = true
+		if (round.fallbackTimer) {
+			clearTimeout(round.fallbackTimer)
+			round.fallbackTimer = null
+		}
+		enqueueNotice(round, { interrupted: true, source })
 	}
 
 	const currentContext = (sessionId) => currentRound(sessionId)?.context ?? { msgId: '', eventId: '' }
@@ -198,21 +247,8 @@ export function createRounds({
 		}
 
 		if (round.origin === 'qq' && !round.superseded && !round.stopped && round.openid) {
-			const key = `${sessionId}:${round.turn ?? round.startedAt}`
-			if (!state.noticeSeen(key)) {
-				const card = buildNoticeCard({ label: sessions.label(sessionId), sessionId })
-				outbox.enqueue('send_c2c', {
-					openid: round.openid,
-					markdown: true,
-					content: card.content,
-					keyboard: card.keyboard,
-					replyToMsgId: round.context.msgId ?? '',
-					replyToEventId: round.context.eventId ?? '',
-					msgSeq: nextSeq(sessionId),
-				})
-				state.markNotice(key)
-				logger?.info?.('已发结束通知', { sessionId, replied: round.replied, reason })
-			}
+			// 只有 reason=completed 才是「正常结束」；aborted/blocked/error 都算被打断。
+			enqueueNotice(round, { interrupted: reason !== 'completed' })
 		}
 
 		// 延迟发送只在"AI 正常结束这一轮"时投递：被停止/被顶替/出错的轮不算。

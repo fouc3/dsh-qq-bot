@@ -279,7 +279,8 @@ export function apply(ctx, rawConfig) {
 			agent.cancel({ kind: 'user' }, { keepInbox: false })
 		}
 		ensureAgentSetup(agent, sessionId)
-		const round = rounds.beginRound({ sessionId, openid, origin, context })
+		// 被打断时把「这条消息」当作打断来源：通知里会带一行「> 打断来自：…」。
+		const round = rounds.beginRound({ sessionId, openid, origin, context, interruptSource: interrupt ? text : '' })
 		round.pendingContext = rounds.roundContextText(round)
 		agent.followup(makeUserMessage(text, { kind: 'dsh-qq-bot' }))
 		return { ok: true }
@@ -322,7 +323,7 @@ export function apply(ctx, rawConfig) {
 		stopSession: async (sessionId) => {
 			const agent = ctx.agents.get(sessionId)
 			if (!agent) return { ok: false, reason: '当前没有在运行的轮次' }
-			rounds.markStopped(sessionId)
+			rounds.markStopped(sessionId, '用户发送了「停止」命令')
 			agent.cancel({ kind: 'user' }, { keepInbox: true })
 			return { ok: true }
 		},
