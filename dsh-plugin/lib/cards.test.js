@@ -6,6 +6,8 @@ import {
 	buildInboxCard,
 	buildInboxResult,
 	buildMkdirPromptCard,
+	buildModelListCard,
+	buildModelProviderCard,
 	buildNewSessionCard,
 	buildNoticeCard,
 	buildPermissionCard,
@@ -522,4 +524,160 @@ test('删除确认卡片：确认删除＝红（破坏性），取消＝灰', ()
 	assert.equal(buttons[0].render_data.style, 0)
 	assert.equal(buttons[1].render_data.label, '确认删除')
 	assert.equal(buttons[1].render_data.style, 3, '破坏性动作用红色，不用填充蓝')
+})
+
+// ── 模型卡片（提供商 → 模型） ─────────────────────────────────────────────
+
+function modelGroups(count) {
+	return Array.from({ length: count }, (_, i) => ({
+		id: `p${i}`,
+		name: `提供商${i}`,
+		models: Array.from({ length: 2 }, (_, j) => ({ id: `m${i}-${j}`, name: `模型${i}-${j}`, description: '' })),
+	}))
+}
+
+test('模型卡片·提供商：每行 2 个、超一页才有翻页行、当前提供商标蓝、整卡不超 5 行', () => {
+	// 10 个提供商正好铺满 5 行 × 2 个 → 不需要翻页行
+	const full = buildModelProviderCard({ groups: modelGroups(10), current: { provider: 'p3', model: 'm3-0' } })
+	const fullRows = full.keyboard.content.rows
+	assert.equal(fullRows.length, 5, '10 个供应商正好 5 行 2 列')
+	assert.ok(fullRows.every((row) => row.buttons.length === 2), '每行最多 2 个')
+	assert.ok(!full.keyboard.content.rows.flatMap((r) => r.buttons).some((b) => b.render_data.label === '下一页'))
+	assert.match(full.content, /当前：\*\*提供商3 \/ 模型3-0\*\*/)
+	assert.match(full.content, /提供商 10 个 · 模型 20 个/)
+	const currentButton = fullRows
+		.flatMap((row) => row.buttons)
+		.find((b) => b.action.data === data.model('enter', 'p3'))
+	assert.equal(currentButton.render_data.style, 1, '当前提供商标蓝')
+	assert.equal(currentButton.render_data.visited_label, '当前')
+
+	// 11 个 → 让出一行给翻页（每页 8 个），整卡仍是 5 行
+	const paged = buildModelProviderCard({ groups: modelGroups(11), current: null })
+	const pagedRows = paged.keyboard.content.rows
+	assert.equal(pagedRows.length, 5, '4 行内容 + 1 行翻页')
+	assert.equal(pagedRows[0].buttons.length, 2)
+	assert.ok(pagedRows.at(-1).buttons.some((b) => b.render_data.label === '下一页'))
+	assert.match(paged.content, /第 1\/2 页（每页 8 个提供商）/)
+	assert.match(paged.content, /当前：`（读不到，换过之后就会显示）`/, '读不到当前模型也要照常出卡片')
+	assert.deepEqual(parseCallback(pagedRows.at(-1).buttons[0].action.data), { kind: 'model', action: 'page', arg: '2' })
+	assert.deepEqual(parseCallback(pagedRows[0].buttons[0].action.data), { kind: 'model', action: 'enter', arg: 'p0' })
+
+	// 第二页只剩 3 个，翻页行只有「上一页」
+	const second = buildModelProviderCard({ groups: modelGroups(11), current: null, page: 2 })
+	const secondLabels = second.keyboard.content.rows.at(-1).buttons.map((b) => b.render_data.label)
+	assert.deepEqual(secondLabels, ['上一页'])
+
+	// 读不到模型的提供商单独提示
+	const withFailures = buildModelProviderCard({
+		groups: modelGroups(2),
+		failures: [{ id: 'broken', name: 'Broken', message: '没 key' }],
+	})
+	assert.match(withFailures.content, /1 个提供商读不到模型：`Broken`/)
+})
+
+test('模型卡片·模型列表：每行 1 个、翻页、导航行带「切其他会话」指令按钮（type=2）', () => {
+	const group = {
+		id: 'deepseek',
+		name: 'DeepSeek',
+		models: [
+			{ id: 'deepseek-chat', name: 'DeepSeek Chat', description: '通用对话' },
+			{ id: 'deepseek-reasoner', name: 'DeepSeek Reasoner', description: '深度推理' },
+			{ id: 'deepseek-coder', name: 'DeepSeek Coder', description: '' },
+			{ id: 'deepseek-vl', name: 'DeepSeek VL', description: '' },
+		],
+	}
+	const card = buildModelListCard({
+		group,
+		current: { provider: 'deepseek', model: 'deepseek-chat' },
+		label: '项目甲(session-1)',
+		otherCommand: '模型 deepseek/deepseek-chat ',
+	})
+	const rows = card.keyboard.content.rows
+	assert.equal(rows.length, 5, '4 行模型（每行 1 个）+ 1 行导航')
+	assert.ok(rows.slice(0, 4).every((row) => row.buttons.length === 1), '模型每行最多 1 个')
+	const labels = rows.flatMap((row) => row.buttons.map((b) => b.render_data.label))
+	assert.deepEqual(labels.slice(4), ['返回', '切其他会话'])
+	assert.ok(labels.every((label) => displayWidth(label) <= 10), '按钮 label 都不超平台宽度')
+
+	// 当前模型：标 ✅ + 蓝色 + visited=当前
+	assert.match(card.content, /当前：\*\*DeepSeek \/ DeepSeek Chat\*\*/)
+	assert.match(card.content, /1\. \*\*DeepSeek Chat\*\* ✅/)
+	const currentButton = rows[0].buttons[0]
+	assert.equal(currentButton.render_data.style, 1)
+	assert.equal(currentButton.render_data.visited_label, '当前')
+	assert.equal(rows[1].buttons[0].render_data.style, 0)
+	assert.deepEqual(parseCallback(rows[1].buttons[0].action.data), {
+		kind: 'model',
+		action: 'pick',
+		arg: 'deepseek:deepseek-reasoner',
+	})
+
+	// 导航行：「返回」是回调按钮，「切其他会话」是**指令按钮**（只填输入框）
+	const nav = rows.at(-1).buttons
+	assert.equal(nav[0].action.type, 1)
+	assert.deepEqual(parseCallback(nav[0].action.data), { kind: 'model', action: 'list', arg: '' })
+	assert.equal(nav[1].action.type, 2, '「切其他会话」只填输入框，不产生互动事件')
+	assert.equal(nav[1].action.data, '模型 deepseek/deepseek-chat ')
+	assert.match(card.content, /末尾补上会话id再发送/)
+
+	// 6 个模型 → 4 就放不下（要留翻页行）：每页 3 个
+	const many = {
+		id: 'openai',
+		name: 'OpenAI',
+		models: Array.from({ length: 6 }, (_, i) => ({ id: `m${i}`, name: `模型${i}`, description: '' })),
+	}
+	const paged = buildModelListCard({ group: many, current: null, page: 1 })
+	assert.equal(paged.keyboard.content.rows.length, 5, '3 行模型 + 翻页 + 导航')
+	assert.match(paged.content, /第 1\/2 页（每页 3 个模型）/)
+	assert.deepEqual(
+		paged.keyboard.content.rows.at(-2).buttons.map((b) => b.render_data.label),
+		['下一页'],
+	)
+	assert.deepEqual(parseCallback(paged.keyboard.content.rows.at(-2).buttons[0].action.data), {
+		kind: 'model',
+		action: 'mpage',
+		arg: 'openai:2',
+	})
+	// 读不到当前模型时不给「切其他会话」（没东西可填），也不留那句提示
+	assert.deepEqual(
+		paged.keyboard.content.rows.at(-1).buttons.map((b) => b.render_data.label),
+		['返回'],
+	)
+	assert.ok(!paged.content.includes('切其他会话'))
+
+	// 刚切完（chosen）：正文写明"已切到"，并把这一档标成当前
+	const chosenCard = buildModelListCard({
+		group,
+		current: null,
+		chosen: { provider: 'deepseek', model: 'deepseek-reasoner' },
+		otherCommand: '模型 deepseek/deepseek-reasoner ',
+	})
+	assert.match(chosenCard.content, /✅ 已切到 \*\*DeepSeek \/ DeepSeek Reasoner\*\*/)
+	assert.match(chosenCard.content, /2\. \*\*DeepSeek Reasoner\*\* ✅/)
+	assert.equal(
+		chosenCard.keyboard.content.rows.flatMap((r) => r.buttons).find((b) => b.action.type === 2).action.data,
+		'模型 deepseek/deepseek-reasoner ',
+	)
+})
+
+test('模型卡片回调 data 能原样解析回来（端到端契约）', () => {
+	assert.deepEqual(parseCallback(data.model('page', '2')), { kind: 'model', action: 'page', arg: '2' })
+	assert.deepEqual(parseCallback(data.model('enter', 'deepseek-official')), {
+		kind: 'model',
+		action: 'enter',
+		arg: 'deepseek-official',
+	})
+	assert.deepEqual(parseCallback(data.model('mpage', 'deepseek:3')), {
+		kind: 'model',
+		action: 'mpage',
+		arg: 'deepseek:3',
+	})
+	assert.deepEqual(parseCallback(data.model('pick', 'deepseek:deepseek-chat')), {
+		kind: 'model',
+		action: 'pick',
+		arg: 'deepseek:deepseek-chat',
+	})
+	assert.deepEqual(parseCallback(data.model('list')), { kind: 'model', action: 'list', arg: '' })
+	assert.equal(parseCallback(data.model('')), null)
+	assert.equal(parseCallback('qqb:mod'), null, '不是本插件的回调前缀')
 })

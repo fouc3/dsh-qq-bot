@@ -123,6 +123,9 @@ export const data = {
 	rmdirYes: (path) => `${DATA_PREFIX}:rmdir2:${path}`,
 	// 权限卡片：切成某个预设（value 是 dsh 的预设 key，如 danger-full-access）
 	perm: (value) => `${DATA_PREFIX}:perm:${value}`,
+	// 模型卡片：page（提供商翻页）/ enter（进提供商看模型）/ mpage（提供商内翻页）/
+	// pick（切到某个模型）/ list（回到提供商列表）；arg 是提供商 id 或 `提供商id:…`。
+	model: (action, arg = '') => `${DATA_PREFIX}:mod:${action}${arg === '' ? '' : `:${arg}`}`,
 }
 
 /** 解析回调 data；不是本插件的数据返回 null。 */
@@ -151,6 +154,14 @@ export function parseCallback(raw) {
 	}
 	if (raw.startsWith(`${DATA_PREFIX}:perm:`)) {
 		return { kind: 'perm', value: raw.slice(`${DATA_PREFIX}:perm:`.length) }
+	}
+	if (raw.startsWith(`${DATA_PREFIX}:mod:`)) {
+		const rest = raw.slice(`${DATA_PREFIX}:mod:`.length)
+		const first = rest.indexOf(':')
+		const action = first < 0 ? rest : rest.slice(0, first)
+		const arg = first < 0 ? '' : rest.slice(first + 1)
+		if (!action) return null
+		return { kind: 'model', action, arg }
 	}
 	if (raw.startsWith(`${DATA_PREFIX}:rmdir2:`)) {
 		return { kind: 'rmdiryes', path: raw.slice(`${DATA_PREFIX}:rmdir2:`.length) }
@@ -418,6 +429,159 @@ export function buttonsPerRowFor(count, { preferred = 2, maxRows = KEYBOARD_MAX_
 		if (Math.ceil(count / perRow) <= maxRows) return perRow
 	}
 	return KEYBOARD_MAX_BUTTONS_PER_ROW
+}
+
+// ── 模型（提供商 → 模型）两级选择卡片 ─────────────────────────────────────
+//
+// 用户要求：**提供商每行最多 2 个**（可翻页），点进去才是这个提供商的模型，
+// **模型每行最多 1 个**（可翻页）——每行少放几个就不会被挤成窄条。
+// 两级都遵守平台 5 行 × 5 列上限：内容行之外只多留"翻页行"和"导航行"。
+
+/** 模型选择第一级：提供商。 */
+export const MODEL_PROVIDERS_PER_ROW = 2
+/** 模型选择第二级：模型（用户要求每行最多一个）。 */
+export const MODEL_LIST_PER_ROW = 1
+
+/**
+ * 用来标注"当前"的一段文字。
+ * @param {{provider:string, model:string}|null} current
+ * @param {Array} groups
+ */
+function currentModelText(current, groups) {
+	if (!current?.provider || !current?.model) return '`（读不到，换过之后就会显示）`'
+	const group = groups.find((item) => item.id === current.provider)
+	const model = group?.models?.find((item) => item.id === current.model)
+	const shown = group && model ? `${group.name} / ${model.name}` : `${current.provider} / ${current.model}`
+	return `**${shown}**（\`${current.provider}/${current.model}\`）`
+}
+
+/**
+ * 模型卡片第一级：提供商列表（每行 2 个，可翻页）。
+ *
+ * @param {object} input
+ * @param {Array<{id:string,name:string,models:Array}>} input.groups
+ * @param {Array<{id:string,name:string,message:string}>} [input.failures]
+ * @param {{provider:string,model:string}|null} [input.current]
+ * @param {string} [input.label] 会话显示名（标题(会话id)）
+ * @param {number} [input.page]
+ */
+export function buildModelProviderCard({ groups = [], failures = [], current = null, label = '', page = 1 }) {
+	const perRow = MODEL_PROVIDERS_PER_ROW
+	const capacity = KEYBOARD_MAX_ROWS * perRow
+	const slots = groups.length <= capacity ? capacity : (KEYBOARD_MAX_ROWS - 1) * perRow
+	const pages = Math.max(1, Math.ceil(groups.length / slots))
+	const currentPage = Math.min(Math.max(1, Number(page) || 1), pages)
+	const slice = groups.slice((currentPage - 1) * slots, currentPage * slots)
+	const modelCount = groups.reduce((total, group) => total + group.models.length, 0)
+
+	const lines = [
+		'**模型**',
+		`> 会话：${label || '（当前会话）'}`,
+		`> 当前：${currentModelText(current, groups)}`,
+		`提供商 ${groups.length} 个 · 模型 ${modelCount} 个`,
+	]
+	if (pages > 1) lines.push(`第 ${currentPage}/${pages} 页（每页 ${slots} 个提供商）`)
+	lines.push('', '点一个**提供商**进去选它的模型（每行 1 个模型）。')
+	if (failures.length > 0) {
+		lines.push(
+			'',
+			`> ⚠️ ${failures.length} 个提供商读不到模型：${failures.map((item) => `\`${item.name}\``).join('、')}`,
+		)
+	}
+
+	const rows = rowsOf(
+		slice.map((group) =>
+			callbackButton(group.name, data.model('enter', group.id), {
+				style: current?.provider === group.id ? BUTTON_STYLE.primary : BUTTON_STYLE.neutral,
+				visited: current?.provider === group.id ? '当前' : group.name,
+			}),
+		),
+		perRow,
+	)
+	const pager = []
+	if (currentPage > 1) pager.push(callbackButton('上一页', data.model('page', String(currentPage - 1))))
+	if (currentPage < pages) pager.push(callbackButton('下一页', data.model('page', String(currentPage + 1))))
+	if (pager.length > 0) rows.push({ buttons: pager })
+
+	return { content: lines.join('\n'), keyboard: keyboardOf(clampRows(rows)) }
+}
+
+/**
+ * 模型卡片第二级：某个提供商的模型列表（每行 1 个，可翻页）。
+ *
+ * 导航行里除了「返回」，还有一个**指令按钮**「切其他会话」：它只把
+ * `模型 <提供商>/<模型>` 填进 QQ 输入框（用户要求），用户在末尾补上**会话id**
+ * 再发送，就切给了别的会话；不补就是当前会话。
+ *
+ * @param {object} input
+ * @param {{id:string,name:string,models:Array}} input.group
+ * @param {{provider:string,model:string}|null} [input.current]
+ * @param {string} [input.label]
+ * @param {number} [input.page]
+ * @param {{id:string,name:string}|null} [input.chosen] 刚刚切换成功的那一个（用于"确认"提示）
+ * @param {string} [input.otherCommand] 「切其他会话」按钮要填进输入框的命令文本
+ */
+export function buildModelListCard({ group, current = null, label = '', page = 1, chosen = null, otherCommand = '' }) {
+	const models = group?.models ?? []
+	const perRow = MODEL_LIST_PER_ROW
+	// 导航行（返回 + 切其他会话）固定占一行；翻页行只有在需要时才出现，
+	// 所以先按"不放翻页行"算一遍，放不下再让出一行给翻页。
+	const navRows = 1
+	const capacity = (KEYBOARD_MAX_ROWS - navRows) * perRow
+	const slots = models.length <= capacity ? capacity : (KEYBOARD_MAX_ROWS - navRows - 1) * perRow
+	const pages = Math.max(1, Math.ceil(models.length / slots))
+	const currentPage = Math.min(Math.max(1, Number(page) || 1), pages)
+	const slice = models.slice((currentPage - 1) * slots, currentPage * slots)
+
+	const marked = chosen ?? current
+	const lines = [
+		`**模型 · ${group?.name ?? ''}**`,
+		`> 会话：${label || '（当前会话）'}`,
+		`> 当前：${currentModelText(marked, group ? [group] : [])}`,
+	]
+	if (chosen) {
+		// chosen 给的是 id（回调 data 里只有 id）：显示名从这一组里查。
+		const picked = models.find((model) => model.id === chosen.model)
+		lines.push(`✅ 已切到 **${group.name} / ${picked?.name ?? chosen.model}**。`)
+	}
+	if (pages > 1) lines.push(`第 ${currentPage}/${pages} 页（每页 ${slots} 个模型）`)
+	lines.push('', '点一个**模型**就切到当前会话（不用再确认）。')
+	for (const [index, model] of slice.entries()) {
+		const order = (currentPage - 1) * slots + index + 1
+		const isCurrent = marked?.provider === group?.id && marked?.model === model.id
+		lines.push(
+			`${order}. **${model.name}**${isCurrent ? ' ✅' : ''}${model.description ? ` — ${model.description}` : ''}`,
+		)
+	}
+	// 没有「切其他会话」按钮（读不到当前模型）时不留这句提示，免得用户找不到按钮。
+	if (otherCommand) {
+		lines.push('', '> 想切给**别的会话**：点「切其他会话」把命令填进输入框，末尾补上会话id再发送。')
+	}
+
+	const rows = rowsOf(
+		slice.map((model) =>
+			callbackButton(model.name, data.model('pick', `${group.id}:${model.id}`), {
+				style:
+					marked?.provider === group?.id && marked?.model === model.id
+						? BUTTON_STYLE.primary
+						: BUTTON_STYLE.neutral,
+				visited: marked?.provider === group?.id && marked?.model === model.id ? '当前' : model.name,
+			}),
+		),
+		perRow,
+	)
+	const pager = []
+	if (currentPage > 1) pager.push(callbackButton('上一页', data.model('mpage', `${group.id}:${currentPage - 1}`)))
+	if (currentPage < pages) pager.push(callbackButton('下一页', data.model('mpage', `${group.id}:${currentPage + 1}`)))
+	if (pager.length > 0) rows.push({ buttons: pager })
+
+	const nav = [callbackButton('返回', data.model('list'), { style: BUTTON_STYLE.neutral })]
+	if (otherCommand) {
+		nav.push(commandButton('切其他会话', otherCommand, { style: BUTTON_STYLE.neutral }))
+	}
+	rows.push({ buttons: nav })
+
+	return { content: lines.join('\n'), keyboard: keyboardOf(clampRows(rows)) }
 }
 
 /**

@@ -138,10 +138,18 @@ bot 启动时（重连后也会重发）上报白名单快照与面板意图，p
 {"remark":"DSH-QQ-BOT 指令面板","enabled":true,
  "menuEnabled":true,
  "items":[{"name":"切换会话","desc":"选择要接入的会话"}],
+ "menuItems":[{"name":"切换会话","sendMessage":"切换会话"},
+              {"name":"管理","type":"menu","children":[{"name":"停止","sendMessage":"停止"}]},
+              {"name":"dsh 命令1","type":"menu","children":[{"name":"compact","sendMessage":"/compact"}]}],
  "userOpenIds":["…"]}
 ```
 
 bot 收到后按 `remark` 找到已有面板 → 更新；找不到 → 创建；并把 `userOpenIds` 差量同步。
+
+`menuItems` 是单聊窗口底部的**自定义菜单**（整体覆盖，`type:"menu"` 表示一层二级菜单，内容在
+`children` 里；两项都没有 `type` 时是 `send_message`，点了只把 `sendMessage` 填进输入框）。
+平台硬限制：**顶层 ≤10 项、二级每组 ≤5 项**——所以桥命令里不常点的 `停止/归档/权限`
+收进「管理」二级菜单（顶层共 7 项），给 dsh 命令的二级菜单留位。
 
 ## 5. 队列语义
 
@@ -163,6 +171,7 @@ bot 收到后按 `remark` 找到已有面板 → 更新；找不到 → 创建�
 | AI 回复 | 正文以 `【{标题}({sessionId})】` 开头（模板可配） |
 | 一轮结束通知 | `{标题}({sessionId})已结束` + 键盘单行两按钮：「我需要回复」`action.type=1`、`data="qqb:needreply:<sessionId>"`；「发送消息」`action.type=2`（指令按钮，只把 `发送 <sessionId>` 填进输入框） |
 | 权限卡片 | 每档一个回调按钮，`data="qqb:perm:<预设key>"`（如 `danger-full-access`）；每行 2 个、放不下自动加宽；当前档 `style=1`（蓝）、其余 `style=0`（灰） |
+| 模型卡片 | 两级：**提供商**每行 2 个、`data="qqb:mod:enter:<提供商id>"`（第一级翻页 `qqb:mod:page:<页码>`）；**模型**每行 1 个、`data="qqb:mod:pick:<提供商id>:<模型id>"`（第二级翻页 `qqb:mod:mpage:<提供商id>:<页码>`、回列表 `qqb:mod:list`）。当前档 `style=1`（蓝）；模型列表导航行另有一个**指令按钮**「切其他会话」`action.type=2`（只把 `模型 <提供商id>/<模型id>` 填进输入框，用户补会话id后发送即切给别的会话） |
 | 会话选择卡片 | 文件夹按钮 `action.type=1`、`data="qqb:dir:<路径>"`；会话按钮 `action.type=2`（指令按钮，只把 `切换会话 <sessionId>` 填进输入框）。新建会话卡片另有 `qqb:mkdir:`（新建目录，等名字）、`qqb:mkx:`（取消等名字）、`qqb:rmdir:` / `qqb:rmdir2:`（删除空目录的两步确认） |
 | 提问卡片 | 选项 `data="qqq:<callId>:<题序>:<选项序>"`、其他 `…:custom`、提交 `…:submit`；选中 `style=1`、未选中 `style=0` |
 | 按钮配色 | 主操作＝蓝 `1`、次要/退出＝灰 `0`、破坏性＝红 `3`；**不用 `4`**（SDK 名为"蓝色填充"，线上客户端实际渲染成白色，曾导致"取消蓝、发送白"被点错） |

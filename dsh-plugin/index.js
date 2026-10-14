@@ -28,9 +28,12 @@ import { buildReplyTool } from './lib/reply-tool.js'
 import { ATTACHMENT_TOOL_NAME, buildAttachmentTool } from './lib/attachment-tool.js'
 import { DEFAULT_MAX_ATTACHMENT_BYTES, DEFAULT_MAX_FETCH_BYTES, createInbox, formatBytes } from './lib/inbox.js'
 import { createPermissions } from './lib/permissions.js'
+import { createModels, splitOnce } from './lib/models.js'
 import {
 	QUESTION_MAX_BUTTONS,
 	buildInboxCard,
+	buildModelListCard,
+	buildModelProviderCard,
 	buildPermissionCard,
 	buildInboxResult,
 	buildMkdirPromptCard,
@@ -143,6 +146,8 @@ export function apply(ctx, rawConfig) {
 	const inbox = createInbox({ state, attachments: ctx.attachments, config, logger })
 	// 权限预设（就是 Web 里那个 仅可查看/工作区内修改/完全权限 选择器）：可选服务。
 	const permissions = createPermissions({ ctx, logger })
+	// 模型目录与切换（就是 Web 里那个模型选择器）：可选服务，见 lib/models.js。
+	const models = createModels({ ctx, logger })
 
 	// ── 会话级序号：被动回复按 msg_id+msg_seq 去重，所以每条消息都要递增 ──────
 	const seqByKey = new Map()
@@ -202,6 +207,89 @@ export function apply(ctx, rawConfig) {
 	}
 
 	/**
+	 * 模型卡片第一级：提供商列表（每行 2 个，可翻页）。
+	 *
+	 * 作用对象是**当前绑定会话**；卡片上标出它现在用的是哪个提供商的哪个模型。
+	 */
+	async function showModelCard({ openid, sessionId, page = 1, replyContext = {} }) {
+		const catalog = await models.catalog()
+		if (!catalog.ok) {
+			await sendText({ openid, content: catalog.error, markdown: true, context: replyContext })
+			return null
+		}
+		if (catalog.groups.length === 0) {
+			const hint = catalog.failures.length > 0
+				? `\n\n> 读不到模型的提供商：${catalog.failures.map((item) => `\`${item.name}\``).join('、')}`
+				: ''
+			await sendText({
+				openid,
+				content: `这个部署现在没有任何**可路由**的模型（都没配好 key 或都读失败）。${hint}`,
+				markdown: true,
+				context: replyContext,
+			})
+			return null
+		}
+		const current = await models.current(sessionId)
+		const card = buildModelProviderCard({
+			groups: catalog.groups,
+			failures: catalog.failures,
+			current,
+			label: sessions.get(sessionId) ? sessions.label(sessionId) : sessionId,
+			page,
+		})
+		await io.sendCard({ openid, content: card.content, keyboard: card.keyboard, context: replyContext })
+		return card
+	}
+
+	/**
+	 * 模型卡片第二级：某个提供商的模型列表（每行 1 个，可翻页）。
+	 *
+	 * `chosen` 是刚切成功的那一个：卡片会写成"✅ 已切到 …"并标成当前——
+	 * 这就是用户说的「选择完毕确认」，同一张卡片上还给一个**指令按钮**「切其他会话」，
+	 * 点它只是把 `模型 <提供商>/<模型>` 填进输入框，用户在末尾补会话id再发送即可。
+	 */
+	async function showModelListCard({ openid, sessionId, providerId, page = 1, chosen = null, replyContext = {} }) {
+		const catalog = await models.catalog()
+		if (!catalog.ok) {
+			await sendText({ openid, content: catalog.error, markdown: true, context: replyContext })
+			return null
+		}
+		const group = catalog.groups.find((item) => item.id === providerId)
+		if (!group) {
+			// 目录变了（提供商被禁用/读失败）：退回提供商列表，别让用户对着死卡片点。
+			await sendText({ openid, content: `提供商 \`${providerId}\` 现在不可用，这是最新的列表。`, markdown: true, context: replyContext })
+			return showModelCard({ openid, sessionId, replyContext })
+		}
+		const current = await models.current(sessionId)
+		const justChosen = chosen && chosen.provider === group.id ? chosen : null
+		const marked = justChosen ?? (current?.provider === group.id ? current : null)
+		// 「切其他会话」按钮要填进输入框的命令：`模型 <提供商>/<模型>`（末尾留空格给会话id）。
+		const otherCommand = marked ? models.commandFor(group, { id: marked.model }) : ''
+		const card = buildModelListCard({
+			group,
+			current,
+			chosen: justChosen,
+			label: sessions.get(sessionId) ? sessions.label(sessionId) : sessionId,
+			page,
+			otherCommand,
+		})
+		await io.sendCard({ openid, content: card.content, keyboard: card.keyboard, context: replyContext })
+		return card
+	}
+
+	/**
+	 * 把某个会话的模型切成 spec（`提供商/模型名字`）指定的那一档。
+	 * @returns {Promise<{ok:boolean, text?:string, error?:string}|null>}
+	 */
+	async function setModelForSession({ openid, sessionId, spec }) {
+		const catalog = await models.catalog()
+		if (!catalog.ok) return { ok: false, error: catalog.error }
+		const resolved = models.resolveToken(spec, catalog.groups)
+		if (!resolved.ok) return { ok: false, error: resolved.error }
+		const result = await models.set(sessionId, { provider: resolved.group.id, model: resolved.model.id })
+		if (!result.ok) return result
+		return { ok: true, value: `${resolved.group.id}/${resolved.model.id}`, text: models.describe(resolved.group, resolved.model) }
+	}	/**
 	 * 这个会话归哪个 QQ 私聊。
 	 *
 	 * 先看当前绑定；没有绑定就回退到"最近一次从 QQ 跟它说过话的人"——
@@ -792,6 +880,9 @@ export function apply(ctx, rawConfig) {
 		showPermissionCard: ({ openid, sessionId, replyContext }) =>
 			showPermissionCard({ openid, sessionId, replyContext }),
 		setPermission: ({ openid, sessionId, tokens }) => setPermissionForSession({ openid, sessionId, tokens }),
+		// 模型卡片（提供商 → 模型两级）/ 直接切（见 lib/models.js）。
+		showModelCard: ({ openid, sessionId, replyContext }) => showModelCard({ openid, sessionId, replyContext }),
+		setModel: ({ openid, sessionId, spec }) => setModelForSession({ openid, sessionId, spec }),
 		// 裸发 `发送` 进入输入态（详细设计见 lib/inbox.js 顶部注释）。
 		beginInput: ({ openid, sessionId, replyContext, mode }) => beginInput({ openid, sessionId, replyContext, mode }),
 		// 进度是**只读**的：只用 agents.get（不 resume、不 cancel）；拿不到活跃 agent 就如实说没在跑。
@@ -1106,6 +1197,54 @@ export function apply(ctx, rawConfig) {
 			await sendText({ openid, content: '已取消新建目录。', markdown: true, context: ctxReply })
 			await showNewSessionCard({ openid, dir: parsed.path, replyContext: ctxReply })
 			code = 0
+		} else if (parsed.kind === 'model') {
+			// 模型卡片：提供商翻页 / 进提供商 / 提供商内翻页 / 切某个模型 / 回提供商列表。
+			// 全部作用于**当前绑定会话**（与 `权限` 一致）。
+			const ctxReply = { eventId: event.eventId, msgId: event.msgId ?? '' }
+			const bound = state.bindingOf(openid)
+			if (!bound || bound === 'none') {
+				await sendText({ openid, content: '当前没有绑定会话，先 `切换会话`。', markdown: true, context: ctxReply })
+				code = 1
+			} else if (parsed.action === 'page') {
+				await showModelCard({ openid, sessionId: bound, page: Number(parsed.arg) || 1, replyContext: ctxReply })
+				code = 0
+			} else if (parsed.action === 'list') {
+				await showModelCard({ openid, sessionId: bound, replyContext: ctxReply })
+				code = 0
+			} else if (parsed.action === 'enter') {
+				await showModelListCard({ openid, sessionId: bound, providerId: parsed.arg, replyContext: ctxReply })
+				code = 0
+			} else if (parsed.action === 'mpage') {
+				const [providerId, page] = splitOnce(parsed.arg)
+				await showModelListCard({
+					openid,
+					sessionId: bound,
+					providerId,
+					page: Number(page) || 1,
+					replyContext: ctxReply,
+				})
+				code = 0
+			} else if (parsed.action === 'pick') {
+				const [providerId, modelId] = splitOnce(parsed.arg)
+				const result = await setModelForSession({ openid, sessionId: bound, spec: `${providerId}/${modelId}` })
+				if (!result?.ok) {
+					await sendText({ openid, content: result?.error ?? '切换模型失败。', markdown: true, context: ctxReply })
+					code = 1
+				} else {
+					// 切完就着同一张卡片做"选择完毕确认"：标出新当前，并给出「切其他会话」按钮。
+					await showModelListCard({
+						openid,
+						sessionId: bound,
+						providerId,
+						chosen: { provider: providerId, model: modelId },
+						replyContext: ctxReply,
+					})
+					code = 0
+				}
+			} else {
+				logger.debug?.('收到未知的模型卡片动作', { action: parsed.action })
+				code = 1
+			}
 		} else if (parsed.kind === 'perm') {
 			// 权限卡片上的级别按钮：切成这个预设，并把卡片重发一遍（标出新的"当前"）。
 			const ctxReply = { eventId: event.eventId, msgId: event.msgId ?? '' }

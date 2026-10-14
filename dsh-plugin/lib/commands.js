@@ -70,6 +70,19 @@ export const COMMANDS = [
 		usage: '权限',
 		usageAlt: '权限 <级别>                   # 直接设定，如 `权限 完全权限`、`权限 read-only`、`权限 2`',
 	},
+	{
+		name: '模型',
+		desc: '看/切模型（提供商/模型）',
+		purpose:
+			'管理**当前会话**要用的模型（就是 dsh Web 里那个模型选择器）：' +
+			'发 `模型`（不带参数）回一张卡片——先列**提供商**（每行最多 2 个，可翻页），' +
+			'点一个提供商进去才是它的**模型**（每行最多 1 个，可翻页），点一下就切；' +
+			'也可以 `模型 <提供商>/<模型名字>` 直接切（提供商与模型都认 id 或显示名），' +
+			'末尾还能再跟一个**会话id**，把模型切给别的会话（不跟就是当前会话）。',
+		usage: '模型',
+		usageAlt: '模型 <提供商>/<模型名字>             # 直接切（默认当前会话）',
+		usageAlt2: '模型 <提供商>/<模型名字> <会话id>    # 切给指定会话',
+	},
 ]
 
 const BY_NAME = new Map(COMMANDS.map((cmd) => [cmd.name, cmd]))
@@ -115,9 +128,54 @@ export function panelItems() {
 	return COMMANDS.map((cmd) => ({ name: cmd.name, desc: cmd.desc }))
 }
 
-/** 单聊窗口底部自定义菜单项（send_message 型 = 点击把命令填进输入框）。 */
+/**
+ * 自定义菜单的版式（顶层顺序 + 哪些命令收进二级菜单）。
+ *
+ * 为什么要有这份版式：QQ 平台**顶层最多 10 项**（二级每组 ≤5），而顶层还要留给
+ * dsh 内置命令的二级菜单。命令表长到 9 条时，8 个平铺顶层 + 2 个 dsh 二级菜单
+ * 就是 10 项上限——再加一条会挤掉 dsh 命令。所以把不常点的
+ * 「停止 / 归档 / 权限」收进一个「管理」二级菜单：顶层 6 平铺 + 1 个二级菜单 = 7，
+ * 给 dsh 命令留出 3 个顶层位（实际 2 个：「dsh 命令1」「dsh 命令2」）。
+ *
+ * 只影响**自定义菜单**：指令面板（panelItems）仍是完整平铺的 9 条命令。
+ */
+const MENU_LAYOUT = [
+	'切换会话',
+	'新建会话',
+	'发送',
+	'延迟发送',
+	'模型',
+	'进度',
+	{ name: '管理', children: ['停止', '归档', '权限'] },
+]
+
+/**
+ * 单聊窗口底部自定义菜单项（send_message 型 = 点击把命令填进输入框；
+ * type='menu' 型是一层二级菜单，内容在 children 里）。
+ *
+ * 版式里没提到的命令会被兜底平铺在末尾——保证"命令表加了新命令"绝不会从菜单里消失。
+ */
 export function menuItems() {
-	return COMMANDS.map((cmd) => ({ name: cmd.name, sendMessage: cmd.name }))
+	const mentioned = new Set()
+	const items = MENU_LAYOUT.map((entry) => {
+		if (typeof entry === 'string') {
+			mentioned.add(entry)
+			return { name: entry, sendMessage: entry }
+		}
+		const children = entry.children
+			.filter((name) => {
+				mentioned.add(name)
+				return BY_NAME.has(name)
+			})
+			.map((name) => ({ name, sendMessage: name }))
+		if (children.length === 0) return null
+		return { name: entry.name, type: 'menu', children }
+	}).filter(Boolean)
+
+	for (const cmd of COMMANDS) {
+		if (!mentioned.has(cmd.name)) items.push({ name: cmd.name, sendMessage: cmd.name })
+	}
+	return items
 }
 
 /**
@@ -132,6 +190,8 @@ export function menuItems() {
  *   @param {(req:object)=>Promise<void>} deps.deliver 向会话投递消息（不打断）
  *   @param {(sessionId:string)=>Promise<{ok:boolean, reason?:string}>} deps.stopSession
  *   @param {(sessionId:string)=>Promise<{ok:boolean, reason?:string}>} deps.archiveSession
+ *   @param {(req:object)=>Promise<void>} deps.showModelCard 发/刷新模型选择卡片（提供商列表）
+ *   @param {(req:object)=>Promise<{ok:boolean, text?:string, error?:string}|null>} deps.setModel 切某个会话的模型
  */
 export function createCommandRunner(deps) {
 	const { sessions, state, logger } = deps
@@ -165,6 +225,8 @@ export function createCommandRunner(deps) {
 				return delaySend(context, parsed)
 			case '权限':
 				return permissionMode(context, parsed)
+			case '模型':
+				return modelMode(context, parsed)
 			default:
 				return { handled: false }
 		}
@@ -425,6 +487,71 @@ export function createCommandRunner(deps) {
 			content: result.ok
 				? `已把 **${sessions.describe(sessionId)}** 的权限切成 ${result.text}。`
 				: `${result.error}\n\n${usageText('权限')}`,
+			markdown: true,
+			replyContext,
+		})
+		return { handled: true }
+	}
+
+	/**
+	 * 模型：不带参数发卡片（提供商 → 模型两级），带参数直接切。
+	 *
+	 * 作用对象**默认是当前绑定会话**；末尾可以再跟一个可选的**会话id**，
+	 * 把模型切给别的会话（`模型 deepseek/deepseek-chat session-xxxx`）。
+	 */
+	async function modelMode({ openid, replyContext }, parsed) {
+		if (parsed.tokens.length === 0) {
+			const sessionId = currentSessionId(openid)
+			if (!sessionId || sessionId === 'none') {
+				await deps.reply({
+					openid,
+					content: '当前没有绑定会话。先 `切换会话`，再发 `模型` 看模型卡片；也可以 `模型 <提供商>/<模型名字> <会话id>` 直接切给某个会话。',
+					markdown: true,
+					replyContext,
+				})
+				return { handled: true }
+			}
+			await deps.showModelCard?.({ openid, sessionId, replyContext })
+			return { handled: true }
+		}
+
+		// 末尾可选会话id：只有"最后一个 token 能当成会话引用"时才切出来，
+		// 这样带空格的模型显示名（`模型 openai/GPT 5.2`）不会被误当成会话。
+		let specTokens = parsed.tokens
+		let target = ''
+		if (parsed.tokens.length >= 2) {
+			const tail = parsed.tokens[parsed.tokens.length - 1]
+			const ref = sessions.resolveRef([tail])
+			if (ref?.error) {
+				await deps.reply({ openid, content: `${ref.error}\n\n${usageText('模型')}`, replyContext })
+				return { handled: true }
+			}
+			if (ref?.sessionId && ref.sessionId !== 'none') {
+				target = ref.sessionId
+				specTokens = parsed.tokens.slice(0, -1)
+			}
+		}
+		const sessionId = target || currentSessionId(openid)
+		if (!sessionId || sessionId === 'none') {
+			await deps.reply({
+				openid,
+				content: `当前没有绑定会话。用法：\`模型\` 看卡片，或 \`模型 <提供商>/<模型名字> <会话id>\` 切给某个会话。`,
+				markdown: true,
+				replyContext,
+			})
+			return { handled: true }
+		}
+
+		const result = await deps.setModel?.({ openid, sessionId, spec: specTokens.join(' ') })
+		if (!result) {
+			await deps.reply({ openid, content: usageText('模型'), replyContext })
+			return { handled: true }
+		}
+		await deps.reply({
+			openid,
+			content: result.ok
+				? `已把 **${sessions.describe(sessionId)}** 的模型切成 ${result.text}。`
+				: `${result.error}\n\n${usageText('模型')}`,
 			markdown: true,
 			replyContext,
 		})

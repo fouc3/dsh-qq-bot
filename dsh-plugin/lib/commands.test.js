@@ -34,8 +34,8 @@ function makeSessions() {
 	}
 }
 
-function makeRunner({ seed = {} } = {}) {
-	const calls = { replies: [], delivered: [], stopped: [], archived: [], cards: [], inputs: [] }
+function makeRunner({ seed = {}, modelResult = { ok: true, text: '**DeepSeek / DeepSeek Chat**' } } = {}) {
+	const calls = { replies: [], delivered: [], stopped: [], archived: [], cards: [], inputs: [], modelCards: [], models: [] }
 	const state = createState({ seed })
 	const runner = createCommandRunner({
 		sessions: makeSessions(),
@@ -43,6 +43,11 @@ function makeRunner({ seed = {} } = {}) {
 		logger: {},
 		reply: async ({ openid, content }) => calls.replies.push({ openid, content }),
 		showSessionCard: async ({ openid, dir }) => calls.cards.push({ openid, dir }),
+		showModelCard: async ({ openid, sessionId }) => calls.modelCards.push({ openid, sessionId }),
+		setModel: async ({ openid, sessionId, spec }) => {
+			calls.models.push({ openid, sessionId, spec })
+			return modelResult
+		},
 		deliver: async (req) => calls.delivered.push(req),
 		beginInput: async ({ openid, sessionId, mode = 'send' }) => {
 			calls.inputs.push({ openid, sessionId, ...(mode === 'send' ? {} : { mode }) })
@@ -88,9 +93,30 @@ test('需要参数的命令无参时回作用与用法', () => {
 
 test('面板条目与菜单条目都由同一张命令表派生', () => {
 	const items = panelItems()
-	assert.equal(items.length, 8)
-	assert.deepEqual(items.map((i) => i.name), ['切换会话', '新建会话', '进度', '发送', '停止', '归档', '延迟发送', '权限'])
-	assert.equal(menuItems()[0].sendMessage, '切换会话')
+	assert.equal(items.length, 9)
+	assert.deepEqual(items.map((i) => i.name), ['切换会话', '新建会话', '进度', '发送', '停止', '归档', '延迟发送', '权限', '模型'])
+	assert.equal(items.at(-1).desc, '看/切模型（提供商/模型）')
+
+	// 自定义菜单：顶层只有 7 项（6 个平铺 + 1 个「管理」二级菜单），
+	// 这是为了给 dsh 命令的二级菜单留顶层位（平台顶层最多 10 项）。
+	const menu = menuItems()
+	assert.equal(menu.length, 7)
+	assert.deepEqual(
+		menu.filter((it) => it.type !== 'menu').map((it) => it.sendMessage),
+		['切换会话', '新建会话', '发送', '延迟发送', '模型', '进度'],
+	)
+	const manage = menu.find((it) => it.type === 'menu')
+	assert.equal(manage.name, '管理')
+	assert.deepEqual(
+		manage.children.map((it) => it.sendMessage),
+		['停止', '归档', '权限'],
+	)
+	// 每条命令都还在菜单里（平铺或二级菜单），不能因为收编而消失
+	const shown = new Set([
+		...menu.filter((it) => it.type !== 'menu').map((it) => it.name),
+		...manage.children.map((it) => it.name),
+	])
+	assert.deepEqual([...shown].sort(), items.map((i) => i.name).sort())
 })
 
 test('切换会话：无参=会话选择；带会话id=绑定；none=解绑', async () => {
@@ -210,6 +236,62 @@ test('未绑定会话时停止/归档会提示', async () => {
 	await runner.run({ openid: 'U9', replyContext: {} }, parseCommand('停止'))
 	assert.match(calls.replies.at(-1).content, /当前没有绑定会话/)
 	assert.equal(calls.stopped.length, 0)
+})
+
+test('模型：不带参数发提供商卡片；带参数直接切；末尾可选会话id（默认当前会话）', async () => {
+	const { runner, calls } = makeRunner({ seed: boundSeed() })
+
+	// 不带参数 → 卡片（作用于当前绑定会话）
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('模型'))
+	assert.deepEqual(calls.modelCards, [{ openid: 'U1', sessionId: 'session-1' }])
+	assert.equal(calls.models.length, 0)
+
+	// 带 `提供商/模型` → 直接切当前会话
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('模型 deepseek/deepseek-chat'))
+	assert.deepEqual(calls.models, [{ openid: 'U1', sessionId: 'session-1', spec: 'deepseek/deepseek-chat' }])
+	assert.match(calls.replies.at(-1).content, /已把 .*session-1.* 的模型切成/)
+
+	// 末尾跟会话id → 切给那个会话
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('模型 deepseek/deepseek-reasoner session-2'))
+	assert.deepEqual(calls.models.at(-1), {
+		openid: 'U1',
+		sessionId: 'session-2',
+		spec: 'deepseek/deepseek-reasoner',
+	})
+
+	// 模型名字里带空格也不能被当成会话id（认不出就整段都是模型名字）
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('模型 OpenAI/GPT 5.2'))
+	assert.deepEqual(calls.models.at(-1), { openid: 'U1', sessionId: 'session-1', spec: 'OpenAI/GPT 5.2' })
+})
+
+test('模型：会话id写错要明确报错（不能当成模型名字）；切失败要带用法；没绑定会话也提示', async () => {
+	const { runner, calls } = makeRunner({ seed: boundSeed() })
+
+	// `session-nope` 认成"会话id但不存在" → 报错，且**不能**把会话id当模型名字去切
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('模型 deepseek/deepseek-chat session-nope'))
+	assert.equal(calls.models.length, 0)
+	assert.match(calls.replies.at(-1).content, /没找到会话/)
+	assert.match(calls.replies.at(-1).content, /用法/)
+
+	// 底层切失败（服务报错/会话锁模型）→ 原样带上错误 + 用法
+	const failing = makeRunner({ seed: boundSeed(), modelResult: { ok: false, error: '这个会话锁定了模型' } })
+	await failing.runner.run({ openid: 'U1', replyContext: {} }, parseCommand('模型 deepseek/deepseek-chat'))
+	assert.match(failing.calls.replies.at(-1).content, /这个会话锁定了模型/)
+	assert.match(failing.calls.replies.at(-1).content, /用法/)
+
+	// 没绑定会话：无参要提示，带会话id照常能切
+	const free = makeRunner()
+	await free.runner.run({ openid: 'U9', replyContext: {} }, parseCommand('模型'))
+	assert.equal(free.calls.modelCards.length, 0)
+	assert.match(free.calls.replies.at(-1).content, /当前没有绑定会话/)
+
+	await free.runner.run({ openid: 'U9', replyContext: {} }, parseCommand('模型 deepseek/deepseek-chat session-2'))
+	assert.deepEqual(free.calls.models, [{ openid: 'U9', sessionId: 'session-2', spec: 'deepseek/deepseek-chat' }])
+
+	// 用法里两种写法都要写出来
+	const usage = usageText('模型')
+	assert.match(usage, /模型 <提供商>\/<模型名字>/)
+	assert.match(usage, /模型 <提供商>\/<模型名字> <会话id>/)
 })
 
 test('未知会话 id 会给出明确错误与用法', async () => {

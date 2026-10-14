@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { apply, name as pluginName, inject as pluginInject } from '../index.js'
-import { data as cardData, parseCallback } from './cards.js'
+import { clipLabel, data as cardData, parseCallback } from './cards.js'
 import { REPLY_TOOL_NAME } from './reply-tool.js'
 import { ATTACHMENT_TOOL_NAME } from './attachment-tool.js'
 
@@ -106,6 +106,44 @@ function makeCtx({ sessionSummaries = [], live = {}, commands = null } = {}) {
 				const sessionId = `session-created-${sessionSummaries.length + 1}`
 				sessionSummaries.push({ sessionId, cwd, updatedAt: Date.now(), running: false })
 				return { sessionId }
+			},
+			// 模型：与 dsh 的 SessionController 同形（modelCatalog / selectModel / projections）。
+			selectedModels: [],
+			modelSelection: {},
+			async modelCatalog() {
+				return {
+					default: { provider: 'deepseek', model: 'deepseek-chat' },
+					routableProviders: ['deepseek', 'openai'],
+					groups: [
+						{
+							id: 'deepseek',
+							name: 'DeepSeek',
+							models: [
+								{ id: 'deepseek-chat', name: 'DeepSeek Chat', description: '通用对话' },
+								{ id: 'deepseek-reasoner', name: 'DeepSeek Reasoner', description: '深度推理' },
+							],
+						},
+						{
+							id: 'openai',
+							name: 'OpenAI',
+							models: [
+								{ id: 'gpt-5.2', name: 'GPT 5.2', description: '' },
+								{ id: 'gpt-5.2-codex', name: 'GPT 5.2 Codex', description: '' },
+							],
+						},
+					],
+					failures: [{ id: 'broken', name: 'Broken', message: '没 key' }],
+				}
+			},
+			async selectModel({ sessionId, provider, model }) {
+				if (model === 'boom') throw new Error('这个会话锁定了模型')
+				ctx.sessionController.selectedModels.push({ sessionId, provider, model })
+				ctx.sessionController.modelSelection[sessionId] = { provider, model }
+				return { selected: { provider, model } }
+			},
+			async projections({ sessionId }) {
+				const value = ctx.sessionController.modelSelection[sessionId]
+				return { asOfSeq: 1, values: value ? { 'model/selection': { lastUsed: value, pending: null } } : {} }
 			},
 		},
 		workspaceRegistry: {
@@ -360,7 +398,7 @@ test('插件导出形态正确，且 apply() 会建出 0600 的 socket', async (
 	boot.dispose()
 })
 
-test('register → panel：白名单快照 + 八个命令的面板定义（只绑定配置指定的私聊）', async (t) => {
+test('register → panel：白名单快照 + 九个命令的面板定义（只绑定配置指定的私聊）', async (t) => {
 	const boot = bootPlugin(t, { sessions: SUMMARIES })
 	await waitFor(() => existsSync(boot.socketPath))
 
@@ -380,12 +418,16 @@ test('register → panel：白名单快照 + 八个命令的面板定义（只�
 	assert.deepEqual(panel.value.userOpenIds, ['U1'])
 	assert.deepEqual(
 		panel.value.items.map((item) => item.name),
-		['切换会话', '新建会话', '进度', '发送', '停止', '归档', '延迟发送', '权限'],
+		['切换会话', '新建会话', '进度', '发送', '停止', '归档', '延迟发送', '权限', '模型'],
 	)
 	// 扁平键 menuItems：与 Go 侧 PanelDefinition.MenuItems 对齐（大小写不敏感匹配）
-	assert.equal(panel.value.menuItems.length, 8)
+	// 顶层 7 项 = 6 个平铺 + 1 个「管理」二级菜单（停止/归档/权限），给「模型」腾出顶层位。
+	assert.equal(panel.value.menuItems.length, 7)
 	assert.equal(panel.value.menuItems[0].name, '切换会话')
 	assert.equal(panel.value.menuItems[0].sendMessage, '切换会话')
+	const manageGroup = panel.value.menuItems.find((item) => item.type === 'menu')
+	assert.equal(manageGroup.name, '管理')
+	assert.deepEqual(manageGroup.children.map((child) => child.name), ['停止', '归档', '权限'])
 	assert.equal(panel.value.menu, undefined)
 
 	// 白名单落了盘（插件重启后仍能门守）
@@ -693,16 +735,18 @@ test('端到端：dsh 内置命令从 QQ 直接执行（不进模型）；技能
 
 	// 菜单：桥命令 + 1 个二级菜单（feedback 被排除，只剩 compact/goal）
 	const panel = await rpc(boot.socketPath, 'panel')
+	// 二级菜单现在有 2 个：桥自己的「管理」+ dsh 命令（feedback 被排除，只剩 compact/goal）
 	const groups = panel.value.menuItems.filter((item) => item.type === 'menu')
-	assert.equal(groups.length, 1, 'dsh 命令应收进二级菜单')
-	assert.equal(groups[0].name, 'dsh 命令')
+	assert.equal(groups.length, 2, '桥的「管理」与 dsh 命令各占一个二级菜单')
+	const dshGroup = groups.find((item) => item.name === 'dsh 命令')
+	assert.ok(dshGroup, 'dsh 命令应收进二级菜单')
 	assert.deepEqual(
-		groups[0].children.map((child) => child.name),
+		dshGroup.children.map((child) => child.name),
 		['compact', 'goal'],
 		'feedback 不收纳；技能本来就不在命令表里',
 	)
-	assert.equal(groups[0].children[0].sendMessage, '/compact', '点击把 /命令 填进输入框')
-	assert.equal(panel.value.menuItems.filter((i) => i.type !== 'menu').length, 8, '顶层仍是 8 条桥命令')
+	assert.equal(dshGroup.children[0].sendMessage, '/compact', '点击把 /命令 填进输入框')
+	assert.equal(panel.value.menuItems.filter((i) => i.type !== 'menu').length, 6, '顶层 6 条平铺桥命令')
 
 	// 绑定会话
 	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M1' })
@@ -1494,6 +1538,140 @@ test('端到端：`发送 <会话id> <正文>` 带引用时，引用要一起投
 	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '看这条', quote: '引用原文', msgId: 'M2' })
 	await waitFor(() => agent.followed.length === 2)
 	assert.equal(agent.followed[1].content[0].text, '[引用的消息] 引用原文\n\n看这条')
+
+	boot.dispose()
+})
+
+test('端到端：`模型` 两级卡片（提供商 2/行 → 模型 1/行）／点一下就切／`切其他会话`按钮填命令／带参直接切', async (t) => {
+	const boot = bootPlugin(t, { sessions: SUMMARIES })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M0' })
+	await drainFor(boot.socketPath, 60)
+
+	// 裸发 `模型` → 提供商卡片：每行 2 个、正文标出"当前"、失败提供商如实列出
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '模型', msgId: 'M1' })
+	const card = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.filter((c) => c.kind === 'send_c2c' && c.args.keyboard).at(-1) ?? null
+	})
+	assert.match(String(card.args.content), /\*\*模型\*\*/)
+	assert.match(String(card.args.content), /当前：`（读不到，换过之后就会显示）`/, '还没选过模型时如实说读不到')
+	assert.match(String(card.args.content), /1 个提供商读不到模型/)
+	const rows = card.args.keyboard.content.rows.map((row) => row.buttons.map((b) => b.render_data.label))
+	assert.deepEqual(rows, [[clipLabel('DeepSeek'), clipLabel('OpenAI')]], '提供商每行 2 个')
+
+	// 点提供商 → 模型列表卡片：每个模型一行
+	await rpc(boot.socketPath, 'event', {
+		kind: 'interaction',
+		openid: 'U1',
+		buttonData: cardData.model('enter', 'deepseek'),
+		eventId: 'INT-MODEL-1',
+		msgId: 'CARD-M1',
+	})
+	const modelCard = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.filter((c) => c.kind === 'send_c2c' && c.args.keyboard).at(-1) ?? null
+	})
+	assert.match(String(modelCard.args.content), /\*\*模型 · DeepSeek\*\*/)
+	const modelRows = modelCard.args.keyboard.content.rows
+	assert.ok(
+		modelRows.slice(0, -1).every((row) => row.buttons.length === 1),
+		'模型每行最多 1 个',
+	)
+	assert.deepEqual(
+		modelRows.at(-1).buttons.map((b) => b.render_data.label),
+		['返回'],
+		'读不到当前模型时不给「切其他会话」（没东西可填）',
+	)
+
+	// 点一个模型 → 切到当前会话 + 重发卡片做"选择完毕确认"
+	await rpc(boot.socketPath, 'event', {
+		kind: 'interaction',
+		openid: 'U1',
+		buttonData: cardData.model('pick', 'deepseek:deepseek-reasoner'),
+		eventId: 'INT-MODEL-2',
+		msgId: 'CARD-M2',
+	})
+	const picked = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.filter((c) => c.kind === 'send_c2c' && c.args.keyboard).at(-1) ?? null
+	})
+	assert.deepEqual(boot.ctx.sessionController.selectedModels, [
+		{ sessionId: 'session-1', provider: 'deepseek', model: 'deepseek-reasoner' },
+	])
+	assert.match(String(picked.args.content), /✅ 已切到 \*\*DeepSeek \/ DeepSeek Reasoner\*\*/)
+	assert.match(String(picked.args.content), /当前：\*\*DeepSeek \/ DeepSeek Reasoner\*\*/)
+	// 确认卡片上的「切其他会话」是**指令按钮**：只把命令填进输入框（补会话id后发送即切给别的会话）
+	const nav = picked.args.keyboard.content.rows.at(-1).buttons
+	assert.deepEqual(nav.map((b) => b.render_data.label), ['返回', '切其他会话'])
+	assert.equal(nav[1].action.type, 2)
+	assert.equal(nav[1].action.data, '模型 deepseek/deepseek-reasoner ')
+
+	// 回到提供商列表：这一次"当前"要标出来，并且提供商按钮是蓝色
+	await rpc(boot.socketPath, 'event', {
+		kind: 'interaction',
+		openid: 'U1',
+		buttonData: cardData.model('list'),
+		eventId: 'INT-MODEL-3',
+		msgId: 'CARD-M3',
+	})
+	const listed = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /\*\*模型\*\*/.test(String(c.args.content))) ?? null
+	})
+	assert.match(String(listed.args.content), /当前：\*\*DeepSeek \/ DeepSeek Reasoner\*\*/)
+	const dsButton = listed.args.keyboard.content.rows
+		.flatMap((row) => row.buttons)
+		.find((b) => b.action.data === cardData.model('enter', 'deepseek'))
+	assert.equal(dsButton.render_data.style, 1, '当前提供商标蓝')
+
+	// 带参数直接切（显示名/空格也认）
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '模型 OpenAI/GPT 5.2', msgId: 'M2' })
+	const direct = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /的模型切成/.test(String(c.args.content))) ?? null
+	})
+	assert.match(String(direct.args.content), /GPT 5\.2/)
+	assert.deepEqual(boot.ctx.sessionController.selectedModels.at(-1), {
+		sessionId: 'session-1',
+		provider: 'openai',
+		model: 'gpt-5.2',
+	})
+
+	// 末尾带会话id：切给**别的会话**（不要求先绑定它）
+	await rpc(boot.socketPath, 'event', {
+		kind: 'c2c_message',
+		openid: 'U1',
+		text: '模型 deepseek/deepseek-chat session-2',
+		msgId: 'M3',
+	})
+	await waitFor(() => boot.ctx.sessionController.selectedModels.at(-1)?.sessionId === 'session-2')
+	assert.deepEqual(boot.ctx.sessionController.selectedModels.at(-1), {
+		sessionId: 'session-2',
+		provider: 'deepseek',
+		model: 'deepseek-chat',
+	})
+
+	// 认不出的模型 / 写错的会话id：都要明确报错 + 回用法
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '模型 nope/nope', msgId: 'M4' })
+	const badModel = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /认不出提供商/.test(String(c.args.content))) ?? null
+	})
+	assert.match(String(badModel.args.content), /用法：/)
+
+	await rpc(boot.socketPath, 'event', {
+		kind: 'c2c_message',
+		openid: 'U1',
+		text: '模型 deepseek/deepseek-chat session-nope',
+		msgId: 'M5',
+	})
+	const badSession = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /没找到会话/.test(String(c.args.content))) ?? null
+	})
+	assert.match(String(badSession.args.content), /用法：/)
 
 	boot.dispose()
 })
