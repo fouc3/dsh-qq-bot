@@ -246,7 +246,7 @@ level=WARN msg="已丢弃非白名单用户的私聊" openid=2A3B4C… text_len=
 # Go 侧（含假 QQ 平台 + 真 UNIX socket 桩）
 go vet ./... && gofmt -l . && go test -race ./...
 
-# 插件侧：语法 + 130 项（含"装配级端到端"）
+# 插件侧：语法 + 147 项（含"装配级端到端"）
 node --check dsh-plugin/index.js dsh-plugin/lib/*.js
 node --test dsh-plugin/lib/*.test.js
 ```
@@ -256,6 +256,27 @@ node --test dsh-plugin/lib/*.test.js
 所以插件/网关重启那几十秒里到的用户消息不再被静默丢弃（线上踩过：`/新建会话 /tmp` 发在重启窗口里，
 网关只记了 `本地通道不可用` 就把它丢了）。`deploy/restart-and-verify.sh` 重启前还会先等
 发件箱清空（`outboxDepth=0`，最多 60 秒），避免把还没发出去的回复吞掉。
+
+**重启/验证一律外包给临时守护进程**（别占着会话干等）：
+
+```bash
+# 重启 + 自检（180 秒后执行，立刻返回）
+systemd-run --user --on-active=180 --unit=dsh-qq-restart-N --collect \
+  deploy/restart-and-verify.sh /tmp/dsh-qq-bot-restart.log
+
+# 真机卡片验证（等通道 → 注入探针 → 收网关日志 → 写报告，立刻返回）
+systemd-run --user --unit=dsh-qq-verify-model --collect \
+  deploy/verify-model-card.sh /tmp/dsh-qq-bot-verify.log
+```
+
+`deploy/probe-model-card.mjs` 往桥里注入「提供商 → 模型列表 → 确认卡片 → 切到其他会话 →
+取消」这一串事件，让插件真的往 QQ 发几张**模型卡片**（全程不调用 `selectModel`，不改任何会话的模型）。
+它存在的理由：本地测试只能证明我们**构造**了这些按钮（比如 label 有多宽），平台收不收、
+渲染成什么样只有真机能回答 —— 这也是"按钮 label 到底能多长"这个问题唯一可靠的答案来源。
+探针自带两条**正向证据**（比"日志里没报错"强）：`pendingModel` 被写入又清除（说明插件认领了
+这些事件、openid 确实在白名单里）、`lastCard` 拿到真 `messageId`（插件的 `sendCard` 是
+`expectMessageId` 的，说明 QQ 真的收下了卡片）。实测结论：**21 个显示宽度的 label（含中文操作按钮）
+平台照收** —— 我们以前按"10 个显示宽度"截断纯属自缚。
 
 `lib/plugin.test.js` 是**装配级端到端**：真的调用插件导出的 `apply()`，起真的 UNIX socket，
 以真实 NDJSON 帧走 `register / panel / event / outbox.poll / ack / health`，

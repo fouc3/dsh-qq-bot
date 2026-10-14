@@ -32,10 +32,13 @@ if [ ! -S "$SOCKET" ]; then
 fi
 log "通道已就绪"
 
-# 2) openid 从网关配置里取（白名单第一个；不打印配置里的其它内容）
-OPENID="$(grep -m1 -oE 'openid:[[:space:]]*"[^"]+"' "$ROOT/config.yaml" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
-if [ -z "$OPENID" ]; then
-	log "!! 没能从 config.yaml 里取到 openid"
+# 2) openid 从网关配置里取（白名单里第一个；**必须跳过注释行** —— 模板注释里的
+#    `#     - openid: "<日志里的 openid>"` 会先被 grep 命中，这里踩过一次：探针打在一个
+#    假 openid 上，事件被插件当"非白名单"丢掉，于是"零失败"变成了空转）
+OPENID="$(grep -vE '^[[:space:]]*#' "$ROOT/config.yaml" | grep -m1 -oE 'openid:[[:space:]]*"[^"]+"' | sed -E 's/.*"([^"]+)".*/\1/')"
+if ! printf '%s' "$OPENID" | grep -qE '^[A-Za-z0-9_-]{16,}$'; then
+	log "!! 从 config.yaml 取到的 openid 不像 openid（长度 ${#OPENID}）：$OPENID"
+	log "!! 中止：探针必须打在真白名单账号上，否则事件会被插件丢掉、验证等于空转"
 	exit 1
 fi
 log "探针目标：openid ${OPENID:0:6}…（省略）"
@@ -58,6 +61,7 @@ journalctl --user -u dsh-qq-bot --since "$START" --no-pager 2>/dev/null \
 	>>"$LOG" 2>&1
 failures="$(journalctl --user -u dsh-qq-bot --since "$START" --no-pager 2>/dev/null | grep -c "出站命令执行失败" || true)"
 log "出站命令执行失败次数：$failures"
+log "（探针自己的正向证据在上面「探针输出」里：必须同时看到 pendingModel 写入/清除 与 lastCard 拿到 messageId）"
 
 if [ "$failures" = "0" ] && [ "$probe_status" = "0" ]; then
 	log "结论：这几张卡片（含 >10 显示宽度的 label）平台都收下了 → 我们自己设的宽度上限可以继续放宽"
