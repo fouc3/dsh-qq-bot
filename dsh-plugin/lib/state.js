@@ -17,6 +17,7 @@ export const EMPTY_STATE = {
 	inbox: {}, // openid -> { sessionId, text, seq, items[] }（「发送」输入态）
 	attachSeq: {}, // openid -> 已分配到的附件序号（附件 id 永不重用）
 	pendingDir: {}, // openid -> { parent, at }（点了「新建目录」、正在等目录名）
+	pendingModel: {}, // openid -> { provider, model, at }（点了「切到其他会话」、正在等会话id）
 	createdSessions: {}, // sessionId -> cwd（本桥建出来的会话：用来补登记工作区）
 	createdDirs: [], // 本桥建出来的目录（新建目录）：用来补登记工作区
 	sessionOwners: {}, // sessionId -> openid（最近一次从 QQ 跟这个会话说过话的人）
@@ -33,12 +34,13 @@ function normalize(raw) {
 		inbox: {},
 		attachSeq: {},
 		pendingDir: {},
+		pendingModel: {},
 		createdSessions: {},
 		createdDirs: [],
 		sessionOwners: {},
 	}
 	if (!raw || typeof raw !== 'object') return base
-	for (const key of ['bindings', 'lastCard', 'delayed', 'inbox', 'attachSeq', 'pendingDir', 'createdSessions', 'sessionOwners']) {
+	for (const key of ['bindings', 'lastCard', 'delayed', 'inbox', 'attachSeq', 'pendingDir', 'pendingModel', 'createdSessions', 'sessionOwners']) {
 		if (raw[key] && typeof raw[key] === 'object') base[key] = { ...raw[key] }
 	}
 	if (Array.isArray(raw.createdDirs)) base.createdDirs = raw.createdDirs.filter((item) => typeof item === 'string' && item)
@@ -208,8 +210,28 @@ export function createState({ file, logger, seed, debounceMs = 200 } = {}) {
 		},
 		setPendingDir(openid, entry) {
 			return this.update((s) => {
-				if (entry) s.pendingDir[openid] = entry
-				else delete s.pendingDir[openid]
+				if (entry) {
+					// 两种"等一条消息"的状态不能同时挂：后设的把前一个顶掉。
+					delete s.pendingModel[openid]
+					s.pendingDir[openid] = entry
+				} else {
+					delete s.pendingDir[openid]
+				}
+			})
+		},
+		/** 「切到其他会话」点了之后在等会话id（模型卡片第二级确认里的交互式分支）。 */
+		pendingModelOf(openid) {
+			const entry = data.pendingModel[openid]
+			return entry && typeof entry === 'object' ? entry : null
+		},
+		setPendingModel(openid, entry) {
+			return this.update((s) => {
+				if (entry) {
+					delete s.pendingDir[openid]
+					s.pendingModel[openid] = entry
+				} else {
+					delete s.pendingModel[openid]
+				}
 			})
 		},
 		/** 记一笔"这个会话是本桥建的"（启动时用来补登记它的工作区）。 */

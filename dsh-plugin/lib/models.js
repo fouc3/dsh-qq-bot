@@ -247,11 +247,5 @@ export function createModels({ ctx, logger }) {
 		return `**${group.name} / ${model.name}**（\`${group.id}/${model.id}\`）`
 	}
 
-	/** 卡片按钮里填给用户的命令文本（末尾留空格，方便接着写会话id）。 */
-	function commandFor(group, model, { sessionId = '' } = {}) {
-		const base = `模型 ${group.id}/${model.id}`
-		return sessionId ? `${base} ${sessionId}` : `${base} `
-	}
-
-	return { available, catalog, current, resolveToken, set, describe, commandFor }
+	return { available, catalog, current, resolveToken, set, describe }
 }

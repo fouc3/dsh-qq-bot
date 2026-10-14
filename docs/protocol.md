@@ -171,7 +171,7 @@ bot 收到后按 `remark` 找到已有面板 → 更新；找不到 → 创建�
 | AI 回复 | 正文以 `【{标题}({sessionId})】` 开头（模板可配） |
 | 一轮结束通知 | `{标题}({sessionId})已结束` + 键盘单行两按钮：「我需要回复」`action.type=1`、`data="qqb:needreply:<sessionId>"`；「发送消息」`action.type=2`（指令按钮，只把 `发送 <sessionId>` 填进输入框） |
 | 权限卡片 | 每档一个回调按钮，`data="qqb:perm:<预设key>"`（如 `danger-full-access`）；每行 2 个、放不下自动加宽；当前档 `style=1`（蓝）、其余 `style=0`（灰） |
-| 模型卡片 | 两级：**提供商**每行 2 个、`data="qqb:mod:enter:<提供商id>"`（第一级翻页 `qqb:mod:page:<页码>`）；**模型**每行 1 个、`data="qqb:mod:pick:<提供商id>:<模型id>"`（第二级翻页 `qqb:mod:mpage:<提供商id>:<页码>`、回列表 `qqb:mod:list`）。当前档 `style=1`（蓝）；模型列表导航行另有一个**指令按钮**「切其他会话」`action.type=2`（只把 `模型 <提供商id>/<模型id>` 填进输入框，用户补会话id后发送即切给别的会话） |
+| 模型卡片 | 三级：**提供商**每行 2 个、`data="qqb:mod:enter:<提供商id>"`（翻页 `qqb:mod:page:<页码>`）；**模型**每行 1 个、`data="qqb:mod:pick:<提供商id>:<模型id>"`（翻页 `qqb:mod:mpage:<提供商id>:<页码>`、回列表 `qqb:mod:list`）；**确认卡片**三个交互按钮 `qqb:mod:apply:<p>:<m>`（应用到当前会话）、`qqb:mod:other:<p>:<m>`（进"等会话id"状态）、`qqb:mod:back:<提供商id>`（回模型列表）；"等会话id"的提示卡片上有 `qqb:mod:cancel:<p>:<m>`。当前档 `style=1`（蓝）；模型按钮的 label 几乎照发全名（见 docs/commands.md「模型」一节的说明） |
 | 会话选择卡片 | 文件夹按钮 `action.type=1`、`data="qqb:dir:<路径>"`；会话按钮 `action.type=2`（指令按钮，只把 `切换会话 <sessionId>` 填进输入框）。新建会话卡片另有 `qqb:mkdir:`（新建目录，等名字）、`qqb:mkx:`（取消等名字）、`qqb:rmdir:` / `qqb:rmdir2:`（删除空目录的两步确认） |
 | 提问卡片 | 选项 `data="qqq:<callId>:<题序>:<选项序>"`、其他 `…:custom`、提交 `…:submit`；选中 `style=1`、未选中 `style=0` |
 | 按钮配色 | 主操作＝蓝 `1`、次要/退出＝灰 `0`、破坏性＝红 `3`；**不用 `4`**（SDK 名为"蓝色填充"，线上客户端实际渲染成白色，曾导致"取消蓝、发送白"被点错） |

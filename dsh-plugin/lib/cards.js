@@ -55,11 +55,17 @@ export function clipLabel(text, limit = LABEL_WIDTH_LIMIT) {
  */
 export const BUTTON_STYLE = { neutral: 0, primary: 1, danger: 3, fill: 4 }
 
-/** 指令按钮（type=2）：点击只把 data 填进输入框，用户自己发送，不产生互动事件。 */
-export function commandButton(label, data, { visited, style = 1 } = {}) {
+/**
+ * 指令按钮（type=2）：点击只把 data 填进输入框，用户自己发送，不产生互动事件。
+ *
+ * `labelLimit` 可以放宽 label 宽度上限（模型卡片里的按钮要显示全名）；
+ * `id` 可以指定按钮 id —— 平台要求同一键盘内 id 唯一，而截断后的 label 可能撞车。
+ */
+export function commandButton(label, data, { visited, style = 1, labelLimit = LABEL_WIDTH_LIMIT, id } = {}) {
+	const shown = clipLabel(label, labelLimit)
 	return {
-		id: `cmd_${clipLabel(label)}`,
-		render_data: { label: clipLabel(label), visited_label: clipLabel(visited ?? label), style },
+		id: id ?? `cmd_${shown}`,
+		render_data: { label: shown, visited_label: clipLabel(visited ?? label, labelLimit), style },
 		action: {
 			type: 2,
 			data,
@@ -69,11 +75,12 @@ export function commandButton(label, data, { visited, style = 1 } = {}) {
 	}
 }
 
-/** 回调按钮（type=1）：点击产生互动事件并把 data 回传。 */
-export function callbackButton(label, data, { visited, style = 1, group } = {}) {
+/** 回调按钮（type=1）：点击产生互动事件并把 data 回传（`labelLimit`/`id` 同指令按钮）。 */
+export function callbackButton(label, data, { visited, style = 1, group, labelLimit = LABEL_WIDTH_LIMIT, id } = {}) {
+	const shown = clipLabel(label, labelLimit)
 	const button = {
-		id: `cb_${clipLabel(label)}`,
-		render_data: { label: clipLabel(label), visited_label: clipLabel(visited ?? label), style },
+		id: id ?? `cb_${shown}`,
+		render_data: { label: shown, visited_label: clipLabel(visited ?? label, labelLimit), style },
 		action: {
 			type: 1,
 			data,
@@ -436,11 +443,23 @@ export function buttonsPerRowFor(count, { preferred = 2, maxRows = KEYBOARD_MAX_
 // 用户要求：**提供商每行最多 2 个**（可翻页），点进去才是这个提供商的模型，
 // **模型每行最多 1 个**（可翻页）——每行少放几个就不会被挤成窄条。
 // 两级都遵守平台 5 行 × 5 列上限：内容行之外只多留"翻页行"和"导航行"。
+//
+// 关于 label 截断（用户明确要求过）：**别自己提前砍名字**。平台文档现在只写
+// 「按钮上的文字」，SDK 里那句"at most 10 characters"来自旧文档；我们以前按
+// 「10 个显示宽度（中文算 2）」截断，等于把中文名字砍到 5 个字、英文砍到 10 个字母，
+// 全名根本看不到。现在单列的模型按钮**基本不截**（交给 QQ 自己渲染/换行），
+// 双列的提供商按钮给一个宽松上限，只有病态长的名字才会出现省略号。
 
 /** 模型选择第一级：提供商。 */
 export const MODEL_PROVIDERS_PER_ROW = 2
 /** 模型选择第二级：模型（用户要求每行最多一个）。 */
 export const MODEL_LIST_PER_ROW = 1
+/** 提供商按钮（每行 2 个）的 label 宽度上限：够放常见名字。 */
+export const PROVIDER_LABEL_WIDTH_LIMIT = 24
+/** 模型按钮（每行 1 个）的 label 宽度上限：几乎照发全名，只挡病态长的名字。 */
+export const MODEL_LABEL_WIDTH_LIMIT = 60
+/** 模型卡片里操作按钮（应用到当前会话 / 切到其他会话 / 返回）的宽度上限。 */
+export const MODEL_ACTION_LABEL_WIDTH_LIMIT = 24
 
 /**
  * 用来标注"当前"的一段文字。
@@ -494,6 +513,8 @@ export function buildModelProviderCard({ groups = [], failures = [], current = n
 			callbackButton(group.name, data.model('enter', group.id), {
 				style: current?.provider === group.id ? BUTTON_STYLE.primary : BUTTON_STYLE.neutral,
 				visited: current?.provider === group.id ? '当前' : group.name,
+				labelLimit: PROVIDER_LABEL_WIDTH_LIMIT,
+				id: `cb_provider_${group.id}`,
 			}),
 		),
 		perRow,
@@ -509,22 +530,20 @@ export function buildModelProviderCard({ groups = [], failures = [], current = n
 /**
  * 模型卡片第二级：某个提供商的模型列表（每行 1 个，可翻页）。
  *
- * 导航行里除了「返回」，还有一个**指令按钮**「切其他会话」：它只把
- * `模型 <提供商>/<模型>` 填进 QQ 输入框（用户要求），用户在末尾补上**会话id**
- * 再发送，就切给了别的会话；不补就是当前会话。
+ * 点一个模型**不会立刻切**：先进「确认」卡片（应用到当前会话 / 切到其他会话 / 返回）。
+ * 所以这里导航行只需要「返回」（回提供商列表）。
  *
  * @param {object} input
  * @param {{id:string,name:string,models:Array}} input.group
  * @param {{provider:string,model:string}|null} [input.current]
  * @param {string} [input.label]
  * @param {number} [input.page]
- * @param {{id:string,name:string}|null} [input.chosen] 刚刚切换成功的那一个（用于"确认"提示）
- * @param {string} [input.otherCommand] 「切其他会话」按钮要填进输入框的命令文本
+ * @param {{provider:string,model:string}|null} [input.chosen] 刚切成功的那一个（正文写明"已切到"）
  */
-export function buildModelListCard({ group, current = null, label = '', page = 1, chosen = null, otherCommand = '' }) {
+export function buildModelListCard({ group, current = null, label = '', page = 1, chosen = null }) {
 	const models = group?.models ?? []
 	const perRow = MODEL_LIST_PER_ROW
-	// 导航行（返回 + 切其他会话）固定占一行；翻页行只有在需要时才出现，
+	// 导航行固定占一行；翻页行只有在需要时才出现，
 	// 所以先按"不放翻页行"算一遍，放不下再让出一行给翻页。
 	const navRows = 1
 	const capacity = (KEYBOARD_MAX_ROWS - navRows) * perRow
@@ -545,7 +564,7 @@ export function buildModelListCard({ group, current = null, label = '', page = 1
 		lines.push(`✅ 已切到 **${group.name} / ${picked?.name ?? chosen.model}**。`)
 	}
 	if (pages > 1) lines.push(`第 ${currentPage}/${pages} 页（每页 ${slots} 个模型）`)
-	lines.push('', '点一个**模型**就切到当前会话（不用再确认）。')
+	lines.push('', '点一个**模型**进确认卡片（要切给当前会话还是别的会话，那里再选）。')
 	for (const [index, model] of slice.entries()) {
 		const order = (currentPage - 1) * slots + index + 1
 		const isCurrent = marked?.provider === group?.id && marked?.model === model.id
@@ -553,19 +572,18 @@ export function buildModelListCard({ group, current = null, label = '', page = 1
 			`${order}. **${model.name}**${isCurrent ? ' ✅' : ''}${model.description ? ` — ${model.description}` : ''}`,
 		)
 	}
-	// 没有「切其他会话」按钮（读不到当前模型）时不留这句提示，免得用户找不到按钮。
-	if (otherCommand) {
-		lines.push('', '> 想切给**别的会话**：点「切其他会话」把命令填进输入框，末尾补上会话id再发送。')
-	}
 
 	const rows = rowsOf(
-		slice.map((model) =>
+		slice.map((model, index) =>
 			callbackButton(model.name, data.model('pick', `${group.id}:${model.id}`), {
 				style:
 					marked?.provider === group?.id && marked?.model === model.id
 						? BUTTON_STYLE.primary
 						: BUTTON_STYLE.neutral,
 				visited: marked?.provider === group?.id && marked?.model === model.id ? '当前' : model.name,
+				labelLimit: MODEL_LABEL_WIDTH_LIMIT,
+				// 同一键盘内 id 必须唯一：截断后的名字可能撞车，所以按序编号。
+				id: `cb_model_${group.id}_${index}`,
 			}),
 		),
 		perRow,
@@ -575,12 +593,95 @@ export function buildModelListCard({ group, current = null, label = '', page = 1
 	if (currentPage < pages) pager.push(callbackButton('下一页', data.model('mpage', `${group.id}:${currentPage + 1}`)))
 	if (pager.length > 0) rows.push({ buttons: pager })
 
-	const nav = [callbackButton('返回', data.model('list'), { style: BUTTON_STYLE.neutral })]
-	if (otherCommand) {
-		nav.push(commandButton('切其他会话', otherCommand, { style: BUTTON_STYLE.neutral }))
-	}
-	rows.push({ buttons: nav })
+	rows.push({ buttons: [callbackButton('返回', data.model('list'), { style: BUTTON_STYLE.neutral })] })
 
+	return { content: lines.join('\n'), keyboard: keyboardOf(clampRows(rows)) }
+}
+
+/**
+ * 模型卡片第三级：**确认**卡片（用户要求）。
+ *
+ * 选完模型先问一句要切到哪儿，三个都是**交互式**回调按钮：
+ *   - 「应用到当前会话」→ 立刻切；
+ *   - 「切到其他会话」→ 进"等会话id"状态（用户下一条消息写出会话id，见 index.js），
+ *     不再用"往输入框填命令"那种方式（用户明确要求改成交互式）；
+ *   - 「返回」→ 回该提供商的模型列表。
+ *
+ * @param {object} input
+ * @param {{id:string,name:string}} input.group
+ * @param {{id:string,name:string,description?:string}} input.model
+ * @param {string} [input.label] 当前会话显示名
+ */
+export function buildModelConfirmCard({ group, model, label = '' }) {
+	const lines = [
+		'**模型 · 确认**',
+		`> 会话：${label || '（当前会话）'}`,
+		`> 选中的模型：**${group?.name ?? ''} / ${model?.name ?? ''}**（\`${group?.id}/${model?.id}\`）`,
+	]
+	if (model?.description) lines.push(`> ${model.description}`)
+	lines.push(
+		'',
+		'要切到哪儿？',
+		'> 「应用到当前会话」＝就切给上面这个会话。',
+		'> 「切到其他会话」＝你接着发一条消息写出**会话id**，我切给那个会话。',
+		'> 「返回」＝回到模型列表继续挑。',
+	)
+
+	const rows = [
+		{
+			buttons: [
+				callbackButton('应用到当前会话', data.model('apply', `${group.id}:${model.id}`), {
+					style: BUTTON_STYLE.primary,
+					visited: '已应用',
+					labelLimit: MODEL_ACTION_LABEL_WIDTH_LIMIT,
+					id: 'cb_model_apply',
+				}),
+				callbackButton('切到其他会话', data.model('other', `${group.id}:${model.id}`), {
+					style: BUTTON_STYLE.neutral,
+					labelLimit: MODEL_ACTION_LABEL_WIDTH_LIMIT,
+					id: 'cb_model_other',
+				}),
+			],
+		},
+		{
+			buttons: [
+				callbackButton('返回', data.model('back', group.id), {
+					style: BUTTON_STYLE.neutral,
+					id: 'cb_model_back',
+				}),
+			],
+		},
+	]
+	return { content: lines.join('\n'), keyboard: keyboardOf(clampRows(rows)) }
+}
+
+/**
+ * 「切到其他会话」之后那张"等会话id"的提示卡片：自带一个明确的「取消」。
+ *
+ * @param {object} input
+ * @param {{id:string,name:string}} input.group
+ * @param {{id:string,name:string}} input.model
+ * @param {string} [input.label]
+ */
+export function buildModelSessionPromptCard({ group, model, label = '' }) {
+	const lines = [
+		'**模型 · 切到其他会话**',
+		`> 会话：${label || '（当前会话）'}`,
+		`> 选中的模型：**${group?.name ?? ''} / ${model?.name ?? ''}**（\`${group?.id}/${model?.id}\`）`,
+		'',
+		'> 直接发一条消息写出**会话id**（`session-…`），我就把模型切给那个会话。',
+		'> 不想切了，点下面的「取消」回到确认卡片。',
+	]
+	const rows = [
+		{
+			buttons: [
+				callbackButton('取消', data.model('cancel', `${group.id}:${model.id}`), {
+					style: BUTTON_STYLE.neutral,
+					id: 'cb_model_cancel',
+				}),
+			],
+		},
+	]
 	return { content: lines.join('\n'), keyboard: keyboardOf(clampRows(rows)) }
 }
 

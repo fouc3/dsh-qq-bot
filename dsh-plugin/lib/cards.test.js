@@ -2,12 +2,16 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
+	MODEL_LABEL_WIDTH_LIMIT,
+	PROVIDER_LABEL_WIDTH_LIMIT,
 	QUESTION_MAX_BUTTONS,
 	buildInboxCard,
 	buildInboxResult,
 	buildMkdirPromptCard,
+	buildModelConfirmCard,
 	buildModelListCard,
 	buildModelProviderCard,
+	buildModelSessionPromptCard,
 	buildNewSessionCard,
 	buildNoticeCard,
 	buildPermissionCard,
@@ -575,7 +579,7 @@ test('模型卡片·提供商：每行 2 个、超一页才有翻页行、当前
 	assert.match(withFailures.content, /1 个提供商读不到模型：`Broken`/)
 })
 
-test('模型卡片·模型列表：每行 1 个、翻页、导航行带「切其他会话」指令按钮（type=2）', () => {
+test('模型卡片·模型列表：每行 1 个、翻页、导航行只有「返回」、label 照发全名', () => {
 	const group = {
 		id: 'deepseek',
 		name: 'DeepSeek',
@@ -590,14 +594,13 @@ test('模型卡片·模型列表：每行 1 个、翻页、导航行带「切其
 		group,
 		current: { provider: 'deepseek', model: 'deepseek-chat' },
 		label: '项目甲(session-1)',
-		otherCommand: '模型 deepseek/deepseek-chat ',
 	})
 	const rows = card.keyboard.content.rows
 	assert.equal(rows.length, 5, '4 行模型（每行 1 个）+ 1 行导航')
 	assert.ok(rows.slice(0, 4).every((row) => row.buttons.length === 1), '模型每行最多 1 个')
 	const labels = rows.flatMap((row) => row.buttons.map((b) => b.render_data.label))
-	assert.deepEqual(labels.slice(4), ['返回', '切其他会话'])
-	assert.ok(labels.every((label) => displayWidth(label) <= 10), '按钮 label 都不超平台宽度')
+	assert.deepEqual(labels.slice(4), ['返回'], '导航行只有「返回」——切别的会话走确认卡片（交互式）')
+	assert.ok(labels.includes('DeepSeek Reasoner'), 'label 不再被我们自己砍成省略号')
 
 	// 当前模型：标 ✅ + 蓝色 + visited=当前
 	assert.match(card.content, /当前：\*\*DeepSeek \/ DeepSeek Chat\*\*/)
@@ -611,14 +614,10 @@ test('模型卡片·模型列表：每行 1 个、翻页、导航行带「切其
 		action: 'pick',
 		arg: 'deepseek:deepseek-reasoner',
 	})
-
-	// 导航行：「返回」是回调按钮，「切其他会话」是**指令按钮**（只填输入框）
-	const nav = rows.at(-1).buttons
-	assert.equal(nav[0].action.type, 1)
-	assert.deepEqual(parseCallback(nav[0].action.data), { kind: 'model', action: 'list', arg: '' })
-	assert.equal(nav[1].action.type, 2, '「切其他会话」只填输入框，不产生互动事件')
-	assert.equal(nav[1].action.data, '模型 deepseek/deepseek-chat ')
-	assert.match(card.content, /末尾补上会话id再发送/)
+	// 按钮 id 必须唯一（截断后的 label 可能撞车，所以按序编号）
+	const ids = rows.flatMap((row) => row.buttons).map((b) => b.id)
+	assert.equal(new Set(ids).size, ids.length, '同一键盘内按钮 id 唯一')
+	assert.match(card.content, /进确认卡片/)
 
 	// 6 个模型 → 4 就放不下（要留翻页行）：每页 3 个
 	const many = {
@@ -638,26 +637,93 @@ test('模型卡片·模型列表：每行 1 个、翻页、导航行带「切其
 		action: 'mpage',
 		arg: 'openai:2',
 	})
-	// 读不到当前模型时不给「切其他会话」（没东西可填），也不留那句提示
 	assert.deepEqual(
 		paged.keyboard.content.rows.at(-1).buttons.map((b) => b.render_data.label),
 		['返回'],
 	)
-	assert.ok(!paged.content.includes('切其他会话'))
 
 	// 刚切完（chosen）：正文写明"已切到"，并把这一档标成当前
 	const chosenCard = buildModelListCard({
 		group,
 		current: null,
 		chosen: { provider: 'deepseek', model: 'deepseek-reasoner' },
-		otherCommand: '模型 deepseek/deepseek-reasoner ',
 	})
 	assert.match(chosenCard.content, /✅ 已切到 \*\*DeepSeek \/ DeepSeek Reasoner\*\*/)
 	assert.match(chosenCard.content, /2\. \*\*DeepSeek Reasoner\*\* ✅/)
-	assert.equal(
-		chosenCard.keyboard.content.rows.flatMap((r) => r.buttons).find((b) => b.action.type === 2).action.data,
-		'模型 deepseek/deepseek-reasoner ',
+})
+
+test('模型卡片·提供商/模型：长名字照发（不再自己砍成省略号），只挡病态长名字', () => {
+	const group = {
+		id: 'deepseek-official',
+		name: 'DeepSeek Official 官方渠道名字',
+		models: [
+			{ id: 'deepseek-reasoner', name: 'DeepSeek Reasoner (Thinking Mode, 128k)', description: '' },
+			{ id: 'very-long', name: '名'.repeat(80), description: '' },
+		],
+	}
+	const providers = buildModelProviderCard({ groups: [group] })
+	const providerLabel = providers.keyboard.content.rows[0].buttons[0].render_data.label
+	assert.ok(providerLabel.startsWith('DeepSeek Official'), '英文全名保留')
+	assert.ok(providerLabel.endsWith('…'), '按宽松上限截断')
+	assert.ok(displayWidth(providerLabel) > 10, '比原来"10 个显示宽度"宽得多——不再只显示 5 个中文字')
+	assert.ok(displayWidth(providerLabel) <= PROVIDER_LABEL_WIDTH_LIMIT)
+
+	const list = buildModelListCard({ group, current: null })
+	const modelLabels = list.keyboard.content.rows.flatMap((row) => row.buttons.map((b) => b.render_data.label))
+	assert.equal(modelLabels[0], 'DeepSeek Reasoner (Thinking Mode, 128k)', '模型按钮照发全名')
+	assert.ok(modelLabels[1].endsWith('…'), '病态长的名字才截断')
+	assert.ok(displayWidth(modelLabels[1]) <= MODEL_LABEL_WIDTH_LIMIT)
+})
+
+test('模型卡片·确认卡片：应用到当前会话 / 切到其他会话（交互式）/ 返回', () => {
+	const group = { id: 'deepseek', name: 'DeepSeek' }
+	const model = { id: 'deepseek-reasoner', name: 'DeepSeek Reasoner', description: '深度推理' }
+	const card = buildModelConfirmCard({ group, model, label: '项目甲(session-1)' })
+
+	assert.match(card.content, /\*\*模型 · 确认\*\*/)
+	assert.match(card.content, /选中的模型：\*\*DeepSeek \/ DeepSeek Reasoner\*\*/)
+	assert.match(card.content, /深度推理/)
+	assert.match(card.content, /写出\*\*会话id\*\*/)
+
+	const rows = card.keyboard.content.rows
+	assert.deepEqual(
+		rows.map((row) => row.buttons.map((b) => b.render_data.label)),
+		[['应用到当前会话', '切到其他会话'], ['返回']],
 	)
+	const buttons = rows.flatMap((row) => row.buttons)
+	assert.ok(buttons.every((b) => b.action.type === 1), '三个都是交互式回调按钮（不是填输入框的指令按钮）')
+	assert.equal(buttons[0].render_data.style, 1, '主操作「应用到当前会话」＝蓝')
+	assert.equal(buttons[1].render_data.style, 0)
+	assert.equal(buttons[2].render_data.style, 0)
+	assert.deepEqual(parseCallback(buttons[0].action.data), {
+		kind: 'model',
+		action: 'apply',
+		arg: 'deepseek:deepseek-reasoner',
+	})
+	assert.deepEqual(parseCallback(buttons[1].action.data), {
+		kind: 'model',
+		action: 'other',
+		arg: 'deepseek:deepseek-reasoner',
+	})
+	assert.deepEqual(parseCallback(buttons[2].action.data), { kind: 'model', action: 'back', arg: 'deepseek' })
+	assert.ok(card.keyboard.content.rows.length <= 5)
+})
+
+test('模型卡片·「切到其他会话」提示卡片：等用户发会话id，自带「取消」', () => {
+	const group = { id: 'deepseek', name: 'DeepSeek' }
+	const model = { id: 'deepseek-reasoner', name: 'DeepSeek Reasoner' }
+	const card = buildModelSessionPromptCard({ group, model, label: '项目甲(session-1)' })
+
+	assert.match(card.content, /\*\*模型 · 切到其他会话\*\*/)
+	assert.match(card.content, /发一条消息写出\*\*会话id\*\*/)
+	const buttons = card.keyboard.content.rows.flatMap((row) => row.buttons)
+	assert.deepEqual(buttons.map((b) => b.render_data.label), ['取消'])
+	assert.equal(buttons[0].action.type, 1)
+	assert.deepEqual(parseCallback(buttons[0].action.data), {
+		kind: 'model',
+		action: 'cancel',
+		arg: 'deepseek:deepseek-reasoner',
+	})
 })
 
 test('模型卡片回调 data 能原样解析回来（端到端契约）', () => {
@@ -677,6 +743,22 @@ test('模型卡片回调 data 能原样解析回来（端到端契约）', () =>
 		action: 'pick',
 		arg: 'deepseek:deepseek-chat',
 	})
+	assert.deepEqual(parseCallback(data.model('apply', 'deepseek:deepseek-chat')), {
+		kind: 'model',
+		action: 'apply',
+		arg: 'deepseek:deepseek-chat',
+	})
+	assert.deepEqual(parseCallback(data.model('other', 'deepseek:deepseek-chat')), {
+		kind: 'model',
+		action: 'other',
+		arg: 'deepseek:deepseek-chat',
+	})
+	assert.deepEqual(parseCallback(data.model('cancel', 'deepseek:deepseek-chat')), {
+		kind: 'model',
+		action: 'cancel',
+		arg: 'deepseek:deepseek-chat',
+	})
+	assert.deepEqual(parseCallback(data.model('back', 'deepseek')), { kind: 'model', action: 'back', arg: 'deepseek' })
 	assert.deepEqual(parseCallback(data.model('list')), { kind: 'model', action: 'list', arg: '' })
 	assert.equal(parseCallback(data.model('')), null)
 	assert.equal(parseCallback('qqb:mod'), null, '不是本插件的回调前缀')

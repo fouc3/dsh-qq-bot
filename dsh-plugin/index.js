@@ -32,8 +32,10 @@ import { createModels, splitOnce } from './lib/models.js'
 import {
 	QUESTION_MAX_BUTTONS,
 	buildInboxCard,
+	buildModelConfirmCard,
 	buildModelListCard,
 	buildModelProviderCard,
+	buildModelSessionPromptCard,
 	buildPermissionCard,
 	buildInboxResult,
 	buildMkdirPromptCard,
@@ -244,9 +246,7 @@ export function apply(ctx, rawConfig) {
 	/**
 	 * 模型卡片第二级：某个提供商的模型列表（每行 1 个，可翻页）。
 	 *
-	 * `chosen` 是刚切成功的那一个：卡片会写成"✅ 已切到 …"并标成当前——
-	 * 这就是用户说的「选择完毕确认」，同一张卡片上还给一个**指令按钮**「切其他会话」，
-	 * 点它只是把 `模型 <提供商>/<模型>` 填进输入框，用户在末尾补会话id再发送即可。
+	 * `chosen` 是刚切成功的那一个：卡片会写成"✅ 已切到 …"并标成当前。
 	 */
 	async function showModelListCard({ openid, sessionId, providerId, page = 1, chosen = null, replyContext = {} }) {
 		const catalog = await models.catalog()
@@ -261,21 +261,80 @@ export function apply(ctx, rawConfig) {
 			return showModelCard({ openid, sessionId, replyContext })
 		}
 		const current = await models.current(sessionId)
-		const justChosen = chosen && chosen.provider === group.id ? chosen : null
-		const marked = justChosen ?? (current?.provider === group.id ? current : null)
-		// 「切其他会话」按钮要填进输入框的命令：`模型 <提供商>/<模型>`（末尾留空格给会话id）。
-		const otherCommand = marked ? models.commandFor(group, { id: marked.model }) : ''
 		const card = buildModelListCard({
 			group,
 			current,
-			chosen: justChosen,
+			chosen: chosen && chosen.provider === group.id ? chosen : null,
 			label: sessions.get(sessionId) ? sessions.label(sessionId) : sessionId,
 			page,
-			otherCommand,
 		})
 		await io.sendCard({ openid, content: card.content, keyboard: card.keyboard, context: replyContext })
 		return card
 	}
+
+	/** 从目录里找一对 {group, model}；找不到返回 null。 */
+	async function lookupModel(providerId, modelId) {
+		const catalog = await models.catalog()
+		if (!catalog.ok) return { error: catalog.error }
+		const group = catalog.groups.find((item) => item.id === providerId)
+		if (!group) return { error: `提供商 \`${providerId}\` 现在不可用（发 \`模型\` 看最新列表）。` }
+		const model = group.models.find((item) => item.id === modelId)
+		if (!model) return { error: `提供商 \`${group.name}\` 里没有 \`${modelId}\`（发 \`模型\` 重新挑）。` }
+		return { group, model }
+	}
+
+	/**
+	 * 模型卡片第三级：确认卡片（用户要求"选完模型先确认：应用到当前会话 / 切其他会话 / 返回"）。
+	 */
+	async function showModelConfirmCard({ openid, sessionId, providerId, modelId, replyContext = {} }) {
+		const found = await lookupModel(providerId, modelId)
+		if (found.error) {
+			await sendText({ openid, content: found.error, markdown: true, context: replyContext })
+			return null
+		}
+		const card = buildModelConfirmCard({
+			group: found.group,
+			model: found.model,
+			label: sessions.get(sessionId) ? sessions.label(sessionId) : sessionId,
+		})
+		await io.sendCard({ openid, content: card.content, keyboard: card.keyboard, context: replyContext })
+		return card
+	}
+
+	/**
+	 * 「切到其他会话」：进"等会话id"状态并发一张提示卡片（自带「取消」）。
+	 *
+	 * 用户明确要求这里是**交互式**的（而不是"把命令填进输入框"）：
+	 * 下一条消息写出会话id，就切给那个会话。
+	 */
+	async function beginModelSessionPrompt({ openid, providerId, modelId, replyContext = {} }) {
+		const found = await lookupModel(providerId, modelId)
+		if (found.error) {
+			await sendText({ openid, content: found.error, markdown: true, context: replyContext })
+			return null
+		}
+		state.setPendingModel(openid, {
+			provider: found.group.id,
+			model: found.model.id,
+			at: new Date().toISOString(),
+		})
+		state.flush()
+		const boundId = sessionIdOfPendingTarget(openid)
+		const card = buildModelSessionPromptCard({
+			group: found.group,
+			model: found.model,
+			label: boundId ? sessions.label(boundId) : '',
+		})
+		await io.sendCard({ openid, content: card.content, keyboard: card.keyboard, context: replyContext })
+		return card
+	}
+
+	/** 等会话id时那张提示卡片上「会话：」显示的就是当前绑定会话（没绑定则留空）。 */
+	function sessionIdOfPendingTarget(openid) {
+		const bound = state.bindingOf(openid)
+		return bound && bound !== 'none' && sessions.get(bound) ? bound : ''
+	}
+
 
 	/**
 	 * 把某个会话的模型切成 spec（`提供商/模型名字`）指定的那一档。
@@ -1033,10 +1092,11 @@ export function apply(ctx, rawConfig) {
 		//    否则 `停止`/`进度` 这类命令会被提问桥当「其他」答案吃掉。
 		const parsed = parseCommand(event.text)
 		if (parsed) {
-			// 命令也当"取消等目录名"：不然点了「新建目录」又反悔发命令，会有一条
-			// 悬着的 pending 把后面某条无关消息当成目录名吃掉。
-			if (state.pendingDirOf(openid)) {
+			// 命令也当"取消等目录名/等会话id"：不然点了「新建目录」或「切到其他会话」
+			// 又反悔发命令，会有一条悬着的 pending 把后面某条无关消息吃掉。
+			if (state.pendingDirOf(openid) || state.pendingModelOf(openid)) {
 				state.setPendingDir(openid, null)
+				state.setPendingModel(openid, null)
 				state.flush()
 			}
 			// 引用也要交给命令：`发送 <会话id> <正文>` 带引用时，引用必须生效。
@@ -1051,6 +1111,12 @@ export function apply(ctx, rawConfig) {
 			const bound = state.bindingOf(openid)
 			const agent = bound && bound !== 'none' ? await agentFor(bound) : null
 			if (agent) {
+				// 拿 dsh 命令也当"取消等待"（同桥命令）。
+				if (state.pendingDirOf(openid) || state.pendingModelOf(openid)) {
+					state.setPendingDir(openid, null)
+					state.setPendingModel(openid, null)
+					state.flush()
+				}
 				// `/plan <文本>` 要拆开：命令切模式，文本走本桥投递（见 splitModeCommand 的注释）。
 				const split = splitModeCommand(slash)
 				const outcome = await runCommand(ctx.commands, agent, split.command, { logger })
@@ -1098,6 +1164,50 @@ export function apply(ctx, rawConfig) {
 			await ensureWorkspaceFor({ path: result.path })
 			// 默认 cd 进去：直接把新目录的卡片发出来，接着点「在这里新建」就建在这里。
 			await showNewSessionCard({ openid, dir: result.path, replyContext: context })
+			return
+		}
+
+		// 3c) 模型卡片上点了「切到其他会话」在等会话id：这条文字就是会话id（交互式，见上）。
+		//     认不出就**保持等待**并说清楚，想退出点提示卡片上的「取消」或直接发命令。
+		const pendingModel = state.pendingModelOf(openid)
+		if (
+			pendingModel &&
+			String(event.text ?? '').trim() &&
+			!(Array.isArray(event.attachments) && event.attachments.length > 0)
+		) {
+			const raw = String(event.text).trim()
+			const ref = sessions.resolveRef(raw.split(/\s+/))
+			const target = !ref?.error && ref?.sessionId && ref.sessionId !== 'none' ? ref.sessionId : ''
+			if (!target) {
+				await sendText({
+					openid,
+					content: `${
+						ref?.error ?? `认不出会话引用 \`${raw}\`。`
+					}\n\n再发一次**会话id**（\`session-…\`），或点上面卡片上的「取消」。`,
+					markdown: true,
+					context,
+				})
+				return
+			}
+			state.setPendingModel(openid, null)
+			state.flush()
+			const result = await setModelForSession({
+				openid,
+				sessionId: target,
+				spec: `${pendingModel.provider}/${pendingModel.model}`,
+			})
+			if (!result?.ok) {
+				await sendText({ openid, content: result?.error ?? '切换模型失败。', markdown: true, context })
+				return
+			}
+			// 只回执、不重发模型卡片：卡片上的"当前"是按**绑定会话**读的，
+			// 切给别的会话时重发会标错（用户看的是另一个会话的当前模型）。
+			await sendText({
+				openid,
+				content: `已把 ${sessions.describe(target)} 的模型切成 ${result.text}。`,
+				markdown: true,
+				context,
+			})
 			return
 		}
 
@@ -1225,13 +1335,18 @@ export function apply(ctx, rawConfig) {
 				})
 				code = 0
 			} else if (parsed.action === 'pick') {
+				// 点模型**不立刻切**：先给确认卡片（应用到当前会话 / 切到其他会话 / 返回）。
+				const [providerId, modelId] = splitOnce(parsed.arg)
+				await showModelConfirmCard({ openid, sessionId: bound, providerId, modelId, replyContext: ctxReply })
+				code = 0
+			} else if (parsed.action === 'apply') {
+				// 确认卡片上的「应用到当前会话」：切完把模型列表卡片重发一遍（标出新当前 + ✅）。
 				const [providerId, modelId] = splitOnce(parsed.arg)
 				const result = await setModelForSession({ openid, sessionId: bound, spec: `${providerId}/${modelId}` })
 				if (!result?.ok) {
 					await sendText({ openid, content: result?.error ?? '切换模型失败。', markdown: true, context: ctxReply })
 					code = 1
 				} else {
-					// 切完就着同一张卡片做"选择完毕确认"：标出新当前，并给出「切其他会话」按钮。
 					await showModelListCard({
 						openid,
 						sessionId: bound,
@@ -1241,6 +1356,22 @@ export function apply(ctx, rawConfig) {
 					})
 					code = 0
 				}
+			} else if (parsed.action === 'other') {
+				// 确认卡片上的「切到其他会话」：进"等会话id"状态（交互式，不再是填命令）。
+				const [providerId, modelId] = splitOnce(parsed.arg)
+				await beginModelSessionPrompt({ openid, providerId, modelId, replyContext: ctxReply })
+				code = 0
+			} else if (parsed.action === 'cancel') {
+				// "等会话id"卡片上的「取消」：清掉等待状态，回到确认卡片。
+				const [providerId, modelId] = splitOnce(parsed.arg)
+				state.setPendingModel(openid, null)
+				state.flush()
+				await showModelConfirmCard({ openid, sessionId: bound, providerId, modelId, replyContext: ctxReply })
+				code = 0
+			} else if (parsed.action === 'back') {
+				// 确认卡片上的「返回」：回到该提供商的模型列表。
+				await showModelListCard({ openid, sessionId: bound, providerId: parsed.arg, replyContext: ctxReply })
+				code = 0
 			} else {
 				logger.debug?.('收到未知的模型卡片动作', { action: parsed.action })
 				code = 1

@@ -155,7 +155,7 @@ test('模型：不带斜杠时——是全库唯一的模型才认，提供商/�
 	assert.equal(models.resolveToken('/chat', groups).ok, false, '缺提供商')
 })
 
-test('模型：切换会话模型（成功记下出参，失败如实回报），并生成给用户填的命令', async () => {
+test('模型：切换会话模型（成功记下出参，失败如实回报）', async () => {
 	const okCtx = fakeCtx()
 	const models = createModels({ ctx: okCtx.ctx })
 	const ok = await models.set('session-1', { provider: 'openai', model: 'gpt-5.2' })
@@ -169,10 +169,6 @@ test('模型：切换会话模型（成功记下出参，失败如实回报）�
 
 	assert.equal((await models.set('', { provider: 'a', model: 'b' })).ok, false)
 	assert.equal((await models.set('s', { provider: 'a' })).ok, false)
-
-	// 用户点「切其他会话」时填进输入框的命令：末尾留空格好接会话id
-	assert.equal(models.commandFor({ id: 'openai' }, { id: 'gpt-5.2' }), '模型 openai/gpt-5.2 ')
-	assert.equal(models.commandFor({ id: 'openai' }, { id: 'gpt-5.2' }, { sessionId: 'session-9' }), '模型 openai/gpt-5.2 session-9')
 })
 
 test('splitOnce：按第一个分隔符切两段（模型卡片回调 data 用）', () => {

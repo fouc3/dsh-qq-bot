@@ -1542,7 +1542,7 @@ test('端到端：`发送 <会话id> <正文>` 带引用时，引用要一起投
 	boot.dispose()
 })
 
-test('端到端：`模型` 两级卡片（提供商 2/行 → 模型 1/行）／点一下就切／`切其他会话`按钮填命令／带参直接切', async (t) => {
+test('端到端：`模型` 两级卡片（提供商 2/行 → 模型 1/行）／选完模型先确认（应用/切其他会话/返回）／切其他会话是交互式／带参直接切', async (t) => {
 	const boot = bootPlugin(t, { sessions: SUMMARIES })
 	await waitFor(() => existsSync(boot.socketPath))
 	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
@@ -1561,7 +1561,7 @@ test('端到端：`模型` 两级卡片（提供商 2/行 → 模型 1/行）／
 	const rows = card.args.keyboard.content.rows.map((row) => row.buttons.map((b) => b.render_data.label))
 	assert.deepEqual(rows, [[clipLabel('DeepSeek'), clipLabel('OpenAI')]], '提供商每行 2 个')
 
-	// 点提供商 → 模型列表卡片：每个模型一行
+	// 点提供商 → 模型列表卡片：每个模型一行，label 是**全名**（不再自己砍）
 	await rpc(boot.socketPath, 'event', {
 		kind: 'interaction',
 		openid: 'U1',
@@ -1580,12 +1580,12 @@ test('端到端：`模型` 两级卡片（提供商 2/行 → 模型 1/行）／
 		'模型每行最多 1 个',
 	)
 	assert.deepEqual(
-		modelRows.at(-1).buttons.map((b) => b.render_data.label),
-		['返回'],
-		'读不到当前模型时不给「切其他会话」（没东西可填）',
+		modelCard.args.keyboard.content.rows.flatMap((r) => r.buttons).map((b) => b.render_data.label),
+		['DeepSeek Chat', 'DeepSeek Reasoner', '返回'],
+		'模型按钮照发全名（以前会被砍成 "DeepSe…"）',
 	)
 
-	// 点一个模型 → 切到当前会话 + 重发卡片做"选择完毕确认"
+	// 点一个模型 → **确认卡片**（不立刻切！）
 	await rpc(boot.socketPath, 'event', {
 		kind: 'interaction',
 		openid: 'U1',
@@ -1593,28 +1593,100 @@ test('端到端：`模型` 两级卡片（提供商 2/行 → 模型 1/行）／
 		eventId: 'INT-MODEL-2',
 		msgId: 'CARD-M2',
 	})
-	const picked = await waitFor(async () => {
+	const confirmCard = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.filter((c) => c.kind === 'send_c2c' && c.args.keyboard).at(-1) ?? null
+	})
+	assert.deepEqual(boot.ctx.sessionController.selectedModels, [], '确认之前绝不能已经切了')
+	assert.match(String(confirmCard.args.content), /\*\*模型 · 确认\*\*/)
+	assert.match(String(confirmCard.args.content), /选中的模型：\*\*DeepSeek \/ DeepSeek Reasoner\*\*/)
+	assert.deepEqual(
+		confirmCard.args.keyboard.content.rows.map((row) => row.buttons.map((b) => b.render_data.label)),
+		[['应用到当前会话', '切到其他会话'], ['返回']],
+	)
+	assert.ok(
+		confirmCard.args.keyboard.content.rows
+			.flatMap((r) => r.buttons)
+			.every((b) => b.action.type === 1),
+		'三个都是交互式回调按钮（不再是"填输入框"的指令按钮）',
+	)
+
+	// 「应用到当前会话」→ 真的切 + 模型列表卡片重发（标出新当前 + ✅）
+	await rpc(boot.socketPath, 'event', {
+		kind: 'interaction',
+		openid: 'U1',
+		buttonData: cardData.model('apply', 'deepseek:deepseek-reasoner'),
+		eventId: 'INT-MODEL-3',
+		msgId: 'CARD-M3',
+	})
+	const applied = await waitFor(async () => {
 		const list = await drainFor(boot.socketPath, 80)
 		return list.filter((c) => c.kind === 'send_c2c' && c.args.keyboard).at(-1) ?? null
 	})
 	assert.deepEqual(boot.ctx.sessionController.selectedModels, [
 		{ sessionId: 'session-1', provider: 'deepseek', model: 'deepseek-reasoner' },
 	])
-	assert.match(String(picked.args.content), /✅ 已切到 \*\*DeepSeek \/ DeepSeek Reasoner\*\*/)
-	assert.match(String(picked.args.content), /当前：\*\*DeepSeek \/ DeepSeek Reasoner\*\*/)
-	// 确认卡片上的「切其他会话」是**指令按钮**：只把命令填进输入框（补会话id后发送即切给别的会话）
-	const nav = picked.args.keyboard.content.rows.at(-1).buttons
-	assert.deepEqual(nav.map((b) => b.render_data.label), ['返回', '切其他会话'])
-	assert.equal(nav[1].action.type, 2)
-	assert.equal(nav[1].action.data, '模型 deepseek/deepseek-reasoner ')
+	assert.match(String(applied.args.content), /✅ 已切到 \*\*DeepSeek \/ DeepSeek Reasoner\*\*/)
+	assert.match(String(applied.args.content), /当前：\*\*DeepSeek \/ DeepSeek Reasoner\*\*/)
+
+	// 「切到其他会话」→ 提示卡片（等会话id）+ 真的等状态；发一条会话id 就切给那个会话
+	await rpc(boot.socketPath, 'event', {
+		kind: 'interaction',
+		openid: 'U1',
+		buttonData: cardData.model('pick', 'deepseek:deepseek-chat'),
+		eventId: 'INT-MODEL-4',
+		msgId: 'CARD-M4',
+	})
+	await drainFor(boot.socketPath, 80)
+	await rpc(boot.socketPath, 'event', {
+		kind: 'interaction',
+		openid: 'U1',
+		buttonData: cardData.model('other', 'deepseek:deepseek-chat'),
+		eventId: 'INT-MODEL-5',
+		msgId: 'CARD-M5',
+	})
+	const promptCard = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.filter((c) => c.kind === 'send_c2c' && c.args.keyboard).at(-1) ?? null
+	})
+	assert.match(String(promptCard.args.content), /\*\*模型 · 切到其他会话\*\*/)
+	assert.deepEqual(promptCard.args.keyboard.content.rows.flatMap((r) => r.buttons).map((b) => b.render_data.label), ['取消'])
+
+	// 认不出的"会话id"：保持等待并说清楚（不会误切）
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '这不是会话id', msgId: 'M9' })
+	const wrong = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /认不出会话引用|没找到会话/.test(String(c.args.content))) ?? null
+	})
+	assert.match(String(wrong.args.content), /再发一次/)
+
+	// 发一条真会话id → 切给 session-2（不要求先绑定它），并只回执
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: 'session-2', msgId: 'M10' })
+	const switched = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /的模型切成/.test(String(c.args.content))) ?? null
+	})
+	assert.match(String(switched.args.content), /DeepSeek \/ DeepSeek Chat/)
+	assert.deepEqual(boot.ctx.sessionController.selectedModels.at(-1), {
+		sessionId: 'session-2',
+		provider: 'deepseek',
+		model: 'deepseek-chat',
+	})
+	// 等待状态用完即清：下一条普通消息不会再被吃掉
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '普通消息', msgId: 'M11' })
+	const after = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.some((c) => c.kind === 'send_c2c' && /认不出会话引用/.test(String(c.args.content))) ? list : null
+	}).catch(() => null)
+	assert.equal(after, null, '不该再拿普通消息当会话id')
 
 	// 回到提供商列表：这一次"当前"要标出来，并且提供商按钮是蓝色
 	await rpc(boot.socketPath, 'event', {
 		kind: 'interaction',
 		openid: 'U1',
 		buttonData: cardData.model('list'),
-		eventId: 'INT-MODEL-3',
-		msgId: 'CARD-M3',
+		eventId: 'INT-MODEL-6',
+		msgId: 'CARD-M6',
 	})
 	const listed = await waitFor(async () => {
 		const list = await drainFor(boot.socketPath, 80)
