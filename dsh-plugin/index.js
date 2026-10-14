@@ -25,9 +25,17 @@ import { createRounds } from './lib/rounds.js'
 import { buildReplyTool } from './lib/reply-tool.js'
 import { buildSessionCard, callbackButton, data as cardData, parseCallback } from './lib/cards.js'
 import { createCommandRunner, menuItems, panelItems, parseCommand } from './lib/commands.js'
+import {
+	EXCLUDED_COMMANDS,
+	buildMenuItems,
+	isSlashLine,
+	listCommands,
+	runCommand,
+	splitSlashLine,
+} from './lib/dsh-commands.js'
 
 export const name = 'dsh-qq-bot'
-export const inject = ['agents', 'sessions', 'sessionController', 'workspaceRegistry', 'tools']
+export const inject = ['agents', 'sessions', 'sessionController', 'workspaceRegistry', 'tools', 'commands']
 
 /**
  * 递归冻结：与 `createUserMessage` 一样，交给框架的消息必须是不可变快照。
@@ -70,6 +78,7 @@ export function apply(ctx, rawConfig) {
 		sessionPageSize: rawConfig?.sessionPageSize ?? 8,
 		needReplyText: rawConfig?.needReplyText ?? '用户点了「我需要回复」。请把上一条消息对应的结果完整地回复给用户。',
 		needReplyAckText: rawConfig?.needReplyAckText ?? '已触发，正在请求回复…',
+		dshMenuLabel: rawConfig?.dshMenuLabel ?? 'dsh 命令',
 	}
 	const socketPath = expandHome(rawConfig?.socketPath ?? '~/.dsh/dsh-qq-bot/bridge.sock')
 	const stateFile = expandHome(rawConfig?.stateFile ?? '~/.dsh/dsh-qq-bot/state.json')
@@ -98,6 +107,18 @@ export function apply(ctx, rawConfig) {
 
 	function isWhitelisted(openid) {
 		return state.whitelist().includes(openid)
+	}
+
+	/**
+	 * 挑一个"代表 agent"来枚举 dsh 命令（命令是按 agent 作用域的）。
+	 * 优先被 QQ 绑定的活会话，其次任意活会话，都没有就返回 null。
+	 */
+	function representativeAgent() {
+		const live = ctx.agents.list?.() ?? []
+		for (const agent of live) {
+			if (openidForSession(agent.id)) return agent
+		}
+		return live[0] ?? null
 	}
 
 	/** 拉一个活 agent：先查在册，冷会话再 resume（会话不存在则返回 null）。 */
@@ -383,7 +404,27 @@ export function apply(ctx, rawConfig) {
 			return
 		}
 
-		// 3) 普通消息 → 当前绑定会话
+		// 3) dsh 内置命令：'/xxx' 直接交给 ctx.commands.execute（不经模型）。
+		//    不兼容的（如 feedback）当普通消息处理。
+		const slash = splitSlashLine(event.text)
+		if (slash && !EXCLUDED_COMMANDS.has(slash.name)) {
+			const bound = state.bindingOf(openid)
+			const agent = bound && bound !== 'none' ? await agentFor(bound) : null
+			if (agent) {
+				const outcome = await runCommand(ctx.commands, agent, slash.line, { logger })
+				if (outcome.handled) {
+					await sendText({
+						openid,
+						content: outcome.text || (outcome.ok ? `已执行 /${slash.name}` : `/${slash.name} 执行失败`),
+						markdown: false,
+						context,
+					})
+					return
+				}
+			}
+		}
+
+		// 4) 普通消息 → 当前绑定会话
 		const bound = state.bindingOf(openid)
 		if (!bound || bound === 'none') {
 			await sendText({
@@ -462,13 +503,26 @@ export function apply(ctx, rawConfig) {
 				logger.info?.('已接收白名单与面板意图', { openids: openids.length, panelUsers: registered.panel.users.length })
 				return { ok: true }
 			},
-			panel: async () => ({
-				scope: 'c2c',
-				targetType: 'specific',
-				userOpenIds: registered.panel.users,
-				items: panelItems(),
-				menu: { items: registered.menu.enabled ? menuItems() : [] },
-			}),
+			panel: async () => {
+				// dsh 内置命令收进二级菜单（顶层留给桥自己的命令）。
+				// 命令是按 agent 作用域的，所以挑一个代表：优先"被 QQ 绑定的活会话"，
+				// 其次任意活会话；都没有时只发桥命令（下次网关重同步时再补齐）。
+				const descriptors = await listCommands(ctx.commands, representativeAgent(), logger)
+				return {
+					scope: 'c2c',
+					targetType: 'specific',
+					// enabled / menuEnabled 只是把 register 收到的意图回显出来，方便直接用
+					// socket 排查；**是否真的发布以 Go 侧 config.yaml 为准**（配置唯一来源在那）。
+					enabled: registered.panel.enabled,
+					menuEnabled: registered.menu.enabled,
+					userOpenIds: registered.panel.users,
+					items: panelItems(),
+					// 扁平键 menuItems：与 Go 侧 PanelDefinition.MenuItems 对齐。
+					menuItems: registered.menu.enabled
+						? buildMenuItems({ bridge: menuItems(), commands: descriptors, label: config.dshMenuLabel })
+						: [],
+				}
+			},
 			event: async (args) => {
 				// 立即返回，异步处理：QQ 的事件回调不该被这里拖住。
 				void onQQEvent(args).catch((error) => logger.warn?.('处理 QQ 事件失败', { error: String(error) }))

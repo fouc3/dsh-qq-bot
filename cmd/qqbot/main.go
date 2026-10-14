@@ -44,9 +44,11 @@ func run() error {
 	var (
 		configPath  string
 		checkConfig bool
+		listPanels  bool
 	)
 	flag.StringVar(&configPath, "config", config.DefaultPath, "配置文件路径")
 	flag.BoolVar(&checkConfig, "check-config", false, "只校验配置并打印摘要（不连 QQ、不连 dsh）")
+	flag.BoolVar(&listPanels, "list-panels", false, "列出平台侧现有指令面板后退出（排查 remark 匹配与数量上限）")
 	flag.Parse()
 
 	cfg, err := config.Load(configPath)
@@ -78,6 +80,21 @@ func run() error {
 	}
 	qqClient := qq.New(sdkClient, logger)
 
+	if listPanels {
+		lines, err := qqClient.DescribePanels(context.Background())
+		if err != nil {
+			return err
+		}
+		if len(lines) == 0 {
+			fmt.Println("平台侧没有 c2c 指令面板")
+			return nil
+		}
+		for _, line := range lines {
+			fmt.Println(line)
+		}
+		return nil
+	}
+
 	socketPath := cfg.SocketPath()
 	dedupe, err := executor.OpenDedupe(filepath.Join(filepath.Dir(socketPath), "qqbot-seen.json"), dedupeCapacity)
 	if err != nil {
@@ -102,6 +119,7 @@ func run() error {
 
 	// 本地通道：注册 + 面板发布（重试到成功）+ outbox 长轮询。
 	go bridgeLoop(ctx, cfg, channel, exec, logger)
+	go panelResyncLoop(ctx, cfg, channel, exec, logger)
 
 	// QQ 事件 → 本地通道。emit 里带独立超时，且用 WithoutCancel：
 	// 停机取消不该让"正在投递的这条事件"半途消失，但也绝不能无限等。
@@ -137,7 +155,7 @@ func bridgeLoop(ctx context.Context, cfg *config.Config, channel *bridge.Client,
 	delay := time.Second
 
 	for ctx.Err() == nil {
-		if err := ensureRegistered(ctx, cfg, channel, exec, logger); err != nil {
+		if err := ensureRegistered(ctx, cfg, channel, exec, logger, true); err != nil {
 			if ctx.Err() != nil {
 				return
 			}
@@ -166,7 +184,9 @@ func bridgeLoop(ctx context.Context, cfg *config.Config, channel *bridge.Client,
 }
 
 // ensureRegistered 上报白名单快照并发布指令面板/菜单。
-func ensureRegistered(ctx context.Context, cfg *config.Config, channel *bridge.Client, exec *executor.Executor, logger *slog.Logger) error {
+//
+// verbose 只影响日志级别：首次注册打 INFO，周期性重同步打 DEBUG。
+func ensureRegistered(ctx context.Context, cfg *config.Config, channel *bridge.Client, exec *executor.Executor, logger *slog.Logger, verbose bool) error {
 	openids := make([]map[string]string, 0, len(cfg.Whitelist.Users))
 	for _, u := range cfg.Whitelist.Users {
 		openids = append(openids, map[string]string{"openid": u.OpenID, "note": u.Note})
@@ -184,16 +204,61 @@ func ensureRegistered(ctx context.Context, cfg *config.Config, channel *bridge.C
 		return fmt.Errorf("register 失败：%w", err)
 	}
 
-	var def qq.PanelDefinition
-	if err := channel.Call(ctx, "panel", struct{}{}, &def); err != nil {
+	// 插件回包兼容两种形状：扁平的 menuItems（新）与嵌套的 menu.items（旧）。
+	// 之所以要兼容：Host 插件的 ESM 模块按 URL 缓存，改代码后光重启网关不会
+	// 换到新代码（要 dsh web 重启），兼容解码保证两种版本都能发布菜单。
+	var panelPayload struct {
+		qq.PanelDefinition
+		Menu struct {
+			Items []qq.MenuItem `json:"items"`
+		} `json:"menu"`
+	}
+	if err := channel.Call(ctx, "panel", struct{}{}, &panelPayload); err != nil {
 		return fmt.Errorf("读取面板定义失败：%w", err)
 	}
+	def := panelPayload.PanelDefinition
+	if len(def.MenuItems) == 0 {
+		def.MenuItems = panelPayload.Menu.Items
+	}
+	// 是否发布、面板 remark、是否发布菜单，一律以本机 config.yaml 为准 ——
+	// 插件只提供"内容"（命令表 / 菜单项 / 目标私聊），不决定本机要不要发。
+	def.Enabled = cfg.IsPanelEnabled()
+	def.Remark = cfg.Panel.Remark
+	def.MenuEnabled = cfg.IsMenuEnabled()
 	// 面板与菜单：失败只记 WARN —— 它们是发现入口，不该阻塞收发。
 	if err := exec.PublishPanel(ctx, def); err != nil {
 		logger.Warn("发布指令面板失败（不影响收发）", "err", err)
 	}
-	logger.Info("已向 dsh 插件注册并同步面板", "commands", len(def.Items), "targets", len(def.UserOpenIDs))
+	if verbose {
+		logger.Info("已向 dsh 插件注册并同步面板", "commands", len(def.Items), "menu", len(def.MenuItems), "targets", len(def.UserOpenIDs))
+	} else {
+		logger.Debug("已重同步面板", "menu", len(def.MenuItems))
+	}
 	return nil
+}
+
+// panelResyncInterval 是面板/菜单重新同步的间隔。
+//
+// 为什么需要重同步：菜单里的 dsh 内置命令是按 **agent 作用域** 枚举的，
+// 网关启动那一刻可能还没有活会话，二级菜单就是空的；等用户开始用之后再同步
+// 一次就能补齐。发布本身是幂等的（面板按 remark 复用、菜单内容相同则跳过），
+// 所以这里的代价只是一次通道查询（外加面板的一次幂等更新）。
+const panelResyncInterval = 5 * time.Minute
+
+// panelResyncLoop 周期性重同步面板与菜单。
+func panelResyncLoop(ctx context.Context, cfg *config.Config, channel *bridge.Client, exec *executor.Executor, logger *slog.Logger) {
+	ticker := time.NewTicker(panelResyncInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := ensureRegistered(ctx, cfg, channel, exec, logger, false); err != nil && ctx.Err() == nil {
+				logger.Debug("周期性重同步面板失败（不影响收发）", "err", err)
+			}
+		}
+	}
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) bool {

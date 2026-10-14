@@ -1,0 +1,25 @@
+[Unit]
+Description=DSH QQ Bot 网关（QQ 私聊 ↔ dsh 桥的 QQ 侧）
+Documentation=file:///home/fouc3/Projects/DSH-QQ-Bot/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Projects/DSH-QQ-Bot
+ExecStart=%h/Projects/DSH-QQ-Bot/bin/qqbot -config %h/Projects/DSH-QQ-Bot/config.yaml
+
+# 崩了就拉起来（含 QQ 断线、dsh 插件重启等场景）
+Restart=always
+RestartSec=3
+# 反复启动失败时不要无限刷日志
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# 日志交给 journald：journalctl --user -u dsh-qq-bot -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dsh-qq-bot
+
+[Install]
+WantedBy=default.target

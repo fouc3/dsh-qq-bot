@@ -55,7 +55,7 @@ function makeAgent(sessionId) {
 	return agent
 }
 
-function makeCtx({ sessionSummaries = [], live = {} } = {}) {
+function makeCtx({ sessionSummaries = [], live = {}, commands = null } = {}) {
 	const disposers = []
 	const events = new Map()
 	const liveAgents = new Map(Object.entries(live))
@@ -84,6 +84,15 @@ function makeCtx({ sessionSummaries = [], live = {} } = {}) {
 			},
 		},
 		sessions: { get: () => undefined },
+		// dsh 内置命令服务（ctx.commands）：默认"没有命令"，测试可覆盖。
+		commands: commands ?? {
+			async list() {
+				return []
+			},
+			async execute() {
+				return undefined
+			},
+		},
 		sessionController: {
 			async list() {
 				return { items: sessionSummaries, isEnd: true }
@@ -183,11 +192,11 @@ async function drainFor(path, ms = 150) {
 	return collected
 }
 
-function bootPlugin(t, { sessions: summaries, live, token = '', config = {} } = {}) {
+function bootPlugin(t, { sessions: summaries, live, token = '', commands = null, config = {} } = {}) {
 	const dir = mkdtempSync(join(tmpdir(), 'dsh-qq-bot-'))
 	const socketPath = join(dir, 'bridge.sock')
 	const stateFile = join(dir, 'state.json')
-	const fake = makeCtx({ sessionSummaries: summaries, live })
+	const fake = makeCtx({ sessionSummaries: summaries, live, commands })
 	apply(fake.ctx, {
 		socketPath,
 		stateFile,
@@ -254,13 +263,18 @@ test('register → panel：白名单快照 + 五条命令的面板定义（只�
 	const panel = await rpc(boot.socketPath, 'panel')
 	assert.equal(panel.value.scope, 'c2c')
 	assert.equal(panel.value.targetType, 'specific')
+	assert.equal(panel.value.enabled, true)
+	assert.equal(panel.value.menuEnabled, true)
 	assert.deepEqual(panel.value.userOpenIds, ['U1'])
 	assert.deepEqual(
 		panel.value.items.map((item) => item.name),
 		['切换会话', '发送', '停止', '归档', '延迟发送'],
 	)
-	assert.equal(panel.value.menu.items.length, 5)
-	assert.equal(panel.value.menu.items[0].sendMessage, '切换会话')
+	// 扁平键 menuItems：与 Go 侧 PanelDefinition.MenuItems 对齐（大小写不敏感匹配）
+	assert.equal(panel.value.menuItems.length, 5)
+	assert.equal(panel.value.menuItems[0].name, '切换会话')
+	assert.equal(panel.value.menuItems[0].sendMessage, '切换会话')
+	assert.equal(panel.value.menu, undefined)
 
 	// 白名单落了盘（插件重启后仍能门守）
 	await waitFor(() => {
@@ -521,6 +535,71 @@ test('端到端：token 握手与 health 诊断', async (t) => {
 	assert.equal(typeof good.value.outboxDepth, 'number')
 	assert.equal(typeof good.value.pendingQuestions, 'number')
 	boot.dispose()
+})
+
+test('端到端：dsh 内置命令从 QQ 直接执行（不进模型）；技能不在内、反馈排除', async (t) => {
+	const agent = makeAgent('session-1')
+	const executed = []
+	const boot = bootPlugin(t, {
+		sessions: SUMMARIES,
+		live: { 'session-1': agent },
+		commands: {
+			async list() {
+				return [
+					{ name: 'compact', description: '压缩以上对话内容' },
+					{ name: 'feedback', description: '发送关于当前会话的反馈' },
+					{ name: 'goal', description: '设置或查看长期任务目标' },
+				]
+			},
+			async execute(target, line) {
+				executed.push({ sessionId: target.id, line })
+				if (line.startsWith('/unknown')) return undefined
+				return { commandId: 'c1', result: { kind: 'success', text: '已压缩' } }
+			},
+		},
+	})
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+
+	// 菜单：桥命令 + 1 个二级菜单（feedback 被排除，只剩 compact/goal）
+	const panel = await rpc(boot.socketPath, 'panel')
+	const groups = panel.value.menuItems.filter((item) => item.type === 'menu')
+	assert.equal(groups.length, 1, 'dsh 命令应收进二级菜单')
+	assert.equal(groups[0].name, 'dsh 命令')
+	assert.deepEqual(
+		groups[0].children.map((child) => child.name),
+		['compact', 'goal'],
+		'feedback 不收纳；技能本来就不在命令表里',
+	)
+	assert.equal(groups[0].children[0].sendMessage, '/compact', '点击把 /命令 填进输入框')
+	assert.equal(panel.value.menuItems.filter((i) => i.type !== 'menu').length, 5, '顶层仍有 5 条桥命令')
+
+	// 绑定会话
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M1' })
+	await waitFor(async () => (await pumpQueue(boot.socketPath)).length > 0)
+
+	// /compact 直接执行，且不进模型
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '/compact', msgId: 'M2' })
+	await waitFor(() => executed.length === 1)
+	assert.equal(executed[0].sessionId, 'session-1')
+	assert.equal(executed[0].line, '/compact')
+	assert.equal(agent.followed.length, 0, '内置命令不该被当成提示词发给模型')
+	const ack = await waitFor(async () => {
+		const list = await pumpQueue(boot.socketPath)
+		return list.find((c) => c.kind === 'send_c2c' && String(c.args.content).includes('已压缩')) ?? null
+	})
+	assert.ok(ack, '命令结果要回给 QQ')
+
+	// /feedback 被排除 → 当作普通消息进会话
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '/feedback 很好用', msgId: 'M3' })
+	await waitFor(() => agent.followed.length === 1)
+	assert.equal(executed.length, 1, 'feedback 不该走命令执行')
+	assert.equal(agent.followed[0].content[0].text, '/feedback 很好用')
+
+	// 认不出的斜杠命令 → 回退成普通消息
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '/unknown 参数', msgId: 'M4' })
+	await waitFor(() => agent.followed.length === 2)
+	assert.equal(agent.followed[1].content[0].text, '/unknown 参数')
 })
 
 test('提问桥：ask_user_question 的 waterfall 在 QQ 侧发卡片，点选项后结算', async (t) => {

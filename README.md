@@ -36,6 +36,7 @@ QQ 用户 ──私聊──▶ QQ 开放平台 ──WebSocket──▶ Go: dsh
 | 会话选择 | md 卡片：文件夹是回调按钮、会话是指令按钮（点了只把 `切换会话 <id>` 填进输入框） |
 | 白名单 | 只有配置里列出的 QQ 私聊能控制 bot；其他账号的消息一律丢弃并记日志 |
 | 延迟发送 | `延迟发送 <会话id> <内容>` 登记待发消息，该会话本轮**正常结束**后再投递给会话 |
+| dsh 内置命令 | QQ 里发 `/compact`、`/model`、`/goal`… 直接走 `ctx.commands.execute` 执行（不经模型）；这些命令在菜单里**收进二级菜单**（顶层留给桥命令）；技能不在内，「反馈」不兼容 |
 
 ---
 
@@ -52,11 +53,25 @@ $EDITOR config.yaml          # 填 appid/client_secret（或 access_token）、�
 ```
 
 `go.mod` 用 `replace` 指向本机的 qq-bot-sdk（`../QQ-Bot-CLI/qq-bot-sdk`）。切回发布版：
-
 ```bash
 go mod edit -dropreplace=github.com/fouc3/qq-bot-sdk
 go get github.com/fouc3/qq-bot-sdk@main
 ```
+
+### 1.5 用 systemd 用户服务常驻（推荐，别用后台任务）
+
+网关连的是你 home 下的 socket、要跟着你的登录会话跑，所以用**用户级**服务：
+
+```bash
+cp deploy/dsh-qq-bot.service ~/.config/systemd/user/     # 仓库里的是 %h 路径版模板
+systemctl --user daemon-reload
+systemctl --user enable --now dsh-qq-bot
+systemctl --user status dsh-qq-bot
+journalctl --user -u dsh-qq-bot -f          # 看日志
+```
+
+崩了会自动拉起（`Restart=always`）。想让它在**没登录时也常驻**，需要
+`loginctl enable-linger $USER`（这是系统级设置，自己决定要不要开）。
 
 ### 2. 装 dsh 插件（必须装进你正在用的那个 profile，通常是 `web`）
 
@@ -87,10 +102,10 @@ dsh plugin --profile web add /home/fouc3/Projects/DSH-QQ-Bot/dsh-plugin
 > `dsh-pause@https://codeload.github.com/better-er/dsh-pause/tar.gz/14f5fd3...` 从占位符
 > `set this to true or false` 改成 `true`。这是**允许该第三方包执行安装脚本**的安全决定，需你拍板。
 >
-> **不能用 `--patch` 把插件"插"进现有 profile**（已实测）：覆盖式补丁只能按 id 改写
-> **已有**条目，新增条目会报 `patch: entry "<id>" not found`。bundle 自带的
-> `cordis.patch.yml` 之所以能新增条目，是因为它随包由 `install_bundle` 在包的上下文里
-> 合并进 profile —— 所以安装这一步绕不开 `plugin_manager`。
+> **不能用裸 `--patch` 行把插件"插"进现有 profile**（已实测）：覆盖式补丁只能按 id
+> 改写**已有**条目，新增条目会报 `patch: entry "<id>" not found`；新增要用
+> `- insert:` 形式（本 bundle 的 `cordis.patch.yml` 用的就是这个形式，由
+> `install_bundle` 在包的上下文里合并）。所以安装这一步走 `plugin_manager` 最省事。
 > （`--dump-config` 只回显补丁行，能查 YAML 方言是否正确，但**不代表已经挂载**。）
 
 ### 3. 起服务并核对
@@ -174,6 +189,10 @@ level=WARN msg="已丢弃非白名单用户的私聊" openid=2A3B4C… text_len=
   —— `lib/socket.test.js` + Go `internal/bridge/socketclient_test.go`
 - ✅ 出站队列 at-least-once（失败不消费、超时重投沿用原 id、撤回不重投、ack 唤醒等待者）
   —— `lib/outbox.test.js` + Go `internal/executor/executor_test.go`
+- ✅ dsh 内置命令：QQ 侧 `/compact` 等直接执行（不经模型）、结果回给 QQ；不兼容的「反馈」
+  与认不出的命令回退成普通消息；命令在菜单里收进二级菜单且不超顶层 10 项
+  —— `lib/dsh-commands.test.js` + `lib/plugin.test.js`「dsh 内置命令从 QQ 直接执行」;
+  网关侧 `internal/qq/panel_clip_test.go`（`sub_menu_items` 落库 + 名宽截断 + 菜单差异检测）
 - ✅ 插件在真 `dsh web` 进程里挂载并可用 —— `application: applied`；通道 0600、目录 700；
   对通道发 `health` 得到真实会话数（197）、发 `panel` 得到 5 条命令 + `c2c/specific`
 - ✅ `git log` 有提交 —— 见仓库历史
@@ -188,7 +207,7 @@ level=WARN msg="已丢弃非白名单用户的私聊" openid=2A3B4C… text_len=
 # Go 侧（含假 QQ 平台 + 真 UNIX socket 桩）
 go vet ./... && gofmt -l . && go test -race ./...
 
-# 插件侧：语法 + 63 项（含"装配级端到端"）
+# 插件侧：语法 + 70 项（含"装配级端到端"）
 node --check dsh-plugin/index.js dsh-plugin/lib/*.js
 node --test dsh-plugin/lib/*.test.js
 ```

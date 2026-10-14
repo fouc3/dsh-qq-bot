@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	qqbotsdk "github.com/fouc3/qq-bot-sdk"
 )
@@ -17,10 +18,16 @@ type PanelItem struct {
 	Desc string `json:"desc"`
 }
 
-// MenuItem 是单聊窗口底部自定义菜单的一项；点击会把 SendMessage 填进输入框。
+// MenuItem 是单聊窗口底部自定义菜单的一项。
+//
+// Type 为空表示 send_message（点击把 SendMessage 填进输入框）；
+// Type 为 "menu" 时表示**可折叠的二级菜单**，内容在 Children 里，
+// 平台限制：顶层最多 10 项、二级最多 5 项。
 type MenuItem struct {
-	Name        string `json:"name"`
-	SendMessage string `json:"sendMessage"`
+	Name        string     `json:"name"`
+	SendMessage string     `json:"sendMessage,omitempty"`
+	Type        string     `json:"type,omitempty"`
+	Children    []MenuItem `json:"children,omitempty"`
 }
 
 // PanelDefinition 是插件下发的面板与菜单定义。
@@ -35,6 +42,85 @@ type PanelDefinition struct {
 
 // maxPanelPages 是查找面板时最多翻页的页数（每页 20 条）。
 const maxPanelPages = 10
+
+// 平台对指令面板条目的显示宽度限制：一个中文字符算 2。
+//
+// 超出时平台只回一个笼统的 40030013「超出数量限制」，很难排查，
+// 所以网关在发布前自己按宽度截断（措辞的权威仍在插件侧）。
+const (
+	maxPanelItemNameWidth = 14
+	maxPanelItemDescWidth = 30
+	// 自定义菜单：顶层按钮名 ≤10，二级菜单项名 ≤14（中文都按 2 计）。
+	maxMenuItemNameWidth    = 10
+	maxSubMenuItemNameWidth = 14
+)
+
+// displayWidth 返回按"中文算 2"计的显示宽度。
+func displayWidth(s string) int {
+	width := 0
+	for _, r := range s {
+		if r > 0x7F {
+			width += 2
+			continue
+		}
+		width++
+	}
+	return width
+}
+
+// clipDisplay 把字符串压到显示宽度上限内，超出部分以 … 结尾。
+func clipDisplay(s string, limit int) string {
+	if displayWidth(s) <= limit {
+		return s
+	}
+	const ellipsis = "…" // 省略号也是全角，占 2 宽
+	budget := limit - displayWidth(ellipsis)
+	if budget < 0 {
+		budget = 0
+	}
+	width := 0
+	var b strings.Builder
+	for _, r := range s {
+		runeWidth := 1
+		if r > 0x7F {
+			runeWidth = 2
+		}
+		if width+runeWidth > budget {
+			break
+		}
+		b.WriteRune(r)
+		width += runeWidth
+	}
+	return b.String() + ellipsis
+}
+
+// DescribePanels 列出平台侧现有的 c2c 指令面板（排查"找不到 remark / 数量超限"时用）。
+//
+// 返回的人类可读文本行；没有面板时返回空切片。
+func (c *Client) DescribePanels(ctx context.Context) ([]string, error) {
+	list, err := c.api.ListPanels(ctx, qqbotsdk.PanelScopeC2C, "", qqbotsdk.MaxPanelPageSize)
+	if err != nil {
+		return nil, fmt.Errorf("查询指令面板失败：%w", err)
+	}
+	if list == nil || len(list.Records) == 0 {
+		return nil, nil
+	}
+	out := make([]string, 0, len(list.Records))
+	for i := range list.Records {
+		rec := list.Records[i]
+		if rec.Panel == nil {
+			out = append(out, fmt.Sprintf("panel_id=%s（空面板）", rec.PanelID))
+			continue
+		}
+		targets := ""
+		if detail, err := c.api.GetPanel(ctx, rec.PanelID); err == nil && detail != nil {
+			targets = strings.Join(detail.UserOpenIDs, ",")
+		}
+		out = append(out, fmt.Sprintf("panel_id=%s remark=%q items=%d version=%d targets=[%s]",
+			rec.PanelID, rec.Panel.Remark, len(rec.Panel.Items), rec.Panel.Version, targets))
+	}
+	return out, nil
+}
 
 // PublishPanel 发布指令面板与自定义菜单。
 //
@@ -53,8 +139,8 @@ func (c *Client) PublishPanel(ctx context.Context, def PanelDefinition) error {
 	for _, it := range def.Items {
 		items = append(items, qqbotsdk.PanelItem{
 			Type: qqbotsdk.PanelItemCommand,
-			Name: it.Name,
-			Desc: it.Desc,
+			Name: clipDisplay(it.Name, maxPanelItemNameWidth),
+			Desc: clipDisplay(it.Desc, maxPanelItemDescWidth),
 		})
 	}
 	panel := &qqbotsdk.Panel{Items: items, Remark: def.Remark}
@@ -183,17 +269,37 @@ func (c *Client) syncPanelTargets(ctx context.Context, panelID string, want []st
 
 // publishMenu 发布单聊窗口底部的自定义菜单（整体覆盖）。
 // 已经是目标状态时跳过，避免每次重启都无谓地顶掉版本号。
+// toSDKMenuItem 把插件的菜单项转成 SDK 结构（支持一层二级菜单）。
+func toSDKMenuItem(it MenuItem) qqbotsdk.MenuItem {
+	if it.Type == "menu" && len(it.Children) > 0 {
+		children := make([]qqbotsdk.SubMenuItem, 0, len(it.Children))
+		for _, child := range it.Children {
+			children = append(children, qqbotsdk.SubMenuItem{
+				Type:        qqbotsdk.SubMenuTypeSendMessage,
+				Name:        clipDisplay(child.Name, maxSubMenuItemNameWidth),
+				SendMessage: child.SendMessage,
+			})
+		}
+		return qqbotsdk.MenuItem{
+			Type:         qqbotsdk.MenuTypeMenu,
+			Name:         clipDisplay(it.Name, maxMenuItemNameWidth),
+			SubMenuItems: children,
+		}
+	}
+	return qqbotsdk.MenuItem{
+		Type:        qqbotsdk.MenuTypeSendMessage,
+		Name:        clipDisplay(it.Name, maxMenuItemNameWidth),
+		SendMessage: it.SendMessage,
+	}
+}
+
 func (c *Client) publishMenu(ctx context.Context, items []MenuItem) error {
 	if len(items) == 0 {
 		return nil
 	}
 	menuItems := make([]qqbotsdk.MenuItem, 0, len(items))
 	for _, it := range items {
-		menuItems = append(menuItems, qqbotsdk.MenuItem{
-			Type:        qqbotsdk.MenuTypeSendMessage,
-			Name:        it.Name,
-			SendMessage: it.SendMessage,
-		})
+		menuItems = append(menuItems, toSDKMenuItem(it))
 	}
 	target := &qqbotsdk.Menu{Items: menuItems}
 	if err := target.Validate(); err != nil {
@@ -223,6 +329,23 @@ func sameMenu(a, b *qqbotsdk.Menu) bool {
 		if a.Items[i].Type != b.Items[i].Type ||
 			a.Items[i].Name != b.Items[i].Name ||
 			a.Items[i].SendMessage != b.Items[i].SendMessage {
+			return false
+		}
+		// 二级菜单也要比：只比顶层会把"子项变了"误判成已到位。
+		if !sameSubMenu(a.Items[i].SubMenuItems, b.Items[i].SubMenuItems) {
+			return false
+		}
+	}
+	return true
+}
+
+// sameSubMenu 比较两个二级菜单项列表。
+func sameSubMenu(a, b []qqbotsdk.SubMenuItem) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Type != b[i].Type || a[i].Name != b[i].Name || a[i].SendMessage != b[i].SendMessage {
 			return false
 		}
 	}
