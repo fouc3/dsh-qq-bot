@@ -74,6 +74,20 @@ dsh plugin --profile web add /home/fouc3/Projects/DSH-QQ-Bot/dsh-plugin
 
 装完确认：插件管理器里出现 `@local/dsh-qq-bot`，状态 `applied`；`dsh web` 重启后仍在。
 
+> **本机实测的安装阻塞（与本插件无关）**：当前 `web` profile 里已有的第三方 bundle
+> `dsh-pause` 是 git 依赖且需要执行 build script，没有被 pnpm 的 `allowBuilds` 放行，
+> 于是任何 `install_bundle` 都会以 `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED` 失败
+> （报错来自 `~/.dsh/profiles/web` 的依赖安装，不是本插件）。两条出路，选一条：
+>
+> 1. 按提示把 `dsh-pause` 加进 `~/.dsh/profiles/web/pnpm-workspace.yaml` 的 `allowBuilds`
+>    （这会允许该第三方包执行安装脚本，由你决定是否接受）；
+> 2. 或者把本插件装到一个干净的 profile 里，例如
+>    `dsh rescue --from-default-profile web` 建一个副本 profile 再 `install_bundle`。
+>
+> 不装 profile 也能先验证补丁能被 Loader 接受：
+> `dsh --profile web --patch ./dsh-plugin/cordis.patch.yml --dump-config`（应能在组合树里
+> 看到 `dsh-qq-bot` 这一行）。
+
 ### 3. 起服务并核对
 
 ```bash
@@ -144,10 +158,22 @@ level=WARN msg="已丢弃非白名单用户的私聊" openid=2A3B4C… text_len=
 ## 测试
 
 ```bash
-go vet ./... && gofmt -l . && go test ./...
+# Go 侧（含假 QQ 平台 + 真 UNIX socket 桩）
+go vet ./... && gofmt -l . && go test -race ./...
+
+# 插件侧（纯逻辑，不需要 dsh 运行时）
 node --check dsh-plugin/index.js dsh-plugin/lib/*.js
 node --test dsh-plugin/lib/*.test.js
 ```
+
+已自动覆盖的关键行为：白名单门守、markdown/键盘约束、被动回复失效自动改主动、
+命令去重与失败不消费命令、撤回失败仅记 WARN、分片上传（含校验和与失败重试）、
+面板按 remark 复用与目标差量、socket 权限与帧上限、命令解析与用法回复、
+卡片按钮类型（文件夹=回调 / 会话=指令）、结束通知与按钮、提问卡片状态机
+（选项/其他/空提交=跳过/超时交回 GUI）、延迟发送只在正常结束时投递。
+
+**尚未验证**：真 QQ 凭证下的端到端收发（需要你自己的机器人凭据与私聊 openid）；
+插件在本机 profile 的自动安装（见上面"安装阻塞"）。
 
 ## 边界与已知约束
 
