@@ -112,6 +112,8 @@ function makeCtx({ sessionSummaries = [], live = {}, commands = null } = {}) {
 			},
 			/** 与 dsh-workspace 的 create 同形：返回实体，实体上有 attachSession。 */
 			async create(path, title) {
+				// 真实实现会 realpath + 校验"必须已存在的目录"，这里对齐这条契约
+				if (!existsSync(path) || !statSync(path).isDirectory()) throw new Error(`cannot create a Workspace at "${path}": not a directory`)
 				const existing = ctx.workspaceRegistry.workspaces.find((item) => item.path === path)
 				if (existing) return existing
 				const entity = {
@@ -273,10 +275,11 @@ async function drainFor(path, ms = 150) {
 	return collected
 }
 
-function bootPlugin(t, { sessions: summaries, live, token = '', commands = null, config = {} } = {}) {
+function bootPlugin(t, { sessions: summaries, live, token = '', commands = null, config = {}, stateSeed = null } = {}) {
 	const dir = mkdtempSync(join(tmpdir(), 'dsh-qq-bot-'))
 	const socketPath = join(dir, 'bridge.sock')
 	const stateFile = join(dir, 'state.json')
+	if (stateSeed) writeFileSync(stateFile, JSON.stringify(stateSeed))
 	const fake = makeCtx({ sessionSummaries: summaries, live, commands })
 	apply(fake.ctx, {
 		socketPath,
@@ -450,7 +453,11 @@ test('端到端：命令 → 会话卡片；绑定后普通消息进会话；一
 	assert.ok(Object.isFrozen(agent.followed[0]), '交给框架的消息必须是不可变快照')
 
 	const toolNames = agent.tools.map((tool) => tool.name)
-	assert.deepEqual(toolNames.sort(), [ATTACHMENT_TOOL_NAME, REPLY_TOOL_NAME].sort(), '应为该会话注册 qq_reply 与附件拉取工具')
+	assert.deepEqual(
+		toolNames.sort(),
+		[ATTACHMENT_TOOL_NAME, REPLY_TOOL_NAME, 'qq_register_workspace'].sort(),
+		'应为该会话注册 qq_reply、附件拉取、工作区补登记三个工具',
+	)
 	const replyTool = agent.tools.find((tool) => tool.name === REPLY_TOOL_NAME)
 	assert.equal(replyTool.parameters.type, 'object')
 
@@ -1198,3 +1205,61 @@ test('端到端：QQ 侧新建会话要把目录注册成工作区（否则 Web 
 function basenameOf(path) {
 	return String(path).split('/').filter(Boolean).pop()
 }
+
+test('端到端：注册目录工作区的工具（历史遗留的目录/会话靠它补票）', async (t) => {
+	const dir = mkdtempSync(join(tmpdir(), 'dsh-qq-ws2-'))
+	t.after(() => rmSync(dir, { recursive: true, force: true }))
+
+	const agent = makeAgent('session-1')
+	const boot = bootPlugin(t, { sessions: SUMMARY_FOR_WS, live: { 'session-1': agent } })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M1' })
+	await drainFor(boot.socketPath, 60)
+	// 工具是挂在"被 QQ 绑定的会话"上的，先真投一条消息让它挂上
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '你好', msgId: 'M2' })
+	await waitFor(() => agent.followed.length === 1)
+	await drainFor(boot.socketPath, 60)
+
+	const tool = agent.tools.find((item) => item.name === 'qq_register_workspace')
+	assert.ok(tool, '应当注册工作区补登记工具')
+
+	// 正常注册 + 把会话挂上去
+	const ok = await tool.execute({ path: dir, sessionId: 'session-1' })
+	assert.equal(ok.ok, true, JSON.stringify(ok))
+	const created = boot.ctx.workspaceRegistry.workspaces.find((ws) => ws.path === dir)
+	assert.ok(created, '目录要被注册成工作区')
+	assert.deepEqual(created.attached, ['session-1'])
+
+	// 幂等：再调一次不会重复建
+	await tool.execute({ path: dir })
+	assert.equal(boot.ctx.workspaceRegistry.workspaces.filter((ws) => ws.path === dir).length, 1)
+
+	// 空参数 / 不存在的路径：如实失败
+	const bad = await tool.execute({ path: '' })
+	assert.equal(bad.ok, false)
+	const missing = await tool.execute({ path: join(dir, 'nope') })
+	assert.equal(missing.ok, false, '不存在的目录要如实报错')
+})
+
+const SUMMARY_FOR_WS = [{ sessionId: 'session-1', cwd: '/home/u/proj-a', updatedAt: 1, running: false }]
+
+test('端到端：启动补登记——本桥以前跑过轮次的会话（notices 里的）也会被注册成工作区', async (t) => {
+	const root = mkdtempSync(join(tmpdir(), 'dsh-qq-legacy-'))
+	const legacyDir = join(root, 'openfield-file-sdk')
+	mkdirSync(legacyDir)
+	t.after(() => rmSync(root, { recursive: true, force: true }))
+
+	// 旧状态：这个会话跑过轮次（notices 里有 "sessionId:turn"），但当时还没注册工作区
+	const boot = bootPlugin(t, {
+		sessions: [{ sessionId: 'session-legacy', cwd: legacyDir, updatedAt: 2, running: false }],
+		live: {},
+		stateSeed: { bindings: {}, notices: { 'session-legacy:2': true } },
+	})
+	await waitFor(() => existsSync(boot.socketPath))
+	// 网关同步（= 插件/网关重启后的握手）会触发补登记
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	const ws = await waitFor(() => boot.ctx.workspaceRegistry.workspaces.find((item) => item.path === legacyDir) ?? null)
+	assert.equal(ws.attached.length, 1, '会话要挂到工作区上')
+	assert.equal(ws.attached[0], 'session-legacy')
+})

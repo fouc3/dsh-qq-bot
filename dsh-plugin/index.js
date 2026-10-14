@@ -362,22 +362,64 @@ export function apply(ctx, rawConfig) {
 	 * `workspaceRegistry.create(path)` → `workspace.attachSession(sessionId)`。
 	 */
 	const ensuredWorkspaces = new Set()
-	async function ensureWorkspaceFor({ path, sessionId, title }) {
+	/**
+	 * 注册工作区（+ 把会话挂上去）。幂等；`force` 时跳过缓存再试一次。
+	 * @param {{path:string, sessionId?:string, title?:string, force?:boolean}} input
+	 */
+	async function ensureWorkspaceFor({ path, sessionId, title, force = false }) {
 		const dir = String(path ?? '').trim()
-		if (!dir || typeof ctx.workspaceRegistry?.create !== 'function') return null
+		if (!dir) return { ok: false, error: '目录不能为空。' }
+		if (typeof ctx.workspaceRegistry?.create !== 'function') return { ok: false, error: '当前 dsh 没有工作区注册表。' }
 		const key = `${dir}|${sessionId ?? ''}`
-		if (ensuredWorkspaces.has(key)) return null
+		if (!force && ensuredWorkspaces.has(key)) return { ok: true, cached: true, path: dir }
 		try {
 			const workspace = await ctx.workspaceRegistry.create(dir, title || basename(dir))
 			if (sessionId && typeof workspace?.attachSession === 'function') await workspace.attachSession(sessionId)
 			ensuredWorkspaces.add(key)
 			logger.info?.('已把目录注册为工作区（Web 端可见）', { path: dir, sessionId })
-			return workspace
+			return { ok: true, path: dir, sessionId: sessionId ?? '', workspaceId: workspace?.id ?? '' }
 		} catch (error) {
 			// 不进缓存：下次还有机会补上（比如目录刚被删又重建）
 			logger.warn?.('注册工作区失败', { path: dir, sessionId, error: String(error) })
-			return null
+			return { ok: false, path: dir, error: String(error?.message ?? error) }
 		}
+	}
+
+	/**
+	 * 补登记"本桥碰过的目录/会话"的工作区。
+	 *
+	 * 为什么只补这些、而不是所有会话：Web 侧栏只显示**注册过的工作区**，
+	 * 但把用户已有的几百个会话 cwd 全注册一遍会把侧栏塞满。
+	 * 所以名单限定为"本桥自己造的/跑过轮次的"：
+	 *   - `createdSessions` / `createdDirs`：本桥建出来的会话与目录；
+	 *   - 当前绑定会话；
+	 *   - `notices` 的 key（`sessionId:turn`）：本桥跑过并通知过的会话
+	 *     —— 这条能捞回"修复上线之前"建的会话（比如 openfield-file-sdk）；
+	 *   - 输入态 / 延迟发送里提到的会话。
+	 */
+	async function repairWorkspaces() {
+		const targets = new Map() // sessionId -> cwd
+		const dirs = new Set()
+		const addSession = (sessionId) => {
+			const id = String(sessionId ?? '')
+			if (!id || id === 'none' || targets.has(id)) return
+			const cwd = sessions.get(id)?.cwd
+			if (cwd) targets.set(id, cwd)
+		}
+		const snapshot = state.get() ?? {}
+		for (const sessionId of Object.values(snapshot.bindings ?? {})) addSession(sessionId)
+		for (const [sessionId, cwd] of Object.entries(state.createdSessions() ?? {})) {
+			addSession(sessionId)
+			if (cwd && !targets.has(sessionId)) targets.set(sessionId, cwd)
+		}
+		for (const key of Object.keys(snapshot.notices ?? {})) addSession(key.slice(0, key.lastIndexOf(':')))
+		for (const entry of Object.values(snapshot.inbox ?? {})) addSession(entry?.sessionId)
+		for (const sessionId of Object.keys(snapshot.delayed ?? {})) addSession(sessionId)
+		for (const dir of state.createdDirs() ?? []) dirs.add(dir)
+
+		for (const [sessionId, cwd] of targets) await ensureWorkspaceFor({ path: cwd, sessionId })
+		for (const dir of dirs) await ensureWorkspaceFor({ path: dir })
+		if (targets.size > 0 || dirs.size > 0) logger.info?.('补登记工作区完成', { sessions: targets.size, dirs: dirs.size })
 	}
 
 	/**
@@ -403,6 +445,9 @@ export function apply(ctx, rawConfig) {
 			await sessions.refresh()
 			// 先建工作区再绑定：不然 Web 侧栏里不会有这个文件夹。
 			await ensureWorkspaceFor({ path, sessionId })
+			// 留个记录：以后启动时按这份名单补登记（万一这次注册失败/当时没注册上）。
+			state.markCreatedSession(sessionId, path)
+			state.flush()
 			state.setBinding(openid, sessionId)
 			state.setLastCard(openid, null)
 			logger.info?.('已新建并切换会话', { cwd: path, sessionId })
@@ -680,6 +725,57 @@ export function apply(ctx, rawConfig) {
 		},
 	})
 
+	/**
+	 * 修工作区用的工具：把一个已存在的目录注册成 dsh 工作区。
+	 *
+	 * 为什么需要：dsh Web 侧栏**按工作区分组**，没注册的目录在浏览器里看不到
+	 * （会话会落到「未分类」）。正常路径已经在建目录/建会话时自动注册了，
+	 * 这个工具是给"历史遗留"和"外部建的目录"补票用。
+	 */
+	function buildWorkspaceTool() {
+		return {
+			name: 'qq_register_workspace',
+			description:
+				'把一个目录注册成 dsh 工作区，让 dsh Web 侧栏显示它（未注册的目录在浏览器里看不到，它的会话会落在「未分类」）。重复调用不会重复注册。',
+			parameters: {
+				type: 'object',
+				properties: {
+					path: { type: 'string', description: '目录的绝对路径。' },
+					sessionId: { type: 'string', description: '可选：一并把这个会话挂到该工作区上。' },
+				},
+				required: ['path'],
+				additionalProperties: false,
+			},
+			output: {
+				schema: {
+					type: 'object',
+					properties: {
+						ok: { type: 'boolean' },
+						path: { type: 'string' },
+						workspaceId: { type: 'string' },
+						error: { type: 'string' },
+					},
+					required: ['ok', 'path'],
+					additionalProperties: false,
+				},
+				render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+			},
+			async execute(args) {
+				const raw = typeof args?.path === 'string' ? args.path.trim() : ''
+				if (!raw) return { ok: false, path: '', error: 'path 不能为空' }
+				const path = expandHome(raw)
+				const sessionId = typeof args?.sessionId === 'string' && args.sessionId.trim() ? args.sessionId.trim() : ''
+				const result = await ensureWorkspaceFor({ path, sessionId, force: true })
+				return {
+					ok: Boolean(result.ok),
+					path: result.path ?? path,
+					workspaceId: result.workspaceId ?? '',
+					...(result.error ? { error: result.error } : {}),
+				}
+			},
+		}
+	}
+
 	// ── 每个"被 QQ 绑定"的 agent：注册 qq_reply 工具 + 轮次监听 ──────────────
 	const attached = new Set()
 	function ensureAgentSetup(agent, sessionId) {
@@ -703,10 +799,17 @@ export function apply(ctx, rawConfig) {
 				const toolDisposer = agent.ctx.tools.register(buildReplyTool({ outbox, config, logger, target }))
 				// 没自动下载的附件（过大/下载失败）：让模型按需拉一份只读副本。
 				const attachDisposer = agent.ctx.tools.register(buildAttachmentTool({ inbox, logger, target }))
+				// 修工作区用：QQ 建出来的目录/会话没注册成工作区时，Web 侧栏看不到它。
+				const workspaceDisposer = agent.ctx.tools.register(buildWorkspaceTool())
 				const roundsDisposer = rounds.attachAgent(agent, sessionId)
 				return () => {
 					try {
 						toolDisposer?.()
+					} catch {
+						// 忽略
+					}
+					try {
+						workspaceDisposer?.()
 					} catch {
 						// 忽略
 					}
@@ -850,6 +953,10 @@ export function apply(ctx, rawConfig) {
 				markdown: true,
 				context,
 			})
+			// 目录也顺手注册成工作区：这样 dsh Web 侧栏里马上就能看到这个文件夹。
+			state.markCreatedDir(result.path)
+			state.flush()
+			await ensureWorkspaceFor({ path: result.path })
 			// 默认 cd 进去：直接把新目录的卡片发出来，接着点「在这里新建」就建在这里。
 			await showNewSessionCard({ openid, dir: result.path, replyContext: context })
 			return
@@ -1059,12 +1166,7 @@ export function apply(ctx, rawConfig) {
 				// 整个文件夹都看不到。网关每次同步（含插件重启后）都补一次，幂等。
 				try {
 					await sessions.refresh()
-					const bindings = state.get().bindings ?? {}
-					for (const sessionId of new Set(Object.values(bindings))) {
-						if (!sessionId || sessionId === 'none') continue
-						const cwd = sessions.get(sessionId)?.cwd
-						if (cwd) void ensureWorkspaceFor({ path: cwd, sessionId })
-					}
+					await repairWorkspaces()
 				} catch (error) {
 					logger.warn?.('补登记工作区失败', { error: String(error) })
 				}

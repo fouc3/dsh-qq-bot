@@ -17,6 +17,8 @@ export const EMPTY_STATE = {
 	inbox: {}, // openid -> { sessionId, text, seq, items[] }（「发送」输入态）
 	attachSeq: {}, // openid -> 已分配到的附件序号（附件 id 永不重用）
 	pendingDir: {}, // openid -> { parent, at }（点了「新建目录」、正在等目录名）
+	createdSessions: {}, // sessionId -> cwd（本桥建出来的会话：用来补登记工作区）
+	createdDirs: [], // 本桥建出来的目录（新建目录）：用来补登记工作区
 }
 
 function normalize(raw) {
@@ -30,11 +32,14 @@ function normalize(raw) {
 		inbox: {},
 		attachSeq: {},
 		pendingDir: {},
+		createdSessions: {},
+		createdDirs: [],
 	}
 	if (!raw || typeof raw !== 'object') return base
-	for (const key of ['bindings', 'lastCard', 'delayed', 'inbox', 'attachSeq', 'pendingDir']) {
+	for (const key of ['bindings', 'lastCard', 'delayed', 'inbox', 'attachSeq', 'pendingDir', 'createdSessions']) {
 		if (raw[key] && typeof raw[key] === 'object') base[key] = { ...raw[key] }
 	}
+	if (Array.isArray(raw.createdDirs)) base.createdDirs = raw.createdDirs.filter((item) => typeof item === 'string' && item)
 	if (raw.whitelist && typeof raw.whitelist === 'object' && Array.isArray(raw.whitelist.openids)) {
 		base.whitelist = { openids: raw.whitelist.openids.filter((v) => typeof v === 'string' && v) }
 	}
@@ -204,6 +209,26 @@ export function createState({ file, logger, seed, debounceMs = 200 } = {}) {
 				if (entry) s.pendingDir[openid] = entry
 				else delete s.pendingDir[openid]
 			})
+		},
+		/** 记一笔"这个会话是本桥建的"（启动时用来补登记它的工作区）。 */
+		markCreatedSession(sessionId, cwd) {
+			if (!sessionId || !cwd) return
+			return this.update((s) => {
+				s.createdSessions[sessionId] = cwd
+			})
+		},
+		createdSessions() {
+			return { ...data.createdSessions }
+		},
+		/** 记一笔"这个目录是本桥建的"。 */
+		markCreatedDir(path) {
+			if (!path) return
+			return this.update((s) => {
+				if (!s.createdDirs.includes(path)) s.createdDirs = [...s.createdDirs, path].slice(-50)
+			})
+		},
+		createdDirs() {
+			return [...data.createdDirs]
 		},
 		/** 分配下一个附件 id（`A1`、`A2`…，跨输入态单调递增，绝不重用）。 */
 		nextAttachmentId(openid) {
