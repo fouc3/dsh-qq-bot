@@ -282,7 +282,20 @@ export function createCommandRunner(deps) {
 		return { handled: true }
 	}
 
-	async function sendOnce({ openid, replyContext }, parsed) {
+	/**
+	 * 把"引用的消息"拼在正文前面。
+	 *
+	 * 普通消息路径就是这么带的（`[引用的消息] <原文>` 单独一段），命令路径以前把
+	 * `event.quote` 丢了 —— 用户带引用发 `发送 <会话id> <正文>` 时，AI 完全看不到被引用的那条。
+	 */
+	function withQuote(text, quote) {
+		const body = String(text ?? '').trim()
+		const cited = String(quote ?? '').trim()
+		if (!cited) return body
+		return body ? `[引用的消息] ${cited}\n\n${body}` : `[引用的消息] ${cited}`
+	}
+
+	async function sendOnce({ openid, replyContext, quote = '' }, parsed) {
 		// 裸发 `发送`：进入**当前会话**的输入态（不打断正在跑的 AI）。
 		if (parsed.tokens.length === 0) {
 			const sessionId = currentSessionId(openid)
@@ -320,11 +333,11 @@ export function createCommandRunner(deps) {
 			return { handled: true }
 		}
 		// 单次投递和输入态的「发送」同义：**打断**目标会话正在跑的轮次，立刻投过去。
-		// 不想打断就用 `延迟发送`（本轮正常结束后才投）。
+		// 不想打断就用 `延迟发送`（本轮正常结束后才投）。带引用时把被引用的那条一起带上。
 		await deps.deliver({
 			sessionId: target.sessionId,
 			openid,
-			text: target.content,
+			text: withQuote(target.content, quote),
 			interrupt: true,
 			origin: 'qq',
 		})
@@ -418,7 +431,7 @@ export function createCommandRunner(deps) {
 		return { handled: true }
 	}
 
-	async function delaySend({ openid, replyContext }, parsed) {
+	async function delaySend({ openid, replyContext, quote = '' }, parsed) {
 		// 裸发 `延迟发送` / 只给目标：和 `发送` **共用同一套输入态面板**，
 		// 区别只是投递时机（本轮正常结束后），所以这里同样进输入态，只是 mode=delay。
 		if (parsed.tokens.length === 0) {
@@ -457,7 +470,7 @@ export function createCommandRunner(deps) {
 			return { handled: true }
 		}
 		state.setDelayed(target.sessionId, {
-			content: target.content,
+			content: withQuote(target.content, quote),
 			openid,
 			at: new Date().toISOString(),
 		})

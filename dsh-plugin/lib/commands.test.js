@@ -219,3 +219,30 @@ test('未知会话 id 会给出明确错误与用法', async () => {
 	assert.match(calls.replies.at(-1).content, /用法/)
 	assert.equal(calls.delivered.length, 0)
 })
+
+test('发送/延迟发送带引用：被引用的那条要一起带给 AI', async () => {
+	const { runner, calls, state: s } = makeRunner({ seed: boundSeed() })
+
+	// `发送 <会话id> <正文>` + 引用
+	await runner.run(
+		{ openid: 'U1', replyContext: {}, quote: '这是被引用的那条消息' },
+		parseCommand('发送 session-2 帮我看下这个'),
+	)
+	assert.equal(calls.delivered.length, 1)
+	assert.equal(
+		calls.delivered[0].text,
+		'[引用的消息] 这是被引用的那条消息\n\n帮我看下这个',
+		'引用要拼在正文前面（与普通消息路径同格式）',
+	)
+
+	// 没有引用时不能凭空多一行
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('发送 session-2 再来一条'))
+	assert.equal(calls.delivered.at(-1).text, '再来一条')
+
+	// `延迟发送 <会话id> <正文>` + 引用：登记的内容也要带引用
+	await runner.run(
+		{ openid: 'U1', replyContext: {}, quote: '引用内容' },
+		parseCommand('延迟发送 session-2 打完了叫我'),
+	)
+	assert.equal(s.delayedOf('session-2').content, '[引用的消息] 引用内容\n\n打完了叫我')
+})

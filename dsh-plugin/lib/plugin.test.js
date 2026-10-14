@@ -1470,3 +1470,30 @@ test('端到端：`权限` 发卡片（每行两个）／带参数直接设定�
 
 	boot.dispose()
 })
+
+test('端到端：`发送 <会话id> <正文>` 带引用时，引用要一起投给 AI', async (t) => {
+	const agent = makeAgent('session-1')
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': agent } })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	// 绑定 session-1：命令路径不需要绑定也会投，但下面的"普通消息"回归需要
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M0' })
+	await drainFor(boot.socketPath, 60)
+
+	await rpc(boot.socketPath, 'event', {
+		kind: 'c2c_message',
+		openid: 'U1',
+		text: '发送 session-1 帮我看下这个',
+		quote: '这是被引用的那条消息',
+		msgId: 'M1',
+	})
+	await waitFor(() => agent.followed.length === 1)
+	assert.equal(agent.followed[0].content[0].text, '[引用的消息] 这是被引用的那条消息\n\n帮我看下这个')
+
+	// 普通消息路径的引用行为不变（回归）
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '看这条', quote: '引用原文', msgId: 'M2' })
+	await waitFor(() => agent.followed.length === 2)
+	assert.equal(agent.followed[1].content[0].text, '[引用的消息] 引用原文\n\n看这条')
+
+	boot.dispose()
+})

@@ -186,8 +186,8 @@ level=WARN msg="已丢弃非白名单用户的私聊" openid=2A3B4C… text_len=
   —— `lib/commands.test.js` + `lib/plugin.test.js`「发送 / 延迟发送 / 停止 / 归档 / 权限」
 - ✅ `权限`：接 `ctx.permissionPresets`（可选访问，缺服务就如实回一句）；内置档显示 Web 同款中文、custom 档保留服务名；卡片每行两个按钮、放不下自动加宽；带参数直接设定（中文名/英文 key/别名/序号）；点按钮切换并重发卡片
   —— `lib/permissions.test.js` + `lib/cards.test.js`「权限卡片」+ `lib/plugin.test.js`「权限」
-- ✅ `发送`：裸发进当前会话输入态、只给会话进该会话输入态、带内容才是单次投递；认不出目标回用法、目标不存在报错；**有内容的输入框拒绝静默换目标**（先发送/取消）
-  —— `lib/commands.test.js` + `lib/plugin.test.js`「输入态」
+- ✅ `发送`：裸发进当前会话输入态、只给会话进该会话输入态、带内容才是单次投递；认不出目标回用法、目标不存在报错；**有内容的输入框拒绝静默换目标**（先发送/取消）；**带引用时引用生效**（`[引用的消息] <原文>` 拼在正文前，`延迟发送` 同样）—— 以前命令路径把 `event.quote` 丢了，引用等于没用
+  —— `lib/commands.test.js` + `lib/plugin.test.js`「输入态 / 带引用」
 - ✅ `进度` 是**只读快照**（不 cancel、不 resume、不发消息）：当前轮次、已跑多久、最近 3 个动作、最近一段输出；默认时钟不能算出 `NaN`（线上踩过「已跑 NaN 分 NaN 秒」）
   —— `lib/progress.test.js`
 - ✅ 指令面板定义：8 条命令、`c2c` + 指定私聊、按 remark 复用与目标差量 —— Go `internal/qq/panel_test.go`；插件 `lib/plugin.test.js`「register → panel」

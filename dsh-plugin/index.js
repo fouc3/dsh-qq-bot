@@ -948,7 +948,8 @@ export function apply(ctx, rawConfig) {
 				state.setPendingDir(openid, null)
 				state.flush()
 			}
-			await commands.run({ openid, replyContext: context }, parsed)
+			// 引用也要交给命令：`发送 <会话id> <正文>` 带引用时，引用必须生效。
+			await commands.run({ openid, replyContext: context, quote: event.quote ?? '' }, parsed)
 			return
 		}
 
