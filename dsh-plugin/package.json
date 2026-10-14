@@ -5,7 +5,7 @@
   "description": "把 QQ 私聊接到本机 dsh 会话上的桥（插件侧）",
   "type": "module",
   "exports": {
-    ".": "./index-v2.js"
+    ".": "./index.js"
   },
   "keywords": [
     "deepseek-harness",

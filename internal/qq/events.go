@@ -18,7 +18,33 @@ type Event struct {
 	MsgID      string `json:"msgId,omitempty"`
 	EventID    string `json:"eventId,omitempty"`
 	ButtonData string `json:"buttonData,omitempty"`
-	At         string `json:"at,omitempty"`
+	// Quote 是用户引用的那条消息的文本（引用消息才有；QQ 的 message_type=103）。
+	Quote string `json:"quote,omitempty"`
+	At    string `json:"at,omitempty"`
+}
+
+// quotedText 取出引用消息里被引用的文本（不是引用消息、或引用的是图片等无文本内容时返回空串）。
+func quotedText(data *qqbotsdk.C2CMessageCreateData) string {
+	if data == nil || data.MessageType != qqbotsdk.EventMsgTypeQuote {
+		return ""
+	}
+	// 文档把 MsgElements 描述为递归结构，这里按"取第一段非空文本"处理，限深防环。
+	var walk func(elements []qqbotsdk.MsgElement, depth int) string
+	walk = func(elements []qqbotsdk.MsgElement, depth int) string {
+		if depth > 4 {
+			return ""
+		}
+		for i := range elements {
+			if text := strings.TrimSpace(elements[i].Content); text != "" {
+				return text
+			}
+			if nested := walk(elements[i].MsgElements, depth+1); nested != "" {
+				return nested
+			}
+		}
+		return ""
+	}
+	return walk(data.MsgElements, 0)
 }
 
 // Emitter 把归一化事件交给本地通道。
@@ -81,7 +107,10 @@ func DecideC2C(data *qqbotsdk.C2CMessageCreateData, allowed func(string) bool) D
 		return Decision{OpenID: openid, Reason: ReasonNotAllowed}
 	}
 	text := strings.TrimSpace(data.Content)
-	if text == "" {
+	// 引用消息：被引用的内容在 MsgElements 里（message_type=103）。
+	// 只引用不说话（text 空）也要转发，否则"引用某条回复"这种用法会失效。
+	quote := quotedText(data)
+	if text == "" && quote == "" {
 		if data.MessageType != qqbotsdk.EventMsgTypeText {
 			return Decision{OpenID: openid, Reason: fmt.Sprintf("非纯文本消息（message_type=%d, attachments=%d）", data.MessageType, len(data.Attachments))}
 		}
@@ -94,6 +123,7 @@ func DecideC2C(data *qqbotsdk.C2CMessageCreateData, allowed func(string) bool) D
 			Kind:   KindC2CMessage,
 			OpenID: openid,
 			Text:   text,
+			Quote:  quote,
 			MsgID:  data.ID,
 			At:     nowRFC3339(),
 		},

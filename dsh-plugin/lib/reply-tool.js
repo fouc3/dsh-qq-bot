@@ -12,6 +12,9 @@ export const REPLY_TOOL_NAME = 'qq_reply'
 export const REPLY_TOOL_DESCRIPTION = [
 	'把内容发送给 QQ 用户。消息类型可选：文本 / markdown（`markdown=true`）/ 图片 / 视频 / 语音 / 文件（`attachments`）。',
 	'`attachments` 里 `path` 用本机文件（批量分片上传）、`url` 用公网可下载地址，两者二选一；`kind` 取 `image`/`video`/`voice`/`file`。',
+	// QQ 的 markdown 是子集；表格会被原样显示成竖线（线上踩过，别再用）。
+	'QQ 的 markdown 只支持：# / ## 标题、**加粗**、_斜体_、~~删除线~~、[链接](url)、图片、有序/无序列表（可嵌套）、> 块引用、*** 分割线。',
+	'**不要用表格**（QQ 不渲染，会原样显示竖线）；也不要依赖代码块或行内反引号。要多行说明就用列表或「键：值」单行。',
 	'完成时请尽可能详细地把结果回复给用户；过程中也可以随时调用本工具汇报当前进度。',
 	'除非用户明确要求，否则只在你被 QQ 消息拉起时使用本工具。',
 ].join('\n')

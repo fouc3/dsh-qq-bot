@@ -42,6 +42,10 @@ test('工具名与描述覆盖"完成时详细回复 / 过程中汇报 / md 开�
 	assert.match(tool.description, /过程中也可以随时调用/)
 	assert.match(tool.description, /markdown/)
 	assert.match(tool.description, /只在你被 QQ 消息拉起时使用/)
+	// QQ 的 markdown 是子集：工具说明里必须明确禁表格，否则 AI 又会发 md 表格
+	// （官方支持列表里没有表格，线上表现为"没渲染成 md"）。
+	assert.match(tool.description, /不要用表格/)
+	assert.match(tool.description, /块引用/)
 	// bundle 自包含：参数是注册表要的原始 JSON Schema（不是 dsh 的 DSL）
 	assert.equal(tool.parameters.type, 'object')
 	assert.ok(tool.parameters.properties.content)

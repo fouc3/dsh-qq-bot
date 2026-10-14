@@ -488,7 +488,10 @@ export function apply(ctx, rawConfig) {
 			await sendText({ openid, content: `绑定的会话 \`${bound}\` 已不可用，已解除绑定。发 \`切换会话\` 重新选择。`, markdown: true, context })
 			return
 		}
-		await deliver({ sessionId: bound, openid, text: event.text, interrupt: true, origin: 'qq', context })
+		// 引用消息：把被引用的那条也带进会话，否则 AI 看不到用户在说哪一条。
+		const body = (event.quote ? `[引用的消息] ${event.quote}\n\n${event.text}` : event.text).trim()
+		if (!body) return
+		await deliver({ sessionId: bound, openid, text: body, interrupt: true, origin: 'qq', context })
 	}
 
 	async function onInteraction(event) {
