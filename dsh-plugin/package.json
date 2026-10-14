@@ -1,0 +1,20 @@
+{
+  "name": "@local/dsh-qq-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "把 QQ 私聊接到本机 dsh 会话上的桥（插件侧）",
+  "type": "module",
+  "exports": {
+    ".": "./index.js"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "deepseek-harness-plugin",
+    "dsh-plugin"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
