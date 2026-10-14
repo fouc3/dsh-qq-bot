@@ -15,7 +15,8 @@
  * 所以本 bundle 自包含：工具定义用原始 JSON Schema，用户消息本地构造。
  */
 import { randomUUID } from 'node:crypto'
-import { statSync } from 'node:fs'
+import { mkdirSync, readdirSync, rmdirSync, statSync } from 'node:fs'
+import { basename, join } from 'node:path'
 
 import { createState } from './lib/state.js'
 import { createSocketServer } from './lib/socket.js'
@@ -268,8 +269,36 @@ export function apply(ctx, rawConfig) {
 		logger.info?.('已发会话选择卡片', { dir: start, sessions: sessions.sessionsInDir(start).length })
 	}
 
-	/** 新建会话的"选目录"卡片（逐层进入，最后点「在这里新建」）。 */
-	async function showNewSessionCard({ openid, dir, page = 1, replyContext = {} }) {
+	/**
+	 * 目录是不是**彻底空的**（没有任何文件/子目录/隐藏文件）。
+	 *
+	 * 只有空目录才给「删除目录」按钮：`rmdir` 本来也只删空目录，
+	 * 而且能顺手挡住"以为删的是空壳、其实里面还有东西"的误操作。
+	 */
+	function isDirEmpty(dir) {
+		try {
+			return readdirSync(dir).length === 0
+		} catch (error) {
+			logger.warn?.('读取目录失败，按"非空"处理（不给删除按钮）', { dir, error: String(error) })
+			return false
+		}
+	}
+
+	/** 路径是不是一个真实存在的目录。 */
+	function isDirectory(path) {
+		try {
+			return statSync(path).isDirectory()
+		} catch {
+			return false
+		}
+	}
+
+	/**
+	 * 新建会话的"选目录"卡片（逐层进入，最后点「在这里新建」）。
+	 *
+	 * `confirming=true` 时渲染第二步：删除目录的二次确认（确认/取消）。
+	 */
+	async function showNewSessionCard({ openid, dir, page = 1, replyContext = {}, confirming = false }) {
 		const bound = state.bindingOf(openid)
 		const boundCwd = bound && bound !== 'none' ? sessions.get(bound)?.cwd : null
 		const start = dir || boundCwd || sessions.defaultRoot()
@@ -279,9 +308,47 @@ export function apply(ctx, rawConfig) {
 			page,
 			pageSize: Number(config.sessionPageSize) || 8,
 			parentPath: sessions.parentOf(start),
+			empty: isDirEmpty(start),
+			confirming,
 		})
 		await io.sendCard({ openid, content: card.content, keyboard: card.keyboard, context: replyContext })
-		logger.info?.('已发新建会话选目录卡片', { dir: start })
+		logger.info?.('已发新建会话选目录卡片', { dir: start, confirming })
+	}
+
+	/**
+	 * 在指定目录下建一个子目录（目录名只允许一层，不给路径分隔符）。
+	 * @returns {{ok:boolean, path?:string, error?:string}}
+	 */
+	function createSubDirectory({ parent, name }) {
+		const raw = String(name ?? '').trim()
+		if (!raw) return { ok: false, error: '目录名不能为空。' }
+		if (/[\\/\0]/.test(raw) || raw === '.' || raw === '..') {
+			return { ok: false, error: '目录名只能是一层名字，不能带 `/`、`\\` 或 `..`。' }
+		}
+		const path = join(parent, raw)
+		try {
+			mkdirSync(path) // 不带 recursive：父目录不存在/已存在都如实报错
+		} catch (error) {
+			if (error?.code === 'EEXIST') return { ok: false, error: `\`${path}\` 已经存在了。` }
+			return { ok: false, error: `新建目录失败：${String(error?.message ?? error)}` }
+		}
+		return { ok: true, path }
+	}
+
+	/** 删掉一个空目录（二次确认后才调用）。 */
+	function removeEmptyDir(dir) {
+		const path = String(dir ?? '').trim()
+		if (!path || path === '/' || path === (process.env.HOME ?? '\u0000')) {
+			return { ok: false, error: '这个路径不允许删除。' }
+		}
+		try {
+			rmdirSync(path) // 只删空目录：非空会 ENOTEMPTY，正好是我们要的护栏
+		} catch (error) {
+			if (error?.code === 'ENOTEMPTY') return { ok: false, error: `\`${path}\` 不是空目录（里面有文件或子目录），不删。` }
+			if (error?.code === 'ENOENT') return { ok: false, error: `\`${path}\` 已经不在了。` }
+			return { ok: false, error: `删除目录失败：${String(error?.message ?? error)}` }
+		}
+		return { ok: true, removed: path, parent: sessions.parentOf(path) ?? null, name: basename(path) }
 	}
 
 	/**
@@ -699,6 +766,12 @@ export function apply(ctx, rawConfig) {
 		//    否则 `停止`/`进度` 这类命令会被提问桥当「其他」答案吃掉。
 		const parsed = parseCommand(event.text)
 		if (parsed) {
+			// 命令也当"取消等目录名"：不然点了「新建目录」又反悔发命令，会有一条
+			// 悬着的 pending 把后面某条无关消息当成目录名吃掉。
+			if (state.pendingDirOf(openid)) {
+				state.setPendingDir(openid, null)
+				state.flush()
+			}
 			await commands.run({ openid, replyContext: context }, parsed)
 			return
 		}
@@ -725,6 +798,27 @@ export function apply(ctx, rawConfig) {
 
 		// 3) 有待答提问：普通文本＝该题的「其他」答案
 		if (questions.hasPending(openid) && (await questions.handleText(openid, event.text))) return
+
+		// 3b) 点了「新建目录」在等目录名：这条文字就是目录名。
+		const pendingDir = state.pendingDirOf(openid)
+		if (pendingDir && String(event.text ?? '').trim() && !(Array.isArray(event.attachments) && event.attachments.length > 0)) {
+			state.setPendingDir(openid, null)
+			state.flush()
+			const result = createSubDirectory({ parent: pendingDir.parent, name: String(event.text).trim() })
+			if (!result.ok) {
+				await sendText({ openid, content: `${result.error}\n\n再发一次目录名，或发 \`新建会话\` 回到目录列表。`, markdown: true, context })
+				return
+			}
+			await sendText({
+				openid,
+				content: `已新建目录 \`${result.path}\`，并进去了（下面是它）。`,
+				markdown: true,
+				context,
+			})
+			// 默认 cd 进去：直接把新目录的卡片发出来，接着点「在这里新建」就建在这里。
+			await showNewSessionCard({ openid, dir: result.path, replyContext: context })
+			return
+		}
 
 		// 4) 输入态：文字攒成正文、附件自动入列，都只回一张预览卡片（**不投给 AI**）。
 		//    用户明确要求：附件只能通过卡片上的「发送」交出去。
@@ -800,6 +894,53 @@ export function apply(ctx, rawConfig) {
 				logger.warn?.('切换目录失败', { error: String(error) })
 				code = 1
 			}
+		} else if (parsed.kind === 'mkdir') {
+			// 「新建目录」：进入"等目录名"状态，用户下一条文字就是目录名。
+			const ctxReply = { eventId: event.eventId, msgId: event.msgId ?? '' }
+			if (!isDirectory(parsed.path)) {
+				// 路径已经不在了（比如被外部删掉）：别把名字写到一个不存在的父目录下。
+				await sendText({ openid, content: `目录 \`${parsed.path}\` 打不开，重新发 \`新建会话\` 选一次吧。`, markdown: true, context: ctxReply })
+			} else {
+				state.setPendingDir(openid, { parent: parsed.path, at: new Date().toISOString() })
+				state.flush()
+				await sendText({
+					openid,
+					content:
+						`**新建目录** · 父目录 \`${parsed.path}\`\n` +
+						'> 直接发一条消息写出**目录名**（只能一层，不能带 `/`），我就在这个目录下建，建完自动进去。\n' +
+						'> 不想建了就发任意命令（比如 `新建会话`）取消。',
+					markdown: true,
+					context: ctxReply,
+				})
+			}
+			code = 0
+		} else if (parsed.kind === 'rmdir') {
+			// 「删除目录」第一步：换成二次确认卡片，别的都不做。
+			await showNewSessionCard({
+				openid,
+				dir: parsed.path,
+				replyContext: { eventId: event.eventId, msgId: event.msgId ?? '' },
+				confirming: true,
+			})
+			code = 0
+		} else if (parsed.kind === 'rmdiryes') {
+			// 「确认删除」第二步：只删空目录，删完回到上级目录的卡片。
+			const ctxReply = { eventId: event.eventId, msgId: event.msgId ?? '' }
+			const result = removeEmptyDir(parsed.path)
+			if (!result.ok) {
+				await sendText({ openid, content: result.error, markdown: true, context: ctxReply })
+				await showNewSessionCard({ openid, dir: parsed.path, replyContext: ctxReply })
+			} else {
+				state.setLastCard(openid, null)
+				await sendText({
+					openid,
+					content: `已删除空目录 \`${result.removed}\`（没有动它以外的东西）。`,
+					markdown: true,
+					context: ctxReply,
+				})
+				if (result.parent) await showNewSessionCard({ openid, dir: result.parent, replyContext: ctxReply })
+			}
+			code = 0
 		} else if (parsed.kind === 'newhere') {
 			// 「在这里新建」：建完默认切过去，并把结果回给 QQ。
 			code = 0

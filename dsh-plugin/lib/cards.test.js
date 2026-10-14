@@ -396,3 +396,33 @@ test('发送结果预览：超长正文截断并说明；没有正文/附件时�
 	assert.match(empty, /\*\*正文（0 字）\*\*/)
 	assert.match(empty, /> （没有正文）/)
 })
+
+test('新建会话卡片：导航行是 返回上级 | 新建目录 | 在这里新建（顺序固定）', () => {
+	const card = buildNewSessionCard({ dir: '/home/u/proj-a', dirs: [], parentPath: '/home/u' })
+	const labels = card.keyboard.content.rows.flatMap((row) => row.buttons).map((b) => b.render_data.label)
+	assert.deepEqual(labels, ['返回上级', '新建目录', '在这里新建'], '新建目录要夹在返回上级与在这里新建之间')
+	assert.doesNotMatch(labels.join('/'), /删除目录/, '目录非空时不出现「删除目录」')
+	const card2 = buildNewSessionCard({ dir: '/home/u/empty', dirs: [], parentPath: '/home/u', empty: true })
+	const labels2 = card2.keyboard.content.rows.flatMap((row) => row.buttons).map((b) => b.render_data.label)
+	assert.deepEqual(labels2, ['返回上级', '新建目录', '在这里新建', '删除目录'], '空目录才在最右侧多一个「删除目录」')
+	assert.match(card2.content, /这个目录是空的/)
+	assert.match(card2.content, /新建目录/)
+	// 根目录（没有上级）时仍然有新建目录/在这里新建
+	const root = buildNewSessionCard({ dir: '/', dirs: [], parentPath: null, empty: true })
+	const rootLabels = root.keyboard.content.rows.flatMap((row) => row.buttons).map((b) => b.render_data.label)
+	assert.deepEqual(rootLabels, ['新建目录', '在这里新建', '删除目录'])
+})
+
+test('新建会话卡片：删除目录的第二步只给「取消 / 确认删除」，且不超行数', () => {
+	const card = buildNewSessionCard({ dir: '/home/u/empty', dirs: [], parentPath: '/home/u', empty: true, confirming: true })
+	const labels = card.keyboard.content.rows.flatMap((row) => row.buttons).map((b) => b.render_data.label)
+	assert.deepEqual(labels, ['取消', '确认删除'], '二次确认这一步不给别的动作')
+	assert.match(card.content, /确认删除这个目录/)
+	assert.match(card.content, /只会删\*\*空目录\*\*/)
+	assert.ok(card.keyboard.content.rows.length <= 5)
+	// 「确认删除」的回调认得出是第二步
+	assert.equal(parseCallback(data.rmdirYes('/home/u/empty')).kind, 'rmdiryes')
+	assert.equal(parseCallback(data.rmdir('/home/u/empty')).kind, 'rmdir')
+	assert.equal(parseCallback(data.mkdir('/home/u/empty')).kind, 'mkdir')
+	assert.deepEqual(parseCallback(data.mkdir('/home/u/empty')), { kind: 'mkdir', path: '/home/u/empty' })
+})

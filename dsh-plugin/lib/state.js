@@ -16,6 +16,7 @@ export const EMPTY_STATE = {
 	notices: {}, // "sessionId:turn" -> true（结束通知去重）
 	inbox: {}, // openid -> { sessionId, text, seq, items[] }（「发送」输入态）
 	attachSeq: {}, // openid -> 已分配到的附件序号（附件 id 永不重用）
+	pendingDir: {}, // openid -> { parent, at }（点了「新建目录」、正在等目录名）
 }
 
 function normalize(raw) {
@@ -28,9 +29,10 @@ function normalize(raw) {
 		notices: {},
 		inbox: {},
 		attachSeq: {},
+		pendingDir: {},
 	}
 	if (!raw || typeof raw !== 'object') return base
-	for (const key of ['bindings', 'lastCard', 'delayed', 'inbox', 'attachSeq']) {
+	for (const key of ['bindings', 'lastCard', 'delayed', 'inbox', 'attachSeq', 'pendingDir']) {
 		if (raw[key] && typeof raw[key] === 'object') base[key] = { ...raw[key] }
 	}
 	if (raw.whitelist && typeof raw.whitelist === 'object' && Array.isArray(raw.whitelist.openids)) {
@@ -191,6 +193,17 @@ export function createState({ file, logger, seed, debounceMs = 200 } = {}) {
 		},
 		clearInbox(openid) {
 			return this.setInbox(openid, null)
+		},
+		/** 「新建目录」点了之后在等目录名。 */
+		pendingDirOf(openid) {
+			const entry = data.pendingDir[openid]
+			return entry && typeof entry === 'object' ? entry : null
+		},
+		setPendingDir(openid, entry) {
+			return this.update((s) => {
+				if (entry) s.pendingDir[openid] = entry
+				else delete s.pendingDir[openid]
+			})
 		},
 		/** 分配下一个附件 id（`A1`、`A2`…，跨输入态单调递增，绝不重用）。 */
 		nextAttachmentId(openid) {

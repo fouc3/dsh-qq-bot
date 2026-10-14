@@ -106,6 +106,10 @@ export const data = {
 	question: (callId, questionIndex, action) => `${DATA_PREFIX}:q:${questionIndex}:${action}:${callId}`,
 	// 输入态预览卡片：rm:<附件id> / page:<n> / send / clear / cancel
 	inbox: (action, arg = '') => `${DATA_PREFIX}:inbox:${action}${arg ? `:${arg}` : ''}`,
+	// 新建会话的目录卡片：新建目录（等名字）/ 删除目录（两步确认）
+	mkdir: (path) => `${DATA_PREFIX}:mkdir:${path}`,
+	rmdir: (path) => `${DATA_PREFIX}:rmdir:${path}`,
+	rmdirYes: (path) => `${DATA_PREFIX}:rmdir2:${path}`,
 }
 
 /** 解析回调 data；不是本插件的数据返回 null。 */
@@ -125,6 +129,15 @@ export function parseCallback(raw) {
 	}
 	if (raw.startsWith(`${DATA_PREFIX}:new:`)) {
 		return { kind: 'newhere', path: raw.slice(`${DATA_PREFIX}:new:`.length) }
+	}
+	if (raw.startsWith(`${DATA_PREFIX}:mkdir:`)) {
+		return { kind: 'mkdir', path: raw.slice(`${DATA_PREFIX}:mkdir:`.length) }
+	}
+	if (raw.startsWith(`${DATA_PREFIX}:rmdir2:`)) {
+		return { kind: 'rmdiryes', path: raw.slice(`${DATA_PREFIX}:rmdir2:`.length) }
+	}
+	if (raw.startsWith(`${DATA_PREFIX}:rmdir:`)) {
+		return { kind: 'rmdir', path: raw.slice(`${DATA_PREFIX}:rmdir:`.length) }
 	}
 	if (raw.startsWith(`${DATA_PREFIX}:q:`)) {
 		const rest = raw.slice(`${DATA_PREFIX}:q:`.length)
@@ -237,7 +250,7 @@ export function buildSessionCard({ dir, dirs, sessions, currentLabel, page = 1, 
  * 只列子目录（逐层进入），导航行是「返回上级」+「在这里新建」——
  * 两枚按钮共用一行，绝不另起一行（平台 5 行上限）。
  */
-export function buildNewSessionCard({ dir, dirs, page = 1, pageSize = 8, parentPath }) {
+export function buildNewSessionCard({ dir, dirs, page = 1, pageSize = 8, parentPath, empty = false, confirming = false }) {
 	const contentRows = Math.max(1, KEYBOARD_MAX_ROWS - CARD_RESERVED_ROWS)
 	const slots = Math.max(1, Math.min(Math.max(1, pageSize), contentRows * CARD_BUTTONS_PER_ROW))
 	const pages = Math.max(1, Math.ceil(dirs.length / slots))
@@ -246,20 +259,48 @@ export function buildNewSessionCard({ dir, dirs, page = 1, pageSize = 8, parentP
 
 	const lines = ['**新建会话**', `> 目标目录：\`${dir}\``, `子目录 ${dirs.length} 个`]
 	if (pages > 1) lines.push(`第 ${current}/${pages} 页`)
-	lines.push('', '逐层点进目标目录，最后点 **在这里新建**。')
+	if (confirming) {
+		lines.push(
+			'',
+			`⚠️ **确认删除这个目录？** \`${dir}\``,
+			'> 只会删**空目录**（没有任何文件/子目录）；删了没法从 QQ 侧恢复。',
+			'> 点「确认删除」执行，点「取消」回到目录列表。',
+		)
+	} else {
+		lines.push('', '逐层点进目标目录，最后点 **在这里新建**。')
+		lines.push('', '> 「新建目录」= 发一个目录名，在当前目录下建，建完自动进去。')
+		if (empty) lines.push('> 这个目录是空的，所以可以「删除目录」（要再确认一次）。')
+	}
 
 	const rows = rowsOf(
 		slice.map((sub) => callbackButton(sub.name, data.newDir(sub.path))),
 		CARD_BUTTONS_PER_ROW,
 	)
 	const pager = []
-	if (current > 1) pager.push(callbackButton('上一页', data.newPage(dir, current - 1)))
-	if (current < pages) pager.push(callbackButton('下一页', data.newPage(dir, current + 1)))
-	if (pager.length > 0) rows.push({ buttons: pager })
+	if (!confirming) {
+		if (current > 1) pager.push(callbackButton('上一页', data.newPage(dir, current - 1)))
+		if (current < pages) pager.push(callbackButton('下一页', data.newPage(dir, current + 1)))
+		if (pager.length > 0) rows.push({ buttons: pager })
+	}
 
+	if (confirming) {
+		// 二次确认：这一步只有"确认删除 / 取消"，别的动作一概不给。
+		rows.push({
+			buttons: [
+				callbackButton('取消', parentPath ? data.newDir(parentPath) : data.newPage(dir, current)),
+				callbackButton('确认删除', data.rmdirYes(dir), { style: 4, visited: '删除中' }),
+			],
+		})
+		return { content: lines.join('\n'), keyboard: keyboardOf(clampRows(rows)) }
+	}
+
+	// 用户要求：**新建目录** 夹在「返回上级」与「在这里新建」之间；
+	// 只有空目录（没有会话也没有文件）才在右侧多一个「删除目录」。
 	const nav = []
 	if (parentPath) nav.push(callbackButton('返回上级', data.newDir(parentPath)))
+	nav.push(callbackButton('新建目录', data.mkdir(dir)))
 	nav.push(callbackButton('在这里新建', data.newHere(dir), { visited: '已新建' }))
+	if (empty) nav.push(callbackButton('删除目录', data.rmdir(dir)))
 	rows.push({ buttons: nav })
 
 	return { content: lines.join('\n'), keyboard: keyboardOf(clampRows(rows)) }

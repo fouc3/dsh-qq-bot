@@ -9,7 +9,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { connect } from 'node:net'
-import { existsSync, mkdtempSync, statSync, readFileSync, readdirSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -1029,5 +1029,122 @@ test('端到端：输入态已经有内容时，`发送 <别的会话>` 不会�
 	assert.match(card.args.content, /这段别弄丢了/)
 	assert.match(card.args.content, /再来一句/)
 	assert.match(card.args.content, /session-1/, '还在给原来的会话攒')
+	boot.dispose()
+})
+
+test('端到端：新建目录（等名字→创建→默认进去）与空目录删除（二次确认）', async (t) => {
+	const root = mkdtempSync(join(tmpdir(), 'dsh-qq-dirs-'))
+	const emptyDir = join(root, 'empty-dir')
+	const busyDir = join(root, 'busy-dir')
+	mkdirSync(emptyDir)
+	mkdirSync(busyDir)
+	writeFileSync(join(busyDir, 'a.txt'), 'x')
+	t.after(() => rmSync(root, { recursive: true, force: true }))
+
+	const agent = makeAgent('session-1')
+	const boot = bootPlugin(t, {
+		sessions: [
+			{ sessionId: 'session-1', cwd: root, updatedAt: 3, running: false },
+			{ sessionId: 'session-2', cwd: emptyDir, updatedAt: 2, running: false },
+			{ sessionId: 'session-3', cwd: busyDir, updatedAt: 1, running: false },
+		],
+		live: { 'session-1': agent },
+	})
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M1' })
+	await drainFor(boot.socketPath, 60)
+
+	const cardOf = (list) => list.filter((c) => c.kind === 'send_c2c' && c.args.keyboard).at(-1) ?? null
+	const labelsOf = (card) => card.args.keyboard.content.rows.flatMap((r) => r.buttons).map((b) => b.render_data.label)
+	const buttonOf = (card, label) => card.args.keyboard.content.rows.flatMap((r) => r.buttons).find((b) => b.render_data.label === label)
+
+	// 新建会话 → 根目录卡片
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '新建会话', msgId: 'M2' })
+	const rootCard = await waitFor(async () => cardOf(await drainFor(boot.socketPath, 80)))
+	assert.ok(labelsOf(rootCard).includes('新建目录'), '卡片上要有「新建目录」')
+	assert.ok(!labelsOf(rootCard).includes('删除目录'), '根目录非空（有子目录）不给删除按钮')
+
+	// 1) 点「新建目录」→ 进入等名字
+	await rpc(boot.socketPath, 'event', {
+		kind: 'interaction',
+		openid: 'U1',
+		buttonData: buttonOf(rootCard, '新建目录').action.data,
+		eventId: 'INT-MK',
+		msgId: 'CARD-1',
+	})
+	const asked = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 60)
+		return list.find((c) => c.kind === 'send_c2c' && /写出\*\*目录名\*\*/.test(String(c.args.content))) ?? null
+	})
+	assert.match(asked.args.content, new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+
+	// 2) 发目录名 → 真的建出来，并默认进去（回新目录的卡片）
+	const made = join(root, 'made-by-test')
+	assert.equal(existsSync(made), false)
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: 'made-by-test', msgId: 'M3' })
+	assert.equal(existsSync(made), true, '目录要真的建出来')
+	const insideCard = await waitFor(async () => cardOf(await drainFor(boot.socketPath, 80)))
+	assert.match(insideCard.args.content, /made-by-test/, '默认 cd 进新目录（卡片换成它）')
+	assert.ok(labelsOf(insideCard).includes('删除目录'), '新建的空目录可以删')
+
+	// 3) 点「删除目录」→ 只是二次确认，什么都没删
+	await rpc(boot.socketPath, 'event', {
+		kind: 'interaction',
+		openid: 'U1',
+		buttonData: buttonOf(insideCard, '删除目录').action.data,
+		eventId: 'INT-RM',
+		msgId: 'CARD-2',
+	})
+	const confirmCard = await waitFor(async () => cardOf(await drainFor(boot.socketPath, 80)))
+	assert.deepEqual(labelsOf(confirmCard), ['取消', '确认删除'], '第二步只给取消/确认删除')
+	assert.equal(existsSync(made), true, '第一步不能删')
+
+	// 4) 点「确认删除」→ 真的删掉，并回到上级卡片
+	await rpc(boot.socketPath, 'event', {
+		kind: 'interaction',
+		openid: 'U1',
+		buttonData: buttonOf(confirmCard, '确认删除').action.data,
+		eventId: 'INT-RMYES',
+		msgId: 'CARD-3',
+	})
+	const removed = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /已删除空目录/.test(String(c.args.content))) ?? null
+	})
+	assert.match(removed.args.content, /made-by-test/)
+	assert.equal(existsSync(made), false, '确认后才真删')
+
+	// 5) 非空目录不给删除按钮
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '新建会话', msgId: 'M4' })
+	const backCard = await waitFor(async () => cardOf(await drainFor(boot.socketPath, 80)))
+	const busyButton = buttonOf(backCard, 'busy-dir')
+	assert.ok(busyButton, '非空目录仍应列出来')
+	await rpc(boot.socketPath, 'event', {
+		kind: 'interaction',
+		openid: 'U1',
+		buttonData: busyButton.action.data,
+		eventId: 'INT-ENTER',
+		msgId: 'CARD-4',
+	})
+	const busyCard = await waitFor(async () => cardOf(await drainFor(boot.socketPath, 80)))
+	assert.ok(!labelsOf(busyCard).includes('删除目录'), '里面有文件就不给删除按钮')
+	assert.equal(existsSync(join(busyDir, 'a.txt')), true)
+
+	// 6) 手工调「确认删除」删非空目录也要被挡住（护栏不只靠"不给按钮"）
+	await rpc(boot.socketPath, 'event', {
+		kind: 'interaction',
+		openid: 'U1',
+		buttonData: cardData.rmdirYes(busyDir),
+		eventId: 'INT-RMYES2',
+		msgId: 'CARD-5',
+	})
+	const blocked = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /不是空目录/.test(String(c.args.content))) ?? null
+	})
+	assert.match(blocked.args.content, /不是空目录/)
+	assert.equal(existsSync(busyDir), true, '非空目录绝不能被删')
+
 	boot.dispose()
 })
