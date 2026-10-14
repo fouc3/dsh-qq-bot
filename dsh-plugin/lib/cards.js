@@ -544,3 +544,64 @@ export function buildInboxCard({ label, sessionId, text, items = [], voice = [],
 
 	return { content: lines.join('\n'), keyboard: keyboardOf(rows) }
 }
+
+// ── 结果预览（卡片撤回后留一条"我刚才确认了什么"） ───────────────────────
+
+/**
+ * 提问结果预览。
+ *
+ * 为什么需要：提问卡片在提交后会被撤回（否则聊天里一堆积压卡片），
+ * 但撤回之后用户就再也看不到"我到底答了什么"了 —— 这里补一条纯文本预览。
+ *
+ * @param {{questions?:Array<object>, answers?:Array<{id:string,selected?:string[],custom?:string}>}} input
+ */
+export function buildQuestionResult({ questions = [], answers = [] } = {}) {
+	const byId = new Map((answers ?? []).map((answer) => [answer?.id, answer]))
+	const lines = [`**提问结果** · ${questions.length} 题`]
+	questions.forEach((question, index) => {
+		const answer = byId.get(question.id) ?? {}
+		const selected = Array.isArray(answer.selected) ? answer.selected : []
+		lines.push('', `**${index + 1}. ${question.header ? `${oneLine(question.header, 20)} · ` : ''}${oneLine(question.question, 60)}**`)
+		if (selected.length === 0 && !answer.custom) lines.push('> （没选，按跳过处理）')
+		for (const label of selected) lines.push(`> ✅ ${oneLine(label, 60)}`)
+		if (answer.custom) lines.push(`> ✍️ 其他：${oneLine(answer.custom, 160)}`)
+	})
+	return lines.join('\n')
+}
+
+/** 正文预览最多展示多少字（超出截断并说明）。 */
+const RESULT_TEXT_LIMIT = 400
+
+/**
+ * 输入态「发送」后的结果预览。
+ *
+ * 为什么需要：点「发送」后那张预览卡片会被撤回，用户就只看到一句"已发送"；
+ * 这里把**真正发出去的内容**复述一遍（正文 / 语音转写 / 附件），便于回头核对。
+ *
+ * @param {{label?:string, sessionId:string, text?:string, items?:Array<object>, voice?:Array<object>}} input
+ */
+export function buildInboxResult({ label, sessionId, text = '', items = [], voice = [] } = {}) {
+	const voiceIds = new Set((voice ?? []).map((item) => item.id))
+	const body = String(text ?? '').trim()
+	const lines = [`**已发送** · ${label ?? sessionId}`, `> 会话：\`${sessionId}\``, '']
+
+	lines.push(`**正文（${body.length} 字）**`)
+	if (body) {
+		const shown = body.length > RESULT_TEXT_LIMIT ? `${body.slice(0, RESULT_TEXT_LIMIT)}…` : body
+		for (const line of shown.split('\n')) lines.push(`> ${line || ' '}`)
+		if (body.length > RESULT_TEXT_LIMIT) lines.push('> （太长，这里只显示前 400 字）')
+	} else {
+		lines.push('> （没有正文）')
+	}
+
+	if ((voice ?? []).length > 0) {
+		lines.push('', '---', '', '**语音转写（平台，可能有误）**')
+		for (const item of voice) lines.push(`> 🎙 ${item.id}：${oneLine(item.asrText, 200)}`)
+	}
+
+	const others = (items ?? []).filter((item) => !voiceIds.has(item.id))
+	lines.push('', '---', '', `**附件（${others.length}）**`)
+	if (others.length === 0) lines.push('> （没有附件）')
+	for (const item of others) lines.push(`- ${describeInboxItem(item)}`)
+	return lines.join('\n')
+}

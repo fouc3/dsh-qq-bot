@@ -12,7 +12,7 @@
  * 超时、被取消、或卡片放不下/发不出去时返回 null，由调用方 `next()` 交回 dsh GUI
  * —— 绝不吞掉提问；降级时还会在 QQ 里明说一句，免得用户什么都看不到。
  */
-import { buildQuestionCards, QUESTION_MAX_BUTTONS } from './cards.js'
+import { buildQuestionCards, buildQuestionResult, QUESTION_MAX_BUTTONS } from './cards.js'
 
 export function createQuestionBridge({ state, outbox, config, logger, io }) {
 	const pending = new Map() // callId → entry
@@ -231,6 +231,13 @@ export function createQuestionBridge({ state, outbox, config, logger, io }) {
 	async function recallAndSettle(entry) {
 		await recallAll(entry)
 		const answers = finalAnswers(entry)
+		// 卡片撤回后留一条**结果预览**：不然用户答完就"什么都没了"（用户要求）。
+		try {
+			const content = buildQuestionResult({ questions: entry.questions, answers })
+			await io.notify?.({ openid: entry.openid, content, context: entry.context })
+		} catch (error) {
+			logger?.warn?.('发送提问结果预览失败', { callId: entry.callId, error: String(error) })
+		}
 		await settle(entry, answers)
 	}
 

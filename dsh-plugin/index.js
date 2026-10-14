@@ -29,6 +29,7 @@ import { DEFAULT_MAX_ATTACHMENT_BYTES, DEFAULT_MAX_FETCH_BYTES, createInbox, for
 import {
 	QUESTION_MAX_BUTTONS,
 	buildInboxCard,
+	buildInboxResult,
 	buildNewSessionCard,
 	buildSessionCard,
 	data as cardData,
@@ -450,9 +451,10 @@ export function apply(ctx, rawConfig) {
 		if (cardId) await io.recallCard(openid, cardId)
 		const body = text || '（用户没有写正文：内容见上面的分节，请按语音转写/附件回应）'
 		await deliver({ sessionId, openid, text: body, interrupt: true, origin: 'qq', context, images, sections })
+		// 卡片撤回后留一条**最终预览**：把真正发出去的内容复述一遍（用户要求）。
 		await sendText({
 			openid,
-			content: `已发送到 **${label}**（正文 ${text ? `${text.length} 字` : '空'} + 附件 ${items.length} 个）。`,
+			content: buildInboxResult({ label, sessionId, text, items, voice: voiceItems }),
 			markdown: true,
 			context,
 		})

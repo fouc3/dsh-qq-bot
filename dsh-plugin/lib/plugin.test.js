@@ -737,6 +737,14 @@ test('提问桥：ask_user_question 的 waterfall 在 QQ 侧发卡片，点选�
 	const result = await answer
 	assert.equal(nextCalled, false, 'QQ 侧答了就不该交回 GUI')
 	assert.deepEqual(result, { answers: [{ id: 'q1', selected: ['直接上线'] }] })
+
+	// 卡片撤回后要留一条结果预览：否则用户答完就再也看不到自己答了什么
+	const preview = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 60)
+		return list.find((c) => c.kind === 'send_c2c' && /提问结果/.test(String(c.args.content))) ?? null
+	})
+	assert.match(preview.args.content, /1\. 部署方式 · 怎么上线？/)
+	assert.match(preview.args.content, /✅ 直接上线/)
 	boot.dispose()
 })
 
@@ -886,6 +894,14 @@ test('端到端：输入态——附件只能走卡片上的「发送」；裸�
 	assert.equal(delivered.content[1].text, '看看这张图')
 	assert.equal(delivered.content[2].type, 'image', '图片要以 image 块随正文走')
 	assert.equal(delivered.content[2].attachment.attachmentId, 'img-1')
+
+	// 卡片撤回后要留一条**最终预览**：把真正发出去的内容复述一遍
+	const sentPreview = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 60)
+		return list.find((c) => c.kind === 'send_c2c' && /\*\*已发送\*\*/.test(String(c.args.content))) ?? null
+	})
+	assert.match(sentPreview.args.content, /看看这张图/)
+	assert.match(sentPreview.args.content, /A1.*cat\.png/)
 
 	// 投递后输入态被清空（状态文件是 200ms 防抖落盘，等它写完再读）
 	await new Promise((resolve) => setTimeout(resolve, 260))

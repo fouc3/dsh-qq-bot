@@ -4,10 +4,12 @@ import assert from 'node:assert/strict'
 import {
 	QUESTION_MAX_BUTTONS,
 	buildInboxCard,
+	buildInboxResult,
 	buildNewSessionCard,
 	buildNoticeCard,
 	buildQuestionCard,
 	buildQuestionCards,
+	buildQuestionResult,
 	buildSessionCard,
 	callbackButton,
 	clipLabel,
@@ -338,4 +340,59 @@ test('输入态预览卡片：附件多时翻页，且每页都不超平台行�
 	assert.ok(secondLabels.includes('上一页'))
 	assert.ok(!secondLabels.includes('下一页'))
 	assert.ok(second.keyboard.content.rows.length <= 5)
+})
+
+test('提问结果预览：逐题列出选项/其他/跳过（卡片撤回后还能看到答了什么）', () => {
+	const content = buildQuestionResult({
+		questions: [
+			{ id: 'q1', header: '部署方式', question: '这次改动怎么上线？' },
+			{ id: 'q2', question: '要不要通知你？' },
+			{ id: 'q3', question: '还有别的吗？' },
+		],
+		answers: [
+			{ id: 'q1', selected: ['先灰度 10%'] },
+			{ id: 'q2', selected: [], custom: '跑完给我发一条' },
+			{ id: 'q3', selected: [] },
+		],
+	})
+	assert.match(content, /\*\*提问结果\*\* · 3 题/)
+	assert.match(content, /1\. 部署方式 · 这次改动怎么上线？/)
+	assert.match(content, /> ✅ 先灰度 10%/)
+	assert.match(content, /✍️ 其他：跑完给我发一条/)
+	assert.match(content, /（没选，按跳过处理）/)
+})
+
+test('发送结果预览：正文、语音转写、附件各归各位（语音不再算附件）', () => {
+	const content = buildInboxResult({
+		label: 'proj-a(session-1)',
+		sessionId: 'session-1',
+		text: '看看这个\n第二行',
+		items: [
+			{ id: 'A1', kind: 'image', filename: 'cat.png', size: 2048, status: 'stored', image: true },
+			{ id: 'A2', kind: 'file', filename: 'a.pdf', size: 1024, status: 'stored' },
+			{ id: 'A3', kind: 'voice', status: 'voice', asrText: '帮我查一下这个报错' },
+		],
+		voice: [{ id: 'A3', kind: 'voice', status: 'voice', asrText: '帮我查一下这个报错' }],
+	})
+	assert.match(content, /\*\*已发送\*\* · proj-a\(session-1\)/)
+	assert.match(content, /\*\*正文（8 字）\*\*/)
+	assert.match(content, /> 看看这个/)
+	assert.match(content, /> 第二行/)
+	assert.match(content, /\*\*语音转写（平台，可能有误）\*\*/)
+	assert.match(content, /🎙 A3：帮我查一下这个报错/)
+	assert.match(content, /\*\*附件（2）\*\*/)
+	assert.match(content, /A1.*cat\.png.*已下载/)
+	assert.match(content, /A2.*a\.pdf/)
+	assert.ok(!/\*\*附件（3）\*\*/.test(content), '语音不该算进附件数')
+})
+
+test('发送结果预览：超长正文截断并说明；没有正文/附件时如实写"没有"', () => {
+	const long = 'x'.repeat(500)
+	const content = buildInboxResult({ label: 'L', sessionId: 's-1', text: long, items: [] })
+	assert.match(content, /（太长，这里只显示前 400 字）/)
+	assert.match(content, /（没有附件）/)
+
+	const empty = buildInboxResult({ label: 'L', sessionId: 's-1', text: '', items: [] })
+	assert.match(empty, /\*\*正文（0 字）\*\*/)
+	assert.match(empty, /> （没有正文）/)
 })

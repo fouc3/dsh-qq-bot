@@ -164,7 +164,10 @@ test('提问：一卡放不下就拆多张；点哪张只重发哪张，提交�
 	assert.equal(result.length, 6)
 	assert.deepEqual(result[3], { id: 'q4', selected: ['o4-0'] })
 	assert.equal(bridge.pendingCount(), 0)
-	assert.equal(notified.length, 0)
+	// 提交后要留一条结果预览（卡片被撤回了，用户得能看到自己答了什么）
+	assert.equal(notified.length, 1)
+	assert.match(notified[0].content, /提问结果/)
+	assert.match(notified[0].content, /✅ o4-0/)
 })
 
 test('提问：点击者与提问对象不一致时拒绝，且不是重复/过期码', async () => {
