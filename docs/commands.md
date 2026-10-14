@@ -58,7 +58,14 @@
 - **Web 端可见**：新建会话时会把该目录**注册成 dsh 工作区**
   （`workspaceRegistry.create(path)` → `workspace.attachSession(sessionId)`，与 dsh 自己的
   创建流程一致）——否则 dsh Web 侧栏按工作区分组，QQ 建出来的文件夹和会话**整个都看不到**
-  （线上踩过）。插件启动/网关同步时还会补登记一次历史遗漏，幂等。
+  （线上踩过）。点「新建目录」建出来的目录也会**当场**注册，侧栏马上看得到这个文件夹。
+- **补登记（自愈）**：网关每次同步（含插件/网关重启后）会补登记"本桥碰过的"目录与会话：
+  当前绑定会话、本桥建出来的会话/目录（状态里的 `createdSessions` / `createdDirs`）、
+  **跑过轮次的会话**（`notices` 里 `sessionId:turn` 的 key）、输入态与延迟发送里提到的会话。
+  后两条正是一条"历史遗留"能被捞回来的依据；**不会**去注册用户其它几百个会话的 cwd
+  （那会把侧栏塞满）。
+- 另有工具 `qq_register_workspace(path, sessionId?)`：给外部/历史遗留目录补票用，
+  走同一套 `create` + `attachSession`，参数与失败都如实回报。
 
 ### 进度
 

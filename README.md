@@ -190,8 +190,8 @@ level=WARN msg="已丢弃非白名单用户的私聊" openid=2A3B4C… text_len=
 - ✅ 会话选择卡片：文件夹是回调按钮（逐层进入、每步撤回上一张）、会话是指令按钮（只填输入框、不直接切换）
   —— `lib/cards.test.js` + `lib/plugin.test.js`（断言 `action.type` 与 `recall_c2c`）
 - ✅ 新建会话的选目录卡片：导航行 `返回上级 | 新建目录 | 在这里新建`，空目录时 `删除目录` **单独一行**；**新建目录**＝点完换成带「**取消**」按钮的提示卡片，发一条消息写目录名 → 真建出来并默认 cd 进去（点取消或发命令即退出等名字）；**删除目录**只在空目录出现、两步确认（第一步什么都不删）；非空目录即便手工调确认回调也被 `ENOTEMPTY` 挡住
-- ✅ QQ 侧新建会话会把目录**注册成 dsh 工作区**（`workspaceRegistry.create` + `attachSession`），让 dsh Web 侧栏能看到这个文件夹和会话；插件在网关同步时还会补登记历史遗漏
-  —— `lib/plugin.test.js`「QQ 侧新建会话要把目录注册成工作区」
+- ✅ QQ 侧新建会话/新建目录会把目录**注册成 dsh 工作区**（`workspaceRegistry.create` + `attachSession`），让 dsh Web 侧栏能看到这个文件夹和会话；网关每次同步还会补登记"本桥碰过的"目录与会话（绑定会话 + `createdSessions`/`createdDirs` + **`notices` 里跑过轮次的会话** + 输入态/延迟发送提到的），另有 `qq_register_workspace` 工具给外部目录补票
+  —— `lib/plugin.test.js`「QQ 侧新建会话要把目录注册成工作区」「注册目录工作区的工具」「启动补登记」
   —— `lib/cards.test.js` + `lib/plugin.test.js`「新建目录（等名字→创建→默认进去）与空目录删除（二次确认）」
 - ✅ 每轮结束发「标题(会话id)已结束」+「我需要回复」；被顶替/未认领/被停止的轮次不发
   —— `lib/rounds.test.js` + `lib/plugin.test.js`
