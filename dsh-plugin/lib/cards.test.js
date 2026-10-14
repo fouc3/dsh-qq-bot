@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
+	buildNewSessionCard,
 	buildNoticeCard,
 	buildQuestionCard,
 	buildSessionCard,
@@ -154,9 +155,53 @@ test('会话卡片不超平台键盘限额（≤5 行、每行 ≤5 按钮），
 	assert.ok(flat(last).some((b) => b.render_data.label === '不指定会话'))
 })
 
+// 这条守卫是补票：线上曾因为"卡片排满 5 行后，调用方又外挂一行「返回上级」"
+// 被平台 40034029 拒收。现在「返回上级」必须与导航同处一行。
+test('会话卡片：「返回上级」与「不指定会话」同处一行，总行数仍 ≤5', () => {
+	const dirs = Array.from({ length: 9 }, (_, i) => ({ name: `dir${i}`, path: `/home/u/dir${i}` }))
+	const sessions = Array.from({ length: 9 }, (_, i) => ({ sessionId: `session-${i}`, label: `会话${i}` }))
+	const card = buildSessionCard({
+		dir: '/home/u',
+		dirs,
+		sessions,
+		currentLabel: null,
+		page: 2,
+		pageSize: 8,
+		parentPath: '/home',
+		switchCommand: (id) => `切换会话 ${id}`,
+	})
+	const rows = card.keyboard.content.rows
+	assert.ok(rows.length <= 5, `行数 ${rows.length} 超限（线上就是这么被拒收的）`)
+	const nav = rows[rows.length - 1]
+	const labels = nav.buttons.map((b) => b.render_data.label)
+	assert.deepEqual(labels, ['返回上级', '不指定会话'], '导航行应同时含返回上级与不指定会话')
+	assert.equal(nav.buttons[0].action.data, data.dir('/home'))
+})
+
+test('新建会话卡片：只列子目录，导航行是「返回上级」+「在这里新建」', () => {
+	const dirs = [
+		{ name: 'proj-a', path: '/home/u/proj-a' },
+		{ name: 'proj-b', path: '/home/u/proj-b' },
+	]
+	const card = buildNewSessionCard({ dir: '/home/u', dirs, parentPath: '/home' })
+	const rows = card.keyboard.content.rows
+	assert.ok(rows.length <= 5)
+	const buttons = rows.flatMap((row) => row.buttons)
+	assert.equal(buttons.filter((b) => b.action.data === data.newDir('/home/u/proj-a')).length, 1, '子目录用 newdir 回调')
+	assert.deepEqual(
+		buttons.filter((b) => b.action.data === data.newHere('/home/u')).map((b) => b.render_data.label),
+		['在这里新建'],
+	)
+	assert.ok(buttons.some((b) => b.action.data === data.newDir('/home')))
+	assert.match(card.content, /在这里新建/)
+})
+
 test('parseCallback 覆盖四类数据，非本插件的数据返回 null', () => {
-	assert.deepEqual(parseCallback(data.dir('/home/u')), { kind: 'dir', path: '/home/u', page: 1 })
-	assert.deepEqual(parseCallback(`${data.dir('/home/u')}?page=3`), { kind: 'dir', path: '/home/u', page: 3 })
+	// 目录浏览分两种模式：切换会话 / 新建会话选目录（回调 data 里带模式，无状态）
+	assert.deepEqual(parseCallback(data.dir('/home/u')), { kind: 'dir', mode: 'switch', path: '/home/u', page: 1 })
+	assert.deepEqual(parseCallback(`${data.dir('/home/u')}?page=3`), { kind: 'dir', mode: 'switch', path: '/home/u', page: 3 })
+	assert.deepEqual(parseCallback(data.newDir('/home/u')), { kind: 'dir', mode: 'new', path: '/home/u', page: 1 })
+	assert.deepEqual(parseCallback(data.newHere('/home/u')), { kind: 'newhere', path: '/home/u' })
 	assert.deepEqual(parseCallback(data.needReply('session-7')), { kind: 'needreply', sessionId: 'session-7' })
 	assert.deepEqual(parseCallback(data.question('call-1', 2, 'opt-1')), {
 		kind: 'question',

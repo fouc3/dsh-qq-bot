@@ -268,10 +268,10 @@ test('register → panel：白名单快照 + 五条命令的面板定义（只�
 	assert.deepEqual(panel.value.userOpenIds, ['U1'])
 	assert.deepEqual(
 		panel.value.items.map((item) => item.name),
-		['切换会话', '发送', '停止', '归档', '延迟发送'],
+		['切换会话', '新建会话', '发送', '停止', '归档', '延迟发送'],
 	)
 	// 扁平键 menuItems：与 Go 侧 PanelDefinition.MenuItems 对齐（大小写不敏感匹配）
-	assert.equal(panel.value.menuItems.length, 5)
+	assert.equal(panel.value.menuItems.length, 6)
 	assert.equal(panel.value.menuItems[0].name, '切换会话')
 	assert.equal(panel.value.menuItems[0].sendMessage, '切换会话')
 	assert.equal(panel.value.menu, undefined)
@@ -324,7 +324,12 @@ test('端到端：命令 → 会话卡片；绑定后普通消息进会话；一
 	})
 	assert.equal(rootCard.args.markdown, true, '键盘必须挂 markdown 消息')
 	assert.match(rootCard.args.content, /切换会话/)
-	const rootButtons = rootCard.args.keyboard.content.rows.flatMap((row) => row.buttons)
+	// 整条链路（含 index.js 可能追加的按钮）产出的键盘必须合法：≤5 行、每行 ≤5 按钮。
+	// 线上就是这里超了一行被平台 40034029 拒收的。
+	const rows = rootCard.args.keyboard.content.rows
+	assert.ok(rows.length <= 5, `键盘行数 ${rows.length} 超平台上限`)
+	for (const row of rows) assert.ok(row.buttons.length <= 5, `某行按钮数 ${row.buttons.length} 超上限`)
+	const rootButtons = rows.flatMap((row) => row.buttons)
 	const folder = rootButtons.find((b) => b.action.type === 1 && b.action.data === cardData.dir('/home/u/proj-a'))
 	assert.ok(folder, '文件夹应是回调按钮（点了由插件翻层）')
 	assert.equal(rootButtons.find((b) => b.action.data === cardData.dir('/home/u/proj-a')).render_data.label, 'proj-a')
@@ -572,7 +577,7 @@ test('端到端：dsh 内置命令从 QQ 直接执行（不进模型）；技能
 		'feedback 不收纳；技能本来就不在命令表里',
 	)
 	assert.equal(groups[0].children[0].sendMessage, '/compact', '点击把 /命令 填进输入框')
-	assert.equal(panel.value.menuItems.filter((i) => i.type !== 'menu').length, 5, '顶层仍有 5 条桥命令')
+	assert.equal(panel.value.menuItems.filter((i) => i.type !== 'menu').length, 6, '顶层仍是 6 条桥命令')
 
 	// 绑定会话
 	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M1' })

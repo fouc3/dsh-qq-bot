@@ -1,4 +1,12 @@
 /**
+ * ⚠️ 这是当前**生效入口**（package.json 的 exports 指向本文件）：内容与 `index.js` 相同，
+ * 唯一区别是内部 import 带 `?v=2` 查询串 —— 用来绕过 Node 的 ESM 模块缓存。
+ * Host 插件按 URL 缓存模块，重新激活插件行**不会**重新导入，改了代码必须换 URL 才生效。
+ *
+ * 维护约定：改插件代码时改 `index.js`，再同步到本文件（同步时递增 lib import 的 ?v=N）。
+ * 下次 `systemctl --user restart dsh-web` 之后，可以把 package.json 的 exports 指回
+ * `./index.js` 并删掉本文件（重启后走普通入口即可）。
+ *
  * dsh-qq-bot：把 QQ 私聊接到本机 dsh 会话上的插件（Host 插件，与 dsh web 同进程）。
  *
  * 职责边界：
