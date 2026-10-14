@@ -126,6 +126,34 @@ test('提问卡片：按钮数超上限返回 null（调用方降级到 dsh GUI�
 	assert.equal(card, null)
 })
 
+test('会话卡片不超平台键盘限额（≤5 行、每行 ≤5 按钮），装不下就翻页', () => {
+	const dirs = Array.from({ length: 12 }, (_, i) => ({ name: `dir${i}`, path: `/home/u/dir${i}` }))
+	const sessions = Array.from({ length: 10 }, (_, i) => ({ sessionId: `session-${i}`, label: `会话${i}` }))
+	const flat = (card) => card.keyboard.content.rows.flatMap((row) => row.buttons)
+	const build = (page) =>
+		buildSessionCard({
+			dir: '/home/u',
+			dirs,
+			sessions,
+			currentLabel: null,
+			page,
+			pageSize: 8,
+			switchCommand: (id) => `切换会话 ${id}`,
+		})
+
+	const first = build(1)
+	const rows = first.keyboard.content.rows
+	assert.ok(rows.length <= 5, `行数 ${rows.length} 超平台上限（线上就是被 40034029 拒收的）`)
+	for (const row of rows) assert.ok(row.buttons.length <= 5, `某行按钮数 ${row.buttons.length} 超限`)
+	assert.ok(flat(first).some((b) => b.render_data.label === '下一页'), '装不下必须有下一页')
+	assert.ok(flat(first).some((b) => b.render_data.label === '不指定会话'), '导航按钮必须还在')
+
+	const last = build(999)
+	assert.ok(last.keyboard.content.rows.length <= 5)
+	assert.ok(flat(last).some((b) => b.render_data.label === '上一页'))
+	assert.ok(flat(last).some((b) => b.render_data.label === '不指定会话'))
+})
+
 test('parseCallback 覆盖四类数据，非本插件的数据返回 null', () => {
 	assert.deepEqual(parseCallback(data.dir('/home/u')), { kind: 'dir', path: '/home/u', page: 1 })
 	assert.deepEqual(parseCallback(`${data.dir('/home/u')}?page=3`), { kind: 'dir', path: '/home/u', page: 3 })

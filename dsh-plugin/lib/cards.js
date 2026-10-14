@@ -86,7 +86,9 @@ export function rowsOf(buttons, perRow = 3) {
 }
 
 export function keyboardOf(rows) {
-	return { content: { rows } }
+	// 兜底：任何调用方都不该产出超限键盘（平台会整条消息 40034029 拒收），
+	// 真超了就在这里截断成合法形状，而不是让消息发不出去。
+	return { content: { rows: clampRows(rows) } }
 }
 
 // ── 回调 data 编解码 ─────────────────────────────────────────────────────
@@ -139,33 +141,62 @@ export function parseCallback(raw) {
  * @param {number} [input.pageSize]
  * @param {(sessionId:string)=>string} input.switchCommand 生成"填进输入框"的命令文本
  */
+/** 内联键盘的平台硬限制：最多 5 行，每行最多 5 个按钮（超了平台直接 40034029 拒收）。 */
+export const KEYBOARD_MAX_ROWS = 5
+export const KEYBOARD_MAX_BUTTONS_PER_ROW = 5
+
+/** 会话卡片的排版：每行 3 个（手机上更好点），整体不超平台行数。 */
+const CARD_BUTTONS_PER_ROW = 3
+/** 预留两行给"翻页"和"不指定会话"，剩下的才是内容行。 */
+const CARD_RESERVED_ROWS = 2
+
+/** 最后一道兜底：把任何布局压回平台限额内（正常排版不该走到这里）。 */
+function clampRows(rows, maxRows = KEYBOARD_MAX_ROWS, maxPerRow = KEYBOARD_MAX_BUTTONS_PER_ROW) {
+	return rows
+		.slice(0, maxRows)
+		.map((row) => ({ ...row, buttons: (row.buttons ?? []).slice(0, maxPerRow) }))
+		.filter((row) => (row.buttons ?? []).length > 0)
+}
+
 export function buildSessionCard({ dir, dirs, sessions, currentLabel, page = 1, pageSize = 8, switchCommand }) {
-	const totalSessions = sessions.length
-	const pages = Math.max(1, Math.ceil(totalSessions / Math.max(1, pageSize)))
+	// 目录与会话共用同一页预算：先目录（导航优先），再会话。
+	// 这样无论目录多少，键盘都不会超过平台行数上限。
+	const contentRows = Math.max(1, KEYBOARD_MAX_ROWS - CARD_RESERVED_ROWS)
+	const slots = Math.max(1, Math.min(Math.max(1, pageSize), contentRows * CARD_BUTTONS_PER_ROW))
+	const entries = [
+		...dirs.map((sub) => ({ kind: 'dir', label: sub.name, path: sub.path })),
+		...sessions.map((session) => ({
+			kind: 'session',
+			sessionId: session.sessionId,
+			label: `${session.running ? '● ' : ''}${session.label}`,
+		})),
+	]
+	const pages = Math.max(1, Math.ceil(entries.length / slots))
 	const current = Math.min(Math.max(1, page), pages)
-	const slice = sessions.slice((current - 1) * pageSize, current * pageSize)
+	const slice = entries.slice((current - 1) * slots, current * slots)
 
 	const lines = [
 		'**切换会话**',
 		`> 当前会话：${currentLabel ? `\`${currentLabel}\`` : '`none`（未绑定）'}`,
-		`目录：\`${dir}\`（${totalSessions} 个会话，${dirs.length} 个子目录）`,
+		`目录：\`${dir}\`（${sessions.length} 个会话，${dirs.length} 个子目录）`,
 	]
-	if (pages > 1) lines.push(`第 ${current}/${pages} 页`)
+	if (pages > 1) lines.push(`第 ${current}/${pages} 页（每页 ${slots} 项）`)
 	lines.push('', '点文件夹继续选择；点会话会把切换指令**填进输入框**，确认后发送。')
 
-	const buttons = []
-	for (const sub of dirs) buttons.push(callbackButton(sub.name, data.dir(sub.path)))
-	for (const session of slice) {
-		const label = `${session.running ? '● ' : ''}${session.label}`
-		buttons.push(commandButton(label, switchCommand(session.sessionId)))
-	}
-	if (pages > 1) {
-		if (current > 1) buttons.push(callbackButton('上一页', data.page(dir, current - 1)))
-		if (current < pages) buttons.push(callbackButton('下一页', data.page(dir, current + 1)))
-	}
-	buttons.push(commandButton('不指定会话', switchCommand('none')))
+	const buttons = slice.map((entry) =>
+		entry.kind === 'dir'
+			? callbackButton(entry.label, data.dir(entry.path))
+			: commandButton(entry.label, switchCommand(entry.sessionId)),
+	)
+	const rows = rowsOf(buttons, CARD_BUTTONS_PER_ROW)
 
-	return { content: lines.join('\n'), keyboard: keyboardOf(rowsOf(buttons, 3)) }
+	const pager = []
+	if (current > 1) pager.push(callbackButton('上一页', data.page(dir, current - 1)))
+	if (current < pages) pager.push(callbackButton('下一页', data.page(dir, current + 1)))
+	if (pager.length > 0) rows.push({ buttons: pager })
+	rows.push({ buttons: [commandButton('不指定会话', switchCommand('none'))] })
+
+	return { content: lines.join('\n'), keyboard: keyboardOf(clampRows(rows)) }
 }
 
 /**
