@@ -8,6 +8,22 @@
 import { buildNoticeCard } from './cards.js'
 import { REPLY_TOOL_NAME } from './reply-tool.js'
 
+/**
+ * 互动回应码（平台固定语义，**别随手改**）：
+ *   0 成功（按钮变「已触发」，此后不可再点）
+ *   1 失败（按钮保持可点，可重试）
+ *   2 操作太频繁 ← 客户端会直接弹「操作太频繁」，别拿它当"忙"
+ *   3 重复操作   4 没有权限   5 仅管理员可操作
+ */
+export const INTERACTION_CODES = {
+	success: 0,
+	failed: 1,
+	tooFrequent: 2,
+	duplicate: 3,
+	noPermission: 4,
+	adminOnly: 5,
+}
+
 export function createRounds({
 	state,
 	sessions,
@@ -223,15 +239,24 @@ export function createRounds({
 	async function needReply({ openid, sessionId, interactionId, messageId }) {
 		if (state.bindingOf(openid) !== sessionId) {
 			logger?.warn?.('非绑定用户点了「我需要回复」', { openid: `${openid.slice(0, 6)}…`, sessionId })
-			return { ok: false, code: 4, reason: 'not-bound' }
+			return { ok: false, code: INTERACTION_CODES.noPermission, reason: 'not-bound' }
 		}
 		const agent = await agentFor(sessionId)
 		if (!agent) {
-			return { ok: false, code: 4, reason: 'no-session' }
+			return { ok: false, code: INTERACTION_CODES.noPermission, reason: 'no-session' }
 		}
 		if (agent.status === 'running') {
+			// 这里**必须**回「失败」而不是「操作太频繁」：码 2 的平台语义就是
+			// 用户点得太频繁，客户端会直接弹「操作太频繁」（线上就是这么弹的）。
 			logger?.info?.('会话正在运行，忽略「我需要回复」', { sessionId })
-			return { ok: false, code: 2, reason: 'running' }
+			outbox.enqueue('send_c2c', {
+				openid,
+				markdown: false,
+				content: '这一轮还在跑，等它结束后再点「我需要回复」；着急的话直接发一条消息（会打断当前轮）。',
+				replyToEventId: interactionId,
+				msgSeq: nextSeq(sessionId),
+			})
+			return { ok: false, code: INTERACTION_CODES.failed, reason: 'running' }
 		}
 
 		const round = beginRound({
@@ -251,7 +276,7 @@ export function createRounds({
 			msgSeq: nextSeq(sessionId),
 		})
 		logger?.info?.('已按用户点击唤醒会话', { sessionId })
-		return { ok: true, code: 0 }
+		return { ok: true, code: INTERACTION_CODES.success }
 	}
 
 	return {

@@ -157,7 +157,7 @@ test('每轮把用户级上下文注入进会话（每个 turn 只注入一次�
 	assert.equal(third.messages.length, 2, '新 turn 再注入一次')
 })
 
-test('「我需要回复」：绑定不符=4、正在运行=2、成功=0 并注入唤醒消息 + 确认消息', async () => {
+test('「我需要回复」：绑定不符=4、正在运行=1（失败，别用 2）、成功=0 并注入唤醒消息 + 确认消息', async () => {
 	const { rounds, enqueued, agent } = setup()
 
 	const notBound = await rounds.needReply({ openid: 'U2', sessionId: 'session-1', interactionId: 'I1' })
@@ -166,7 +166,8 @@ test('「我需要回复」：绑定不符=4、正在运行=2、成功=0 并注�
 
 	agent.status = 'running'
 	const busy = await rounds.needReply({ openid: 'U1', sessionId: 'session-1', interactionId: 'I2' })
-	assert.equal(busy.code, 2)
+	// 关键：不能是 2 —— 平台的码 2 语义是「操作太频繁」，客户端会直接弹这个词
+	assert.equal(busy.code, 1)
 	assert.equal(agent.followed.length, 0)
 
 	agent.status = 'idle'

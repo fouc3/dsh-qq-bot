@@ -456,7 +456,9 @@ test('端到端：点「我需要回复」→ 唤醒会话 + 回应互动 + 回�
 		const list = await pumpQueue(boot.socketPath)
 		return list.find((c) => c.kind === 'respond_interaction') ?? null
 	})
-	assert.equal(busy.args.code, 2)
+	// 运行中的点击必须回「失败(1)」：码 2 的平台语义是「操作太频繁」，
+	// 客户端会直接弹这个词（线上就是这么弹的）。
+	assert.equal(busy.args.code, 1)
 	assert.equal(agent.followed.length, before, '运行中不该再唤醒')
 
 	// 非绑定用户点按钮：code=4
