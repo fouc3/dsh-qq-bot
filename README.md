@@ -235,10 +235,16 @@ level=WARN msg="已丢弃非白名单用户的私聊" openid=2A3B4C… text_len=
 # Go 侧（含假 QQ 平台 + 真 UNIX socket 桩）
 go vet ./... && gofmt -l . && go test -race ./...
 
-# 插件侧：语法 + 70 项（含"装配级端到端"）
+# 插件侧：语法 + 130 项（含"装配级端到端"）
 node --check dsh-plugin/index.js dsh-plugin/lib/*.js
 node --test dsh-plugin/lib/*.test.js
 ```
+
+**重启窗口不丢消息**：网关把 QQ 事件投给 dsh 插件时做了**退避重试**
+（`internal/qq` 的 `emitWithRetry`：失败就 0.5s→1s→…→5s 退避，窗口 90s；取消即停），
+所以插件/网关重启那几十秒里到的用户消息不再被静默丢弃（线上踩过：`/新建会话 /tmp` 发在重启窗口里，
+网关只记了 `本地通道不可用` 就把它丢了）。`deploy/restart-and-verify.sh` 重启前还会先等
+发件箱清空（`outboxDepth=0`，最多 60 秒），避免把还没发出去的回复吞掉。
 
 `lib/plugin.test.js` 是**装配级端到端**：真的调用插件导出的 `apply()`，起真的 UNIX socket，
 以真实 NDJSON 帧走 `register / panel / event / outbox.poll / ack / health`，

@@ -337,7 +337,8 @@ func logDrop(log *slog.Logger, msg string, d Decision) {
 // RegisterHandlers 登记单聊消息、按钮互动与就绪事件。
 //
 // 处理器只做三件事：解码、按 Decision 处置、交给 emit。
-// **绝不在这里等待 dsh 插件**：QQ 的事件分发是并发的，等插件会把投递拖慢。
+// **不在这里等 dsh 插件**（QQ 的事件分发是并发的，等插件会把投递拖慢）——
+// 唯一的例外是 emitWithRetry 的退避重试，它只在通道短暂不可用时占住本事件的 goroutine。
 func RegisterHandlers(reg Registrar, client *Client, allowed func(string) bool, emit Emitter, log *slog.Logger) []*qqbotsdk.Registration {
 	if log == nil {
 		log = slog.Default()
@@ -357,7 +358,7 @@ func RegisterHandlers(reg Registrar, client *Client, allowed func(string) bool, 
 			logDrop(log, "丢弃私聊消息（不在白名单）", d)
 			return nil
 		}
-		return emit(ctx, d.Event)
+		return emitWithRetry(ctx, emit, d.Event, log)
 	}
 
 	onInteraction := func(ctx context.Context, e *qqbotsdk.Event) error {
@@ -379,18 +380,67 @@ func RegisterHandlers(reg Registrar, client *Client, allowed func(string) bool, 
 			logDrop(log, "丢弃按钮互动", d)
 			return nil
 		}
-		return emit(ctx, d.Event)
+		return emitWithRetry(ctx, emit, d.Event, log)
 	}
 
 	onReady := func(ctx context.Context, e *qqbotsdk.Event) error {
 		log.Info("QQ 长连接就绪")
-		return emit(ctx, Event{Kind: KindReady, At: nowRFC3339()})
+		return emitWithRetry(ctx, emit, Event{Kind: KindReady, At: nowRFC3339()}, log)
 	}
 
 	return []*qqbotsdk.Registration{
 		reg.RegisterFunc(qqbotsdk.EventC2CMessageCreate, onC2C),
 		reg.RegisterFunc(qqbotsdk.EventInteractionCreate, onInteraction),
 		reg.RegisterFunc(qqbotsdk.EventReady, onReady),
+	}
+}
+
+// 投递重试参数（测试里会调小）。
+//
+// 为什么要重试：网关或 dsh 插件重启时 socket 会短暂消失（实测：02:44:16 通道 EOF，
+// 02:44:25 才回来）。以前 emit 失败就把事件直接丢掉，用户消息**静默消失**——
+// 线上踩过：重启窗口里发的 `/新建会话 /tmp` 就这么没了，用户只看到"没反应"。
+// 现在退避重试，直到通道回来或超出窗口；QQ 的事件分发是并发的，等待只占住本事件的 goroutine。
+var (
+	emitRetryWindow = 90 * time.Second
+	emitRetryBase   = 500 * time.Millisecond
+	emitRetryCap    = 5 * time.Second
+)
+
+// emitWithRetry 把事件投给 dsh 插件；失败就退避重试，直到成功或超出窗口。
+func emitWithRetry(ctx context.Context, emit Emitter, ev Event, log *slog.Logger) error {
+	if emit == nil {
+		return fmt.Errorf("投递失败：emit 未配置")
+	}
+	deadline := time.Now().Add(emitRetryWindow)
+	delay := emitRetryBase
+	for {
+		err := emit(ctx, ev)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("投递失败（重试 %s 后放弃）：%w", emitRetryWindow, err)
+		}
+		if log != nil {
+			log.Warn("投递 dsh 插件失败，稍后重试", "err", err, "delay", delay.String(), "kind", ev.Kind)
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		}
+		if delay < emitRetryCap {
+			delay *= 2
+			if delay > emitRetryCap {
+				delay = emitRetryCap
+			}
+		}
 	}
 }
 

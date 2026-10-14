@@ -150,13 +150,21 @@ bot 收到后按 `remark` 找到已有面板 → 更新；找不到 → 创建�
 - `ok:false` 的 ack **不消费命令**：命令会再次下发（用于"这次确实没发出去，稍后重试"）。
 - 命令在 `ack ok:true` 后从队列移除；`recall_c2c` 与 `respond_interaction` 不重投（失败只记日志）。
 
+**反向（QQ → plugin）也有一层重试**：bot 把 QQ 事件（`event` / `ready`）投给 plugin 时，
+若本地通道暂时不可用（plugin/gateway 正在重启，socket 短暂不存在），不会直接丢弃，
+而是**退避重试**（0.5s→1s→2s→…→5s，窗口 90 秒；上下文取消即停），
+直到通道回来或超窗口后记为错误。以前这里一失败就把事件丢掉，
+用户在重启窗口里发的消息会**静默消失**（线上踩过：`/新建会话 /tmp`）。
+
 ## 6. 交互与文案约定（plugin 侧生成，bot 侧不理解语义）
 
 | 场景 | 内容 |
 |---|---|
 | AI 回复 | 正文以 `【{标题}({sessionId})】` 开头（模板可配） |
-| 一轮结束通知 | `{标题}({sessionId})已结束` + 键盘：单行单按钮，label = `我需要回复`，`action.type=1`，`action.data="qqb:needreply:<sessionId>"` |
-| 会话选择卡片 | 文件夹按钮 `action.type=1`、`data="qqb:dir:<路径>"`；会话按钮 `action.type=2`（指令按钮，只把 `切换会话 <sessionId>` 填进输入框） |
-| 提问卡片 | 选项 `data="qqq:<callId>:<题序>:<选项序>"`、其他 `…:custom`、提交 `…:submit` |
+| 一轮结束通知 | `{标题}({sessionId})已结束` + 键盘单行两按钮：「我需要回复」`action.type=1`、`data="qqb:needreply:<sessionId>"`；「发送消息」`action.type=2`（指令按钮，只把 `发送 <sessionId>` 填进输入框） |
+| 权限卡片 | 每档一个回调按钮，`data="qqb:perm:<预设key>"`（如 `danger-full-access`）；每行 2 个、放不下自动加宽；当前档 `style=1`（蓝）、其余 `style=0`（灰） |
+| 会话选择卡片 | 文件夹按钮 `action.type=1`、`data="qqb:dir:<路径>"`；会话按钮 `action.type=2`（指令按钮，只把 `切换会话 <sessionId>` 填进输入框）。新建会话卡片另有 `qqb:mkdir:`（新建目录，等名字）、`qqb:mkx:`（取消等名字）、`qqb:rmdir:` / `qqb:rmdir2:`（删除空目录的两步确认） |
+| 提问卡片 | 选项 `data="qqq:<callId>:<题序>:<选项序>"`、其他 `…:custom`、提交 `…:submit`；选中 `style=1`、未选中 `style=0` |
+| 按钮配色 | 主操作＝蓝 `1`、次要/退出＝灰 `0`、破坏性＝红 `3`；**不用 `4`**（SDK 名为"蓝色填充"，线上客户端实际渲染成白色，曾导致"取消蓝、发送白"被点错） |
 
 bot 对 `buttonData` 只做一件事：原样塞进 `event` 帧（`data.Data.Resolved.ButtonData`）。

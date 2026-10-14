@@ -5,6 +5,11 @@
 # 仍会拿到旧模块实例；只有宿主进程重启才会重新导入。重启后本脚本会等通道
 # 重新出现，再把网关拉起来（网关此前可能因为止血被停掉）。
 #
+# 两个"别丢东西"的保险：
+#   1) 重启前先等网关把发件箱清空（outboxDepth=0）——别把还没发出去的回复吞掉；
+#   2) 网关侧的事件投递已做退避重试（internal/qq 的 emitWithRetry），
+#      重启窗口里到的用户消息**不会像以前那样被静默丢掉**（踩过：`/新建会话 /tmp`）。
+#
 # 用法：deploy/restart-and-verify.sh [日志文件]
 set -u -o pipefail
 
@@ -13,7 +18,37 @@ export SOCKET="$HOME/.dsh/dsh-qq-bot/bridge.sock"
 
 log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >>"$LOG"; }
 
+# 读一次通道 health 的 outboxDepth（读不到就打印空）。
+probe_depth() {
+	node --input-type=module -e "
+import { connect } from 'node:net'
+const call = (op) => new Promise((res, rej) => {
+	const s = connect(process.env.SOCKET)
+	let buf = ''
+	s.on('connect', () => s.write(JSON.stringify({ id: op, op }) + '\n'))
+	s.on('data', (c) => { buf += c; const i = buf.indexOf('\n'); if (i >= 0) { s.destroy(); res(JSON.parse(buf.slice(0, i))) } })
+	s.on('error', rej)
+	setTimeout(() => { s.destroy(); rej(new Error('超时')) }, 3000)
+})
+try { const h = await call('health'); console.log(h?.value?.outboxDepth ?? '') } catch { console.log('') }
+" 2>/dev/null
+}
+
 : >"$LOG"
+
+# 等发件箱清空：最多 60 秒；等不到也继续（网关侧还有重试兜底）。
+depth=""
+for _ in $(seq 1 60); do
+	depth="$(probe_depth)"
+	if [ "$depth" = "0" ] || [ -z "$depth" ]; then break; fi
+	sleep 1
+done
+if [ -n "$depth" ] && [ "$depth" != "0" ]; then
+	log "!! 发件箱仍有 $depth 条未送达，仍然继续重启"
+else
+	log "发件箱已清空（outboxDepth=${depth:-unknown}），开始重启"
+fi
+
 log "=== 重启开始（dsh-web → 等通道 → dsh-qq-bot）==="
 
 systemctl --user restart dsh-web

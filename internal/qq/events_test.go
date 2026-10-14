@@ -2,8 +2,10 @@ package qq
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	qqbotsdk "github.com/fouc3/qq-bot-sdk"
 )
@@ -430,5 +432,64 @@ func TestRecallSurfacesTimeout(t *testing.T) {
 	}
 	if err := client.Recall(context.Background(), "", ""); err == nil {
 		t.Error("缺少参数应当报错")
+	}
+}
+
+// 通道短暂不可用时（网关/插件重启窗口）不能把用户消息丢掉：
+// 先失败几次、通道回来后必须投出去；窗口过完才允许放弃。
+func TestEmitWithRetryKeepsEventThroughRestartWindow(t *testing.T) {
+	oldWindow, oldBase, oldCap := emitRetryWindow, emitRetryBase, emitRetryCap
+	t.Cleanup(func() { emitRetryWindow, emitRetryBase, emitRetryCap = oldWindow, oldBase, oldCap })
+	emitRetryWindow, emitRetryBase, emitRetryCap = 500*time.Millisecond, time.Millisecond, 5*time.Millisecond
+
+	calls := 0
+	emit := func(context.Context, Event) error {
+		calls++
+		if calls < 3 {
+			return errors.New("本地通道不可用（bridge.sock）：no such file or directory")
+		}
+		return nil
+	}
+	ev := Event{Kind: KindC2CMessage, OpenID: "U1", Text: "重启窗口里发的消息"}
+	if err := emitWithRetry(context.Background(), emit, ev, nil); err != nil {
+		t.Fatalf("通道恢复后应投递成功，却返回 %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("应当在第 3 次成功，实际调用 %d 次", calls)
+	}
+}
+
+func TestEmitWithRetryGivesUpAfterWindow(t *testing.T) {
+	oldWindow, oldBase, oldCap := emitRetryWindow, emitRetryBase, emitRetryCap
+	t.Cleanup(func() { emitRetryWindow, emitRetryBase, emitRetryCap = oldWindow, oldBase, oldCap })
+	emitRetryWindow, emitRetryBase, emitRetryCap = 20*time.Millisecond, time.Millisecond, 5*time.Millisecond
+
+	calls := 0
+	emit := func(context.Context, Event) error {
+		calls++
+		return errors.New("本地通道不可用")
+	}
+	err := emitWithRetry(context.Background(), emit, Event{Kind: KindC2CMessage}, nil)
+	if err == nil {
+		t.Fatal("超窗口后必须如实报错")
+	}
+	if !strings.Contains(err.Error(), "重试") || !strings.Contains(err.Error(), "本地通道不可用") {
+		t.Fatalf("错误里要能看出是重试后放弃：%v", err)
+	}
+	if calls < 2 {
+		t.Fatalf("应当重试过，实际调用 %d 次", calls)
+	}
+}
+
+func TestEmitWithRetryStopsOnCancel(t *testing.T) {
+	oldWindow, oldBase, oldCap := emitRetryWindow, emitRetryBase, emitRetryCap
+	t.Cleanup(func() { emitRetryWindow, emitRetryBase, emitRetryCap = oldWindow, oldBase, oldCap })
+	emitRetryWindow, emitRetryBase, emitRetryCap = time.Minute, time.Hour, time.Hour
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := emitWithRetry(ctx, func(context.Context, Event) error { return errors.New("通道不可用") }, Event{Kind: KindC2CMessage}, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("取消后应立刻返回 context.Canceled，实际 %v", err)
 	}
 }
