@@ -56,6 +56,8 @@ export function createRounds({
 			// 记账失败绝不影响主流程
 		}
 	}
+	/** 收到过几个会话事件：只在小日志里留前几条，作为"事件到底来没来"的证据。 */
+	let observedEvents = 0
 
 	function currentRound(sessionId) {
 		return rounds.get(sessionId) ?? null
@@ -91,7 +93,51 @@ export function createRounds({
 			startedAt: Date.now(),
 		}
 		rounds.set(sessionId, round)
+		journal(`轮次开始：${sessionId.slice(-8)} origin=${origin} openid=${openid ? '有' : '无'}`)
 		return round
+	}
+
+	/**
+	 * 兜底：等 agent 真的空下来，再从**会话日志**里读这一轮的结束原因并收尾。
+	 *
+	 * 为什么还要这一条：线上踩过"完成通知不发了"——`session/event` 监听在某些情况下
+	 * 收不到（agent 实例被换、或事件派发范围变了），而 `turn/end` 是"已结束"通知的
+	 * 唯一依据。`agent.whenIdle()` 是 Agent 的一等 API、不依赖事件订阅；结合
+	 * `agent.session.events`（durable log，里面有 turn/end 与它的 reason），
+	 * 即使事件监听全聋，也能得出正确的"已结束 / 被打断"。
+	 *
+	 * 与事件路径幂等：先到的那个收尾，后到的看到 `round.ended` 直接返回。
+	 */
+	function watchIdle(agent, sessionId) {
+		if (!agent || typeof agent.whenIdle !== 'function') return
+		const round = currentRound(sessionId)
+		if (!round) return
+		Promise.resolve(agent.whenIdle()).then(
+			() => {
+				const latest = currentRound(sessionId)
+				if (!latest || latest.ended || latest !== round) return
+				const reason = lastTurnEndReason(agent)
+				journal(`whenIdle 兜底收尾：没等到 turn/end（reason=${reason ?? '未知'}，${sessionId.slice(-8)}）`)
+				void finishRound(sessionId, { reason: reason ?? 'unknown', turn: round.turn ?? undefined, from: 'whenIdle' })
+			},
+			() => {
+				// whenIdle 被取消/抛错：什么都不做，交给事件路径或下一次投递
+			},
+		)
+	}
+
+	/** 从会话日志里读最后一条 `turn/end` 的 reason（读不到返回 null）。 */
+	function lastTurnEndReason(agent) {
+		try {
+			const events = agent?.session?.events ?? []
+			for (let i = events.length - 1; i >= 0; i -= 1) {
+				const event = events[i]
+				if (event?.type === 'turn/end') return event.data?.reason?.kind ?? null
+			}
+		} catch {
+			// 读日志失败：当作未知原因
+		}
+		return null
 	}
 
 	/**
@@ -222,6 +268,8 @@ export function createRounds({
 			if (typeof round.fallbackTimer.unref === 'function') round.fallbackTimer.unref()
 		})
 
+		journal(`轮次监听已注册：${sessionId.slice(-8)}（agent 作用域）`)
+
 		return () => {
 			for (const dispose of disposers) {
 				try {
@@ -248,6 +296,12 @@ export function createRounds({
 	 * @param {string} from 'agent'（agent 作用域监听）或 'root'（插件根作用域监听）
 	 */
 	function observe(sessionId, event, from = 'agent') {
+		if (observedEvents < 8) {
+			observedEvents += 1
+			journal(
+				`收到会话事件：type=${event?.type ?? '?'}（via ${from}，本桥${currentRound(sessionId) ? '有' : '无'}该轮次，${sessionId.slice(-8)}）`,
+			)
+		}
 		const round = currentRound(sessionId)
 		if (!round) return
 		switch (event?.type) {
@@ -390,6 +444,7 @@ export function createRounds({
 		needReply,
 		finishRound,
 		observe,
+		watchIdle,
 		currentContext,
 		nextSeq,
 		pendingInjectText,

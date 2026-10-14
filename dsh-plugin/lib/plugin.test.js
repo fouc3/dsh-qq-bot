@@ -13,7 +13,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { apply, name as pluginName, inject as pluginInject } from '../index.js'
+import { apply, name as pluginName, inject as pluginInject, HUMAN_SOURCE, PLUGIN_SOURCE } from '../index.js'
 import { clipLabel, data as cardData, parseCallback } from './cards.js'
 import { REPLY_TOOL_NAME } from './reply-tool.js'
 import { ATTACHMENT_TOOL_NAME } from './attachment-tool.js'
@@ -23,6 +23,10 @@ import { ATTACHMENT_TOOL_NAME } from './attachment-tool.js'
 function makeAgent(sessionId) {
 	const handlers = {}
 	const tools = []
+	let idleResolve = null
+	let idlePromise = new Promise((resolve) => {
+		idleResolve = resolve
+	})
 	const agent = {
 		id: sessionId,
 		status: 'idle',
@@ -30,6 +34,20 @@ function makeAgent(sessionId) {
 		cancelled: 0,
 		handlers,
 		tools,
+		// 会话日志：兜底收尾（whenIdle + turn/end 的 reason）会读这里
+		session: { id: sessionId, events: [] },
+		/** 让 whenIdle() 结算：测试里手动模拟"这一轮真的结束了"。 */
+		settleIdle(reason = 'completed', turn = 1) {
+			agent.session.events.push({ type: 'turn/end', seq: agent.session.events.length + 1, data: { turn, reason: { kind: reason } } })
+			const done = idleResolve
+			idlePromise = new Promise((resolve) => {
+				idleResolve = resolve
+			})
+			done?.()
+		},
+		whenIdle() {
+			return idlePromise
+		},
 		ctx: {
 			on(event, handler) {
 				handlers[event] = handler
@@ -526,7 +544,10 @@ test('端到端：命令 → 会话卡片；绑定后普通消息进会话；一
 	await waitFor(() => agent.followed.length === 1)
 	assert.equal(agent.followed[0].role, 'user')
 	assert.equal(agent.followed[0].content[0].text, '帮我看看这个')
-	assert.equal(agent.followed[0].source.kind, 'dsh-qq-bot')
+	// 用户本人在 QQ 里打的字 → 标成**人类输入**（dsh 里 create_goal / update_goal resume
+	// 这类"只认人类直接输入"的动作靠的就是这个 kind；插件只是那根线，不该把授权吞掉）。
+	assert.equal(agent.followed[0].source.kind, 'user')
+	assert.equal(HUMAN_SOURCE.kind, 'user')
 	assert.ok(agent.followed[0].id, '消息必须带 id')
 	assert.ok(Object.isFrozen(agent.followed[0]), '交给框架的消息必须是不可变快照')
 
@@ -660,6 +681,48 @@ test('端到端：agent 实例被换掉后要重挂监听（否则「已结束�
 	boot.dispose()
 })
 
+test('端到端：事件监听全聋时，whenIdle + 会话日志也能给出正确的「已结束 / 被打断」', async (t) => {
+	const agent = makeAgent('session-1')
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': agent } })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M0' })
+	await drainFor(boot.socketPath, 60)
+
+	// 第一轮：**完全不喂 session/event**，只让 whenIdle 结算，日志里写着 completed
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '第一条', msgId: 'M1' })
+	await waitFor(() => agent.followed.length === 1)
+	agent.settleIdle('completed', 3)
+	const finished = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /已结束/.test(String(c.args.content))) ?? null
+	})
+	assert.equal(finished.args.content, 'proj-a(session-1)已结束', '按日志里的 reason=completed 判定为正常结束')
+	assert.match(String(finished.args.keyboard.content.rows[0].buttons[0].render_data.label), /我需要回复/)
+
+	// 第二轮：日志里写着 aborted → 必须是「被打断」
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '第二条', msgId: 'M2' })
+	await waitFor(() => agent.followed.length === 2)
+	agent.settleIdle('aborted', 4)
+	const interrupted = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /被打断/.test(String(c.args.content))) ?? null
+	})
+	assert.equal(interrupted.args.content, 'proj-a(session-1)被打断')
+
+	// 小日志里要能看到走的是兜底路径
+	await waitFor(() => {
+		try {
+			const notes = JSON.parse(readFileSync(boot.stateFile, 'utf8')).notes ?? []
+			return notes.some((line) => /whenIdle 兜底收尾/.test(line))
+		} catch {
+			return false
+		}
+	})
+
+	boot.dispose()
+})
+
 test('端到端：点「我需要回复」→ 唤醒会话 + 回应互动 + 回确认；运行中则拒绝', async (t) => {
 	const agent = makeAgent('session-1')
 	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': agent } })
@@ -678,6 +741,9 @@ test('端到端：点「我需要回复」→ 唤醒会话 + 回应互动 + 回�
 	})
 	await waitFor(() => agent.followed.length === 1)
 	assert.match(agent.followed[0].content[0].text, /我需要回复/)
+	// 「我需要回复」的唤醒文本是**插件自己写的**：保持插件来源，不冒充用户授权
+	// （所以这种轮次里 create_goal / update_goal resume 仍会被 dsh 拒绝——那是对的）
+	assert.equal(agent.followed[0].source.kind, PLUGIN_SOURCE.kind)
 
 	const commands = await waitFor(async () => {
 		const list = await pumpQueue(boot.socketPath)
@@ -1576,7 +1642,8 @@ test('端到端：`权限` 发卡片（每行两个）／带参数直接设定�
 	})
 	const switched = afterSwitch.find((c) => /权限切成/.test(String(c.args.content)))
 	assert.match(String(switched.args.content), /完全权限/)
-	assert.deepEqual(boot.ctx.permissionPresets.setCalls, [{ sessionId: undefined, value: 'danger-full-access' }])
+	// 假 agent 现在带 `session`（会话日志，兜底收尾要用），所以这里能拿到真的 session.id
+	assert.deepEqual(boot.ctx.permissionPresets.setCalls, [{ sessionId: 'session-1', value: 'danger-full-access' }])
 	// 回执与重发的卡片在同一次 drain 里（别分两次取，否则第二条会被前一次消费掉）
 	const resent = afterSwitch.filter((c) => c.kind === 'send_c2c' && c.args.keyboard).at(-1)
 	assert.ok(resent, '切换后要重发权限卡片（标出新的"当前"）')

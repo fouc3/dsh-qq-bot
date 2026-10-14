@@ -108,6 +108,26 @@ function makeUserMessage(text, source, images = [], sections = []) {
 	})
 }
 
+/**
+ * 「用户本人的话」的来源标记：`{ kind: 'user' }`。
+ *
+ * 为什么不能标成插件自己的 kind：dsh 里有一批动作**只认人类输入**
+ * （`@deepseek-ai/dsh-tool-goal` 的 `hasDirectHumanInput`：当前轮里必须有一条
+ * `user/message` 且 `source.kind === 'user'`，否则 `create_goal` /
+ * `update_goal edit|pause|resume` 直接拒绝："this goal operation requires a direct
+ * human turn on a top-level agent"）。QQ 里打字的**就是用户本人**，插件只是那根线，
+ * 所以这里如实标记为人类输入 —— 用户在 QQ 里说"继续/恢复目标"时才真的能恢复目标。
+ * （dsh 自己的注释也是这么约定的：`followup()` 不带 source 就会解析成 `user`，
+ * "非人类来源必须自己标明"，我们标明的是"这条确实是人类的原话"。）
+ *
+ * 反过来，插件自己写的话（每轮上下文注入、「我需要回复」的唤醒文本）**不**用这个标记，
+ * 免得冒充用户授权。
+ */
+export const HUMAN_SOURCE = { kind: 'user' }
+
+/** 插件自己写的消息（上下文注入、唤醒文本）的来源标记。 */
+export const PLUGIN_SOURCE = { kind: 'dsh-qq-bot' }
+
 function expandHome(path) {
 	if (typeof path !== 'string' || !path) return path
 	if (path === '~') return process.env.HOME ?? path
@@ -709,7 +729,13 @@ export function apply(ctx, rawConfig) {
 		}
 		// 附件清单/语音转写与正文**同一条消息**（各自一个块）：
 		// followup 的语义是"独占一轮"，分两条发会让正文卡在待发送里（踩过）。
-		agent.followup(makeUserMessage(text, { kind: 'dsh-qq-bot' }, images, sections))
+		// source：这是**用户本人在 QQ 里打的字**，标成人类输入（见 HUMAN_SOURCE 的说明），
+		// 这样 dsh 里那些"只认人类直接输入"的动作（例如 create_goal / update_goal resume）
+		// 在 QQ 触发的轮次里也能用。
+		agent.followup(makeUserMessage(text, HUMAN_SOURCE, images, sections))
+		// 兜底收尾：事件路径（session/event 的 turn/end）在某些情况下收不到，
+		// 就用 Agent 的一等 API whenIdle + 会话日志里的 reason 收尾（见 rounds.watchIdle）。
+		rounds.watchIdle(agent, sessionId)
 		return { ok: true }
 	}
 
@@ -898,10 +924,12 @@ export function apply(ctx, rawConfig) {
 		logger,
 		// 关键判断写进状态文件的小日志（插件日志进不了 journald，线上只能这样看）。
 		note: (text) => state.note(text),
-		userMessage: (text) => makeUserMessage(text, { kind: 'dsh-qq-bot' }),
+		// 「我需要回复」的唤醒文本 / 每轮上下文注入：**插件自己写的话**，用插件来源，
+		// 不冒充用户授权（所以这一类轮次里 goal 操作仍会被 dsh 拒绝 —— 那是对的）。
+		userMessage: (text) => makeUserMessage(text, PLUGIN_SOURCE),
 		contextMessage: (text) =>
 			makeUserMessage(text, {
-				kind: 'dsh-qq-bot',
+				...PLUGIN_SOURCE,
 				form: 'snapshot',
 				sections: [{ name: 'dsh-qq-bot', text: String(text) }],
 			}),
