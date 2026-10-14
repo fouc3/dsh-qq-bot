@@ -725,57 +725,6 @@ export function apply(ctx, rawConfig) {
 		},
 	})
 
-	/**
-	 * 修工作区用的工具：把一个已存在的目录注册成 dsh 工作区。
-	 *
-	 * 为什么需要：dsh Web 侧栏**按工作区分组**，没注册的目录在浏览器里看不到
-	 * （会话会落到「未分类」）。正常路径已经在建目录/建会话时自动注册了，
-	 * 这个工具是给"历史遗留"和"外部建的目录"补票用。
-	 */
-	function buildWorkspaceTool() {
-		return {
-			name: 'qq_register_workspace',
-			description:
-				'把一个目录注册成 dsh 工作区，让 dsh Web 侧栏显示它（未注册的目录在浏览器里看不到，它的会话会落在「未分类」）。重复调用不会重复注册。',
-			parameters: {
-				type: 'object',
-				properties: {
-					path: { type: 'string', description: '目录的绝对路径。' },
-					sessionId: { type: 'string', description: '可选：一并把这个会话挂到该工作区上。' },
-				},
-				required: ['path'],
-				additionalProperties: false,
-			},
-			output: {
-				schema: {
-					type: 'object',
-					properties: {
-						ok: { type: 'boolean' },
-						path: { type: 'string' },
-						workspaceId: { type: 'string' },
-						error: { type: 'string' },
-					},
-					required: ['ok', 'path'],
-					additionalProperties: false,
-				},
-				render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
-			},
-			async execute(args) {
-				const raw = typeof args?.path === 'string' ? args.path.trim() : ''
-				if (!raw) return { ok: false, path: '', error: 'path 不能为空' }
-				const path = expandHome(raw)
-				const sessionId = typeof args?.sessionId === 'string' && args.sessionId.trim() ? args.sessionId.trim() : ''
-				const result = await ensureWorkspaceFor({ path, sessionId, force: true })
-				return {
-					ok: Boolean(result.ok),
-					path: result.path ?? path,
-					workspaceId: result.workspaceId ?? '',
-					...(result.error ? { error: result.error } : {}),
-				}
-			},
-		}
-	}
-
 	// ── 每个"被 QQ 绑定"的 agent：注册 qq_reply 工具 + 轮次监听 ──────────────
 	const attached = new Set()
 	function ensureAgentSetup(agent, sessionId) {
@@ -799,17 +748,10 @@ export function apply(ctx, rawConfig) {
 				const toolDisposer = agent.ctx.tools.register(buildReplyTool({ outbox, config, logger, target }))
 				// 没自动下载的附件（过大/下载失败）：让模型按需拉一份只读副本。
 				const attachDisposer = agent.ctx.tools.register(buildAttachmentTool({ inbox, logger, target }))
-				// 修工作区用：QQ 建出来的目录/会话没注册成工作区时，Web 侧栏看不到它。
-				const workspaceDisposer = agent.ctx.tools.register(buildWorkspaceTool())
 				const roundsDisposer = rounds.attachAgent(agent, sessionId)
 				return () => {
 					try {
 						toolDisposer?.()
-					} catch {
-						// 忽略
-					}
-					try {
-						workspaceDisposer?.()
 					} catch {
 						// 忽略
 					}
