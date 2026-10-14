@@ -45,8 +45,17 @@ export function createRounds({
 	onPlan,
 	sendCommand,
 	nextSeqFor,
+	// 可选：把关键判断记进状态文件（插件日志进不了 journald，线上只有这个出口）。
+	note,
 }) {
 	const rounds = new Map()
+	const journal = (text) => {
+		try {
+			note?.(text)
+		} catch {
+			// 记账失败绝不影响主流程
+		}
+	}
 
 	function currentRound(sessionId) {
 		return rounds.get(sessionId) ?? null
@@ -98,9 +107,15 @@ export function createRounds({
 
 	/** 发一条结束/被打断通知（按 会话+轮次 去重）。 */
 	function enqueueNotice(round, { interrupted = false, source = '' } = {}) {
-		if (!round || round.origin !== 'qq' || !round.openid) return
+		if (!round || round.origin !== 'qq' || !round.openid) {
+			journal(`通知跳过：来源不是 QQ 或没 openid（${round?.sessionId ?? '?'}）`)
+			return
+		}
 		const key = `${round.sessionId}:${round.turn ?? round.startedAt}`
-		if (state.noticeSeen(key)) return
+		if (state.noticeSeen(key)) {
+			journal(`通知跳过：这个轮次已发过（${key.slice(-12)}）`)
+			return
+		}
 		const card = buildNoticeCard({
 			label: sessions.label(round.sessionId),
 			sessionId: round.sessionId,
@@ -118,6 +133,7 @@ export function createRounds({
 			msgSeq: nextSeq(round.sessionId),
 		})
 		state.markNotice(key)
+		journal(`通知已入队：${interrupted ? '被打断' : '已结束'} turn=${round.turn ?? '?'}（${key.slice(-12)}）`)
 		logger?.info?.(interrupted ? '已发被打断通知' : '已发结束通知', {
 			sessionId: round.sessionId,
 			hasSource: Boolean(source),
@@ -188,7 +204,7 @@ export function createRounds({
 			true,
 		)
 
-		on('session/event', (session, event) => onSessionEvent(sessionId, event))
+		on('session/event', (session, event) => observe(sessionId, event, 'agent'))
 		on('agent/status', ({ status }) => {
 			if (status !== 'idle') return
 			const round = currentRound(sessionId)
@@ -199,6 +215,7 @@ export function createRounds({
 			round.fallbackTimer = setTimeout(() => {
 				const latest = currentRound(sessionId)
 				if (!latest || latest.ended || latest !== round) return
+				journal(`兜底收尾：agent 已 idle 但没收到 turn/end（${sessionId.slice(-8)}）`)
 				logger?.warn?.('未收到 turn/end，按兜底路径收尾', { sessionId })
 				void finishRound(sessionId, { reason: 'unknown' })
 			}, delay)
@@ -216,13 +233,30 @@ export function createRounds({
 		}
 	}
 
-	function onSessionEvent(sessionId, event) {
+	/**
+	 * 观察一个会话事件（**同一个实现**给两条注册路径用）。
+	 *
+	 * 为什么要两条路径：线上出现过"完成通知不发了、只剩被打断通知"——后者由插件侧
+	 * （beginRound 顶替 / markStopped）直接发，不需要事件；而"已结束"必须拿到 dsh 的
+	 * `turn/end`。所以怀疑 agent 作用域上的 `session/event` 监听在某些情况下收不到事件
+	 * （agent 实例被换掉，或 dsh 0.2 的事件派发只发给"会话范围内"的观察者）。
+	 * 现在 agent 作用域 + 插件根作用域都注册，谁先到谁生效（认领/收尾都是幂等的），
+	 * 并把这些判断记进状态文件的小日志里，下次一看就知道是哪条路在用。
+	 *
+	 * @param {string} sessionId
+	 * @param {object} event
+	 * @param {string} from 'agent'（agent 作用域监听）或 'root'（插件根作用域监听）
+	 */
+	function observe(sessionId, event, from = 'agent') {
 		const round = currentRound(sessionId)
 		if (!round) return
 		switch (event?.type) {
 			case 'turn/start':
 				// 认领这一轮：只有认领到的轮次才归本轮结算。
-				if (round.turn === null || round.turn === undefined) round.turn = event.data?.turn ?? null
+				if (round.turn === null || round.turn === undefined) {
+					round.turn = event.data?.turn ?? null
+					journal(`认领轮次 turn=${round.turn}（via ${from}，${sessionId.slice(-8)}）`)
+				}
 				break
 			case 'tool/call':
 				if (event.data?.name === REPLY_TOOL_NAME) round.replied = true
@@ -237,14 +271,16 @@ export function createRounds({
 				const turn = event.data?.turn
 				if (round.turn === null || round.turn === undefined) {
 					// 还没认领任何轮次：这多半是我们刚打断的那一轮在收尾（被顶替的轮不发通知）
+					journal(`忽略 turn/end：还没认领过轮次（turn=${turn} via ${from}，${sessionId.slice(-8)}）`)
 					logger?.debug?.('忽略尚未认领的 turn/end', { sessionId, turn })
 					return
 				}
 				if (turn !== round.turn) {
+					journal(`忽略 turn/end：轮次不匹配（turn=${turn} 当前=${round.turn} via ${from}）`)
 					logger?.debug?.('忽略其它轮次的 turn/end', { sessionId, turn, current: round.turn })
 					return
 				}
-				void finishRound(sessionId, { reason: event.data?.reason?.kind ?? 'unknown', turn })
+				void finishRound(sessionId, { reason: event.data?.reason?.kind ?? 'unknown', turn, from })
 				break
 			}
 			default:
@@ -253,7 +289,7 @@ export function createRounds({
 	}
 
 	/** 收尾：发结束通知（必要时）+ 投递延迟消息（仅正常结束）。 */
-	async function finishRound(sessionId, { reason, turn } = {}) {
+	async function finishRound(sessionId, { reason, turn, from = '' } = {}) {
 		const round = currentRound(sessionId)
 		if (!round || round.ended) return
 		round.ended = true
@@ -263,9 +299,16 @@ export function createRounds({
 			round.fallbackTimer = null
 		}
 
+		journal(
+			`收尾：turn=${round.turn ?? '?'} reason=${reason}${from ? ` via ${from}` : ''} ` +
+				`origin=${round.origin} superseded=${round.superseded} stopped=${round.stopped} openid=${round.openid ? '有' : '无'}`,
+		)
+
 		if (round.origin === 'qq' && !round.superseded && !round.stopped && round.openid) {
 			// 只有 reason=completed 才是「正常结束」；aborted/blocked/error 都算被打断。
 			enqueueNotice(round, { interrupted: reason !== 'completed' })
+		} else {
+			journal('通知不发：轮次不是 QQ 来源／已被顶替／已被停止（按设计）')
 		}
 
 		// 延迟发送只在"AI 正常结束这一轮"时投递：被停止/被顶替/出错的轮不算。
@@ -346,6 +389,7 @@ export function createRounds({
 		attachAgent,
 		needReply,
 		finishRound,
+		observe,
 		currentContext,
 		nextSeq,
 		pendingInjectText,

@@ -79,9 +79,17 @@ function makeCtx({ sessionSummaries = [], live = {}, commands = null } = {}) {
 			events.set(event, list)
 			return () => {}
 		},
+		/** 测试侧触发根作用域事件（等价于 dsh 在会话作用域上 emit 后冒泡到这里）。 */
+		emit(event, ...args) {
+			for (const handler of events.get(event) ?? []) handler(...args)
+		},
 		agents: {
 			get: (id) => liveAgents.get(id),
 			list: () => [...liveAgents.values()],
+			/** 测试侧"换一个 agent 实例"（模拟 dsh 重新创建/接管同一个会话）。 */
+			adopt(agent) {
+				liveAgents.set(agent.id, agent)
+			},
 			async resume({ resumeSessionId }) {
 				const agent = liveAgents.get(resumeSessionId) ?? makeAgent(resumeSessionId)
 				liveAgents.set(resumeSessionId, agent)
@@ -569,6 +577,85 @@ test('端到端：命令 → 会话卡片；绑定后普通消息进会话；一
 	assert.equal(noticeButtons[1].render_data.label, '发送消息')
 	assert.equal(noticeButtons[1].action.type, 2)
 	assert.equal(noticeButtons[1].action.data, '发送 session-1')
+
+	boot.dispose()
+})
+
+test('端到端：agent 作用域收不到事件时，根作用域的 session/event 也能认领轮次并发出「已结束」', async (t) => {
+	const agent = makeAgent('session-1')
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': agent } })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M0' })
+	await drainFor(boot.socketPath, 60)
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '你好', msgId: 'M1' })
+	await waitFor(() => agent.followed.length === 1)
+
+	// 只在**根作用域**上喂事件（模拟 agent 实例被换掉 / dsh 只把事件派发给会话范围内的观察者）
+	boot.ctx.emit('session/event', { id: 'session-1' }, { type: 'turn/start', data: { turn: 5 } })
+	boot.ctx.emit('session/event', { id: 'session-1' }, { type: 'turn/end', data: { turn: 5, reason: { kind: 'completed' } } })
+
+	const notice = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /已结束/.test(String(c.args.content))) ?? null
+	})
+	assert.equal(notice.args.content, 'proj-a(session-1)已结束')
+
+	// 状态文件里的小日志要能看出"这轮是根作用域认领的、收尾成功"
+	await waitFor(() => {
+		try {
+			const notes = JSON.parse(readFileSync(boot.stateFile, 'utf8')).notes ?? []
+			return notes.some((line) => /认领轮次 turn=5（via root/.test(line))
+		} catch {
+			return false
+		}
+	})
+
+	// 其它会话的事件不该被本桥吞掉（只处理"正在跟踪的轮次"）
+	boot.ctx.emit('session/event', { id: 'session-other' }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+
+	boot.dispose()
+})
+
+test('端到端：agent 实例被换掉后要重挂监听（否则「已结束」通知永远发不出来）', async (t) => {
+	const first = makeAgent('session-1')
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': first } })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M0' })
+	await drainFor(boot.socketPath, 60)
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '第一条', msgId: 'M1' })
+	await waitFor(() => first.followed.length === 1)
+	assert.equal(typeof first.handlers['session/event'], 'function', '第一个实例挂上了监听')
+
+	// dsh 把同一个会话换成另一个 agent 实例（重新创建/接管），插件下一次投递时必须挂到新实例上
+	const second = makeAgent('session-1')
+	boot.ctx.agents.adopt(second)
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '第二条', msgId: 'M2' })
+	await waitFor(() => second.followed.length === 1)
+	assert.equal(
+		typeof second.handlers['session/event'],
+		'function',
+		'换实例后必须重挂 —— 老代码只按 sessionId 记"已挂过"，新实例上什么都没有',
+	)
+
+	// 新实例上的事件要能正常收尾发通知
+	second.handlers['session/event'](null, { type: 'turn/start', data: { turn: 9 } })
+	second.handlers['session/event'](null, { type: 'turn/end', data: { turn: 9, reason: { kind: 'completed' } } })
+	const notice = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /已结束/.test(String(c.args.content))) ?? null
+	})
+	assert.equal(notice.args.content, 'proj-a(session-1)已结束')
+
+	await waitFor(() => {
+		try {
+			const notes = JSON.parse(readFileSync(boot.stateFile, 'utf8')).notes ?? []
+			return notes.some((line) => /agent 实例换了，重挂监听/.test(line))
+		} catch {
+			return false
+		}
+	})
 
 	boot.dispose()
 })

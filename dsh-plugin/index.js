@@ -896,6 +896,8 @@ export function apply(ctx, rawConfig) {
 		outbox,
 		config,
 		logger,
+		// 关键判断写进状态文件的小日志（插件日志进不了 journald，线上只能这样看）。
+		note: (text) => state.note(text),
 		userMessage: (text) => makeUserMessage(text, { kind: 'dsh-qq-bot' }),
 		contextMessage: (text) =>
 			makeUserMessage(text, {
@@ -923,6 +925,27 @@ export function apply(ctx, rawConfig) {
 			})
 		},
 	})
+
+	/**
+	 * 兜底监听：插件根作用域也听一遍 `session/event`（只看本桥**正在跟踪**的会话）。
+	 *
+	 * 为什么需要：线上的病是"完成通知不发了、只剩被打断通知"——被打断那类是插件自己
+	 * （beginRound 顶替 / markStopped）直接发的，不需要事件；而"已结束"必须拿到 dsh 的
+	 * `turn/end`。agent 作用域上的监听在 agent 实例被换掉、或 dsh 的事件派发只发给
+	 * "会话范围内的观察者"时就收不到了，所以再加一条根作用域的路径。
+	 * 两条路都可能喂同一个事件：认领轮次 / 收尾都是幂等的，重复调用不会有副作用
+	 * （`observe` 只在还没认领时认领，`finishRound` 对已结束的轮次直接返回）。
+	 */
+	ctx.effect(
+		() =>
+			ctx.on('session/event', (session, event) => {
+				const sessionId = session?.id ?? session?.sessionId ?? (typeof session === 'string' ? session : '')
+				if (!sessionId) return
+				if (!rounds.roundOf(sessionId)) return
+				rounds.observe(sessionId, event, 'root')
+			}),
+		'dsh-qq-bot: session/event (root)',
+	)
 
 	const questions = createQuestionBridge({ state, outbox, config, logger, io })
 
@@ -976,10 +999,32 @@ export function apply(ctx, rawConfig) {
 	})
 
 	// ── 每个"被 QQ 绑定"的 agent：注册 qq_reply 工具 + 轮次监听 ──────────────
-	const attached = new Set()
+	const attached = new Map() // sessionId -> 已经挂过的 agent 实例（实例换了要重挂）
+	const agentIds = new WeakMap()
+	let agentSeq = 0
+	function agentTag(agent) {
+		if (!agent) return '?'
+		if (!agentIds.has(agent)) agentIds.set(agent, ++agentSeq)
+		return `#${agentIds.get(agent)}`
+	}
 	function ensureAgentSetup(agent, sessionId) {
-		if (!agent || attached.has(sessionId)) return
-		attached.add(sessionId)
+		if (!agent) return
+		const previous = attached.get(sessionId)
+		if (previous === agent) return
+		attached.set(sessionId, agent)
+		if (previous) {
+			// 线上问题：以前这里只按 sessionId 记"已挂过"，agent 实例被 dsh 换掉后
+			// 就不再挂新实例 —— `qq_reply`/轮次监听留在死实例上，于是**"已结束"通知
+			// 永远发不出来**（只有插件侧直接发的"被打断"还会发）。
+			state.note(`agent 实例换了，重挂监听：${sessionId}（${agentTag(previous)} → ${agentTag(agent)}）`)
+			logger.warn?.('agent 实例已更换，重新挂载工具与轮次监听', {
+				sessionId,
+				from: agentTag(previous),
+				to: agentTag(agent),
+			})
+		} else {
+			state.note(`首次挂载 agent 监听：${sessionId}（${agentTag(agent)}）`)
+		}
 		const target = {
 			sessionId,
 			openid: () => openidForSession(sessionId),

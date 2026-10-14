@@ -21,6 +21,10 @@ export const EMPTY_STATE = {
 	createdSessions: {}, // sessionId -> cwd（本桥建出来的会话：用来补登记工作区）
 	createdDirs: [], // 本桥建出来的目录（新建目录）：用来补登记工作区
 	sessionOwners: {}, // sessionId -> openid（最近一次从 QQ 跟这个会话说过话的人）
+	// 插件自己的"小日志"：最近 40 条关键决策（轮次认领/结束、通知入队或跳过、agent 挂载）。
+	// 为什么放状态里：**插件日志进不了 journald**（dsh-web 只把启动几行写进 journal），
+	// 线上排查"结束通知怎么不发了"这种问题，只有这里能看见插件当时是怎么判断的。
+	notes: [],
 }
 
 function normalize(raw) {
@@ -44,6 +48,7 @@ function normalize(raw) {
 		if (raw[key] && typeof raw[key] === 'object') base[key] = { ...raw[key] }
 	}
 	if (Array.isArray(raw.createdDirs)) base.createdDirs = raw.createdDirs.filter((item) => typeof item === 'string' && item)
+	if (Array.isArray(raw.notes)) base.notes = raw.notes.slice(-40)
 	if (raw.whitelist && typeof raw.whitelist === 'object' && Array.isArray(raw.whitelist.openids)) {
 		base.whitelist = { openids: raw.whitelist.openids.filter((v) => typeof v === 'string' && v) }
 	}
@@ -240,6 +245,21 @@ export function createState({ file, logger, seed, debounceMs = 200 } = {}) {
 			return this.update((s) => {
 				s.createdSessions[sessionId] = cwd
 			})
+		},
+		/**
+		 * 记一条"插件当时的判断"（有上限，最后 40 条）。
+		 *
+		 * 线上排查用：dsh 只把插件日志写在进程里，journald 里看不到，所以关键决策
+		 * （认领到哪一轮、为什么发/不发结束通知、agent 是不是换了实例）落到状态文件里。
+		 */
+		note(text) {
+			const entry = `${new Date().toISOString().slice(11, 19)} ${String(text).slice(0, 160)}`
+			return this.update((s) => {
+				s.notes = [...(s.notes ?? []), entry].slice(-40)
+			})
+		},
+		notes() {
+			return [...(data.notes ?? [])]
 		},
 		createdSessions() {
 			return { ...data.createdSessions }
