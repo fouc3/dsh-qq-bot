@@ -42,10 +42,18 @@ test('工具名与描述覆盖"完成时详细回复 / 过程中汇报 / md 开�
 	assert.match(tool.description, /过程中也可以随时调用/)
 	assert.match(tool.description, /markdown/)
 	assert.match(tool.description, /只在你被 QQ 消息拉起时使用/)
-	assert.ok(tool.parameters.content)
-	assert.ok(tool.parameters.markdown)
-	assert.ok(tool.parameters.attachments)
-	assert.ok(tool.output.schema)
+	// bundle 自包含：参数是注册表要的原始 JSON Schema（不是 dsh 的 DSL）
+	assert.equal(tool.parameters.type, 'object')
+	assert.ok(tool.parameters.properties.content)
+	assert.ok(tool.parameters.properties.markdown)
+	assert.ok(tool.parameters.properties.attachments)
+	assert.equal(tool.parameters.properties.attachments.items.properties.kind.type, 'string')
+	assert.deepEqual(tool.parameters.properties.attachments.items.required, ['kind'])
+	assert.equal(tool.parameters.additionalProperties, false)
+	assert.equal(tool.output.schema.type, 'object')
+	assert.deepEqual(tool.output.schema.required, ['ok'])
+	assert.equal(typeof tool.output.render, 'function')
+	assert.equal(typeof tool.execute, 'function')
 })
 
 test('正文回复：自动带上来源标注，并作为被动回复发出', async () => {

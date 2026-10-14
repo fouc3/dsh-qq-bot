@@ -8,10 +8,13 @@
  *
  * 为什么必须是同进程插件：dsh 没有本地 RPC socket，`/api` 需要浏览器 Cookie，
  * 而 acp/sdk/headless 都是另一个进程，碰不到这里活着的 Agent。
+ *
+ * 为什么**不 import 任何 dsh 包**：profile 里安装本地目录 bundle 是软链，
+ * Node 按 realpath 解析依赖，`/home/fouc3/Projects/...` 这条链上并没有
+ * `@deepseek-ai/*`（那是 dsh 安装目录与 `~/.dsh/profiles/node_modules` 提供的）。
+ * 所以本 bundle 自包含：工具定义用原始 JSON Schema，用户消息本地构造。
  */
-import z from '@deepseek-ai/schemastery'
-import { defineTool } from '@deepseek-ai/dsh-tools'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { randomUUID } from 'node:crypto'
 
 import { createState } from './lib/state.js'
 import { createSocketServer } from './lib/socket.js'
@@ -26,23 +29,25 @@ import { createCommandRunner, menuItems, panelItems, parseCommand } from './lib/
 export const name = 'dsh-qq-bot'
 export const inject = ['agents', 'sessions', 'sessionController', 'workspaceRegistry', 'tools']
 
-export const Config = z.object({
-	socketPath: z.string().default('~/.dsh/dsh-qq-bot/bridge.sock'),
-	token: z.string().default(''),
-	stateFile: z.string().default('~/.dsh/dsh-qq-bot/state.json'),
-	replyHeader: z.boolean().default(true),
-	replyHeaderTemplate: z.string().default('【{title}({id})】'),
-	noticeTemplate: z.string().default('{title}({id})已结束'),
-	idStyle: z.string().default('full'),
-	defaultMarkdown: z.boolean().default(true),
-	questionTimeoutMs: z.number().default(600000),
-	maxQuestionButtons: z.number().default(15),
-	replyAckTimeoutMs: z.number().default(8000),
-	noticeFallbackMs: z.number().default(3000),
-	sessionPageSize: z.number().default(8),
-	needReplyText: z.string().default('用户点了「我需要回复」。请把上一条消息对应的结果完整地回复给用户。'),
-	needReplyAckText: z.string().default('已触发，正在请求回复…'),
-})
+/**
+ * 递归冻结：与 `createUserMessage` 一样，交给框架的消息必须是不可变快照。
+ */
+function deepFreeze(value, seen = new WeakSet()) {
+	if (value === null || typeof value !== 'object' || seen.has(value)) return value
+	seen.add(value)
+	for (const key of Object.keys(value)) deepFreeze(value[key], seen)
+	return Object.freeze(value)
+}
+
+/** 构造一条 user 消息（等价于 @deepseek-ai/dsh-llm 的 createUserMessage）。 */
+function makeUserMessage(text, source) {
+	return deepFreeze({
+		id: randomUUID(),
+		role: 'user',
+		content: [{ type: 'text', text: String(text) }],
+		source,
+	})
+}
 
 function expandHome(path) {
 	if (typeof path !== 'string' || !path) return path
@@ -209,7 +214,7 @@ export function apply(ctx, rawConfig) {
 		ensureAgentSetup(agent, sessionId)
 		const round = rounds.beginRound({ sessionId, openid, origin, context })
 		round.pendingContext = rounds.roundContextText(round)
-		agent.followup(createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'dsh-qq-bot' } }))
+		agent.followup(makeUserMessage(text, { kind: 'dsh-qq-bot' }))
 		return { ok: true }
 	}
 
@@ -220,11 +225,12 @@ export function apply(ctx, rawConfig) {
 		outbox,
 		config,
 		logger,
-		userMessage: (text) => createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'dsh-qq-bot' } }),
+		userMessage: (text) => makeUserMessage(text, { kind: 'dsh-qq-bot' }),
 		contextMessage: (text) =>
-			createUserMessage({
-				content: [{ type: 'text', text }],
-				source: { kind: 'dsh-qq-bot', form: 'snapshot', sections: [{ name: 'dsh-qq-bot', text }] },
+			makeUserMessage(text, {
+				kind: 'dsh-qq-bot',
+				form: 'snapshot',
+				sections: [{ name: 'dsh-qq-bot', text: String(text) }],
 			}),
 		agentFor,
 		nextSeqFor: (sessionId) => nextSeq(`session:${sessionId}`),
@@ -280,7 +286,8 @@ export function apply(ctx, rawConfig) {
 		}
 		try {
 			agent.ctx.effect(() => {
-				const toolDisposer = agent.ctx.tools.register(defineTool(buildReplyTool({ outbox, config, logger, target })))
+				// 直接注册 ToolDefinition：bundle 自包含，不依赖 dsh 包里的 defineTool。
+				const toolDisposer = agent.ctx.tools.register(buildReplyTool({ outbox, config, logger, target }))
 				const roundsDisposer = rounds.attachAgent(agent, sessionId)
 				return () => {
 					try {

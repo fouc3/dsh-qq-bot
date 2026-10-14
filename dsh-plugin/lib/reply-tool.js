@@ -1,8 +1,10 @@
 /**
  * qq_reply 工具：把内容/附件发给 QQ 用户。
  *
- * 本文件不 import 任何 dsh 包 —— 工具定义是纯数据，由 index.js 用 defineTool
- * 包一层后注册到"被 QQ 绑定"的 agent 作用域上。
+ * **本文件不 import 任何 dsh 包**（bundle 必须自包含：profile 安装是软链，
+ * 按 realpath 解析时 `/home/fouc3/Projects/...` 这条链上没有 `@deepseek-ai/*`）。
+ * 所以这里直接给出注册表要的 ToolDefinition：原始 JSON Schema 的 `parameters`
+ * 与 `output.schema`（defineTool 的 DSL 编译出来正是这个形状），加上 `execute`。
  */
 
 export const REPLY_TOOL_NAME = 'qq_reply'
@@ -93,42 +95,66 @@ export function buildReplyTool({ outbox, config, logger, target }) {
 		name: REPLY_TOOL_NAME,
 		description: REPLY_TOOL_DESCRIPTION,
 		parameters: {
-			content: {
-				type: 'string',
-				description: '要发给 QQ 用户的正文（与 attachments 至少给一个）。markdown=true 时按 markdown 渲染。',
-			},
-			markdown: {
-				type: 'boolean',
-				description: `是否按 markdown 渲染（默认 ${config.defaultMarkdown ? 'true' : 'false'}）；带附件时正文也遵守这个开关。`,
-			},
-			attachments: {
-				type: 'array',
-				description: '富媒体附件，逐条作为独立的一条 QQ 消息发送。',
-				items: {
-					type: 'object',
-					additionalProperties: true,
-					properties: {
-						kind: {
-							type: 'string',
-							required: true,
-							description: `附件类型：${ATTACHMENT_KINDS.join(' / ')}。`,
+			type: 'object',
+			properties: {
+				content: {
+					type: 'string',
+					description: '要发给 QQ 用户的正文（与 attachments 至少给一个）。markdown=true 时按 markdown 渲染。',
+				},
+				markdown: {
+					type: 'boolean',
+					description: `是否按 markdown 渲染（默认 ${config.defaultMarkdown ? 'true' : 'false'}）；带附件时正文也遵守这个开关。`,
+				},
+				attachments: {
+					type: 'array',
+					description: '富媒体附件，逐条作为独立的一条 QQ 消息发送。',
+					items: {
+						type: 'object',
+						properties: {
+							kind: {
+								type: 'string',
+								description: `附件类型：${ATTACHMENT_KINDS.join(' / ')}。`,
+								enum: [...ATTACHMENT_KINDS],
+							},
+							path: { type: 'string', description: '本机文件的绝对路径（走分片上传）。与 url 二选一。' },
+							url: { type: 'string', description: '公网可下载地址（平台自行下载）。与 path 二选一。' },
+							name: { type: 'string', description: '展示用的文件名，可空。' },
 						},
-						path: { type: 'string', description: '本机文件的绝对路径（走分片上传）。与 url 二选一。' },
-						url: { type: 'string', description: '公网可下载地址（平台自行下载）。与 path 二选一。' },
-						name: { type: 'string', description: '展示用的文件名，可空。' },
+						required: ['kind'],
 					},
 				},
 			},
+			required: [],
+			additionalProperties: false,
 		},
 		output: {
 			schema: {
 				type: 'object',
-				additionalProperties: false,
 				properties: {
-					ok: { type: 'boolean', required: true },
-					sent: { type: 'array', items: { type: 'object', additionalProperties: true } },
-					failed: { type: 'array', items: { type: 'object', additionalProperties: true } },
+					ok: { type: 'boolean' },
+					sent: {
+						type: 'array',
+						items: {
+							type: 'object',
+							properties: {
+								kind: { type: 'string' },
+								messageId: { type: 'string' },
+							},
+						},
+					},
+					failed: {
+						type: 'array',
+						items: {
+							type: 'object',
+							properties: {
+								kind: { type: 'string' },
+								error: { type: 'string' },
+							},
+						},
+					},
 				},
+				required: ['ok'],
+				additionalProperties: false,
 			},
 			render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
 		},

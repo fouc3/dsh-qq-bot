@@ -143,17 +143,37 @@ level=WARN msg="已丢弃非白名单用户的私聊" openid=2A3B4C… text_len=
 
 ## 验收清单
 
-- [ ] 白名单外的账号发命令：无任何效果，网关日志有 WARN（含其 openid）
-- [ ] 会话正在跑时发消息：日志出现 cancel，随后开始新一轮；空闲时直接开始
-- [ ] 普通消息能进 dsh（会话里能看到消息与注入的上下文），AI 调 `qq_reply` 后 QQ 收到，且开头是 `【标题(会话id)】`
-- [ ] AI 本轮没回复：QQ 侧只收到「…已结束」+按钮；点「我需要回复」→ 提示已触发 + AI 被唤醒并回复
-- [ ] 富媒体：`qq_reply` 发本机图片成功；>20MB 文件走分片成功；超限文件返回明确错误
-- [ ] 五个命令都可用；不带参数的 `停止`/`归档` 作用于当前会话
-- [ ] 指令面板在配置指定的私聊可见；`GetMenu` 返回 5 条命令
-- [ ] 会话选择卡片：文件夹可逐层进入、上一张被撤回、会话按钮只填输入框
-- [ ] `延迟发送` 注册后，在本轮正常结束时收到；不带参数能列出待发消息
-- [ ] 提问：`ask_user_question` 在 QQ 出选择卡片，选项/多选/「其他」打字/直接提交跳过都正确，且每步撤回上一张卡片
-- [ ] `git log` 有提交
+`✅` = 已有自动化证据（跑下面两条命令即可复现），`⏳` = 必须真 QQ 环境（凭据 + 私聊 openid），只能你本地验。
+
+- ✅ 白名单外的账号发命令：无任何效果，网关日志有 WARN（含其 openid）
+  —— Go `internal/qq/events_test.go`；插件第二道门守 `lib/plugin.test.js`「非白名单来源的事件在插件侧被丢弃」
+- ✅ 会话正在跑时发消息：先 cancel 再开新一轮；空闲时直接开始
+  —— `lib/plugin.test.js`「命令 → 会话卡片…」（4b 步：断言 `agent.cancelled === 1` 与投递顺序）
+- ✅ 被动回复失效（超 60 分钟 / 超 4 次）自动改发主动消息 —— Go `internal/qq/messaging_test.go`
+- ✅ 富媒体上传：URL 直发、本机文件分片（校验和 + 预签名 PUT + 失败重试）、超限报错
+  —— Go `internal/qq/media_test.go`（含分片与 `md5_10m`）
+- ✅ 五个命令都可用；不带参数的 `停止`/`归档` 作用于当前会话；需要参数的命令无参时回作用+用法
+  —— `lib/commands.test.js` + `lib/plugin.test.js`「发送 / 延迟发送 / 停止 / 归档」
+- ✅ 指令面板定义：5 条命令、`c2c` + 指定私聊、按 remark 复用与目标差量 —— Go `internal/qq/panel_test.go`；插件 `lib/plugin.test.js`「register → panel」
+- ✅ 会话选择卡片：文件夹是回调按钮（逐层进入、每步撤回上一张）、会话是指令按钮（只填输入框、不直接切换）
+  —— `lib/cards.test.js` + `lib/plugin.test.js`（断言 `action.type` 与 `recall_c2c`）
+- ✅ 每轮结束发「标题(会话id)已结束」+「我需要回复」；被顶替/未认领/被停止的轮次不发
+  —— `lib/rounds.test.js` + `lib/plugin.test.js`
+- ✅ 点「我需要回复」：绑定不符=4、运行中=2、成功=0，并注入唤醒消息 + 回「已触发」
+  —— `lib/rounds.test.js` + `lib/plugin.test.js`
+- ✅ `延迟发送 <目标> <内容>` 登记、只在本轮**正常结束**时投递、投递后清槽；无参回用法
+  —— `lib/rounds.test.js`「只在正常结束时投递」+ `lib/commands.test.js`
+- ✅ 提问：`ask_user_question` → QQ 卡片（按钮只写字母、对照与选项小字在正文、选项/多选/「其他」打字/空提交=跳过/每步撤回上一张/超时交回 GUI）
+  —— `lib/questions.test.js` + `lib/plugin.test.js`「提问桥」
+- ✅ UNIX socket 通道：目录 0700 / socket 0600 / 可选 token / 帧上限 1 MiB / 残留 socket 清理 / health 诊断
+  —— `lib/socket.test.js` + Go `internal/bridge/socketclient_test.go`
+- ✅ 出站队列 at-least-once（失败不消费、超时重投沿用原 id、撤回不重投、ack 唤醒等待者）
+  —— `lib/outbox.test.js` + Go `internal/executor/executor_test.go`
+- ✅ `git log` 有提交 —— 见仓库历史
+- ⏳ 普通消息进 dsh 后，AI 调 `qq_reply` 时 QQ 真的收到，且开头是 `【标题(会话id)】`
+- ⏳ 真实 QQ 客户端的按钮点按行为（含单聊 `user_openid` 字段是否如预期）
+- ⏳ 真机上的面板可见性与 `GetMenu`
+- ⏳ 插件在本机 profile 的自动安装（见上面"安装阻塞"）
 
 ## 测试
 
@@ -161,16 +181,21 @@ level=WARN msg="已丢弃非白名单用户的私聊" openid=2A3B4C… text_len=
 # Go 侧（含假 QQ 平台 + 真 UNIX socket 桩）
 go vet ./... && gofmt -l . && go test -race ./...
 
-# 插件侧（纯逻辑，不需要 dsh 运行时）
+# 插件侧：语法 + 63 项（含"装配级端到端"）
 node --check dsh-plugin/index.js dsh-plugin/lib/*.js
 node --test dsh-plugin/lib/*.test.js
 ```
 
-已自动覆盖的关键行为：白名单门守、markdown/键盘约束、被动回复失效自动改主动、
-命令去重与失败不消费命令、撤回失败仅记 WARN、分片上传（含校验和与失败重试）、
-面板按 remark 复用与目标差量、socket 权限与帧上限、命令解析与用法回复、
-卡片按钮类型（文件夹=回调 / 会话=指令）、结束通知与按钮、提问卡片状态机
-（选项/其他/空提交=跳过/超时交回 GUI）、延迟发送只在正常结束时投递。
+`lib/plugin.test.js` 是**装配级端到端**：真的调用插件导出的 `apply()`，起真的 UNIX socket，
+以真实 NDJSON 帧走 `register / panel / event / outbox.poll / ack / health`，
+断言 QQ 消息真的变成了对 agent 的注入消息、卡片/结束通知真的进了出站队列、
+按钮点按真的走了回调路由、提问 waterfall 真的在 QQ 侧结算。它用假 dsh 服务替代运行时，
+所以不需要凭据也不需要 `dsh web`。
+
+**bundle 自包含**：`dsh-plugin/` 里**没有任何 `@deepseek-ai/*` import**（工具定义用原始
+JSON Schema，用户消息本地构造）。原因：profile 安装本地目录是 pnpm 软链，Node 按 realpath
+解析依赖，而 `~/Projects/...` 这条链上并没有 `@deepseek-ai/*`（那是 dsh 安装目录和
+`~/.dsh/profiles/node_modules` 提供的）。自包含后无论软链还是拷贝安装都能加载。
 
 **尚未验证**：真 QQ 凭证下的端到端收发（需要你自己的机器人凭据与私聊 openid）；
 插件在本机 profile 的自动安装（见上面"安装阻塞"）。
