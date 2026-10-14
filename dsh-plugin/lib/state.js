@@ -19,6 +19,7 @@ export const EMPTY_STATE = {
 	pendingDir: {}, // openid -> { parent, at }（点了「新建目录」、正在等目录名）
 	createdSessions: {}, // sessionId -> cwd（本桥建出来的会话：用来补登记工作区）
 	createdDirs: [], // 本桥建出来的目录（新建目录）：用来补登记工作区
+	sessionOwners: {}, // sessionId -> openid（最近一次从 QQ 跟这个会话说过话的人）
 }
 
 function normalize(raw) {
@@ -34,9 +35,10 @@ function normalize(raw) {
 		pendingDir: {},
 		createdSessions: {},
 		createdDirs: [],
+		sessionOwners: {},
 	}
 	if (!raw || typeof raw !== 'object') return base
-	for (const key of ['bindings', 'lastCard', 'delayed', 'inbox', 'attachSeq', 'pendingDir', 'createdSessions']) {
+	for (const key of ['bindings', 'lastCard', 'delayed', 'inbox', 'attachSeq', 'pendingDir', 'createdSessions', 'sessionOwners']) {
 		if (raw[key] && typeof raw[key] === 'object') base[key] = { ...raw[key] }
 	}
 	if (Array.isArray(raw.createdDirs)) base.createdDirs = raw.createdDirs.filter((item) => typeof item === 'string' && item)
@@ -229,6 +231,23 @@ export function createState({ file, logger, seed, debounceMs = 200 } = {}) {
 		},
 		createdDirs() {
 			return [...data.createdDirs]
+		},
+		/**
+		 * 记下"最近一次从 QQ 跟这个会话说过话的人"。
+		 *
+		 * 为什么需要：`发送 <会话id> <内容>` / 输入态可以往**非绑定会话**投递，
+		 * 那时候 AI 用 `qq_reply` 回话不能因为"当前绑定不是它"就拒绝
+		 * （线上踩过：显式指定的会话回不了 QQ，报"该会话当前没有绑定 QQ 私聊"）。
+		 */
+		rememberSessionOwner(sessionId, openid) {
+			if (!sessionId || !openid) return
+			return this.update((s) => {
+				s.sessionOwners[sessionId] = openid
+			})
+		},
+		sessionOwnerOf(sessionId) {
+			const owner = data.sessionOwners?.[sessionId]
+			return typeof owner === 'string' && owner ? owner : null
 		},
 		/** 分配下一个附件 id（`A1`、`A2`…，跨输入态单调递增，绝不重用）。 */
 		nextAttachmentId(openid) {

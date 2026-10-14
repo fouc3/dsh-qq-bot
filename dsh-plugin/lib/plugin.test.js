@@ -1335,3 +1335,34 @@ test('端到端：plan 模式下提交计划（exit_plan_mode）会把计划正�
 
 	boot.dispose()
 })
+
+test('端到端：用 `发送 <会话id>` 说话的非绑定会话也能回 QQ（qq_reply 不该被"当前绑定"卡住）', async (t) => {
+	const agent1 = makeAgent('session-1')
+	const agent2 = makeAgent('session-2')
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': agent1, 'session-2': agent2 } })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	// 绑定 session-2，但用显式目标跟 session-1 说话
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-2', msgId: 'M1' })
+	await drainFor(boot.socketPath, 60)
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '发送 session-1 帮我看看', msgId: 'M2' })
+	await waitFor(() => agent1.followed.length === 1)
+	assert.equal(agent2.followed.length, 0, '不该投到绑定会话')
+
+	const replyTool = agent1.tools.find((tool) => tool.name === REPLY_TOOL_NAME)
+	assert.ok(replyTool, '被投递的会话应当拿到 qq_reply 工具')
+	const result = await replyTool.execute({ content: '看完了，没问题' })
+	// 测试里没有网关 ack，"等待送达确认超时"是正常的；关键是**不能**因为"当前绑定不是它"被拒
+	assert.doesNotMatch(
+		JSON.stringify(result.failed ?? []),
+		/没有绑定 QQ 私聊/,
+		'非绑定会话（显式指定发送）也必须能回 QQ',
+	)
+	const sent = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 60)
+		return list.find((c) => c.kind === 'send_c2c' && /看完了，没问题/.test(String(c.args.content))) ?? null
+	})
+	assert.match(String(sent.args.content), /看完了，没问题/)
+
+	boot.dispose()
+})

@@ -149,11 +149,18 @@ export function apply(ctx, rawConfig) {
 		return next
 	}
 
+	/**
+	 * 这个会话归哪个 QQ 私聊。
+	 *
+	 * 先看当前绑定；没有绑定就回退到"最近一次从 QQ 跟它说过话的人"——
+	 * `发送 <会话id> <内容>` / 输入态能往**非绑定会话**投递，那种会话也必须能回 QQ
+	 * （线上踩过：显式指定的会话回话时报"该会话当前没有绑定 QQ 私聊"）。
+	 */
 	function openidForSession(sessionId) {
 		for (const [openid, bound] of Object.entries(state.get().bindings)) {
 			if (bound === sessionId) return openid
 		}
-		return null
+		return state.sessionOwnerOf(sessionId)
 	}
 
 	function isWhitelisted(openid) {
@@ -476,6 +483,8 @@ export function apply(ctx, rawConfig) {
 
 	// ── 消息投递（打断 + 用户级上下文注入 + 唤醒） ───────────────────────────
 	async function deliver({ sessionId, openid, text, interrupt = true, origin = 'qq', context = {}, images = [], sections = [] }) {
+		// 记下"谁在跟这个会话说话"：非绑定会话（`发送 <会话id> …` / 输入态）也要能回 QQ。
+		if (openid) state.rememberSessionOwner(sessionId, openid)
 		const agent = await agentFor(sessionId)
 		if (!agent) {
 			await sendText({
