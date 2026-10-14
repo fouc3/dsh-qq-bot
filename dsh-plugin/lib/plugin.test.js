@@ -98,11 +98,33 @@ function makeCtx({ sessionSummaries = [], live = {}, commands = null } = {}) {
 			async list() {
 				return { items: sessionSummaries, isEnd: true }
 			},
+			async create({ cwd }) {
+				const sessionId = `session-created-${sessionSummaries.length + 1}`
+				sessionSummaries.push({ sessionId, cwd, updatedAt: Date.now(), running: false })
+				return { sessionId }
+			},
 		},
 		workspaceRegistry: {
 			archivedSessionIds: [],
+			workspaces: [],
 			async archiveSession(sessionId) {
 				archived.push(sessionId)
+			},
+			/** 与 dsh-workspace 的 create 同形：返回实体，实体上有 attachSession。 */
+			async create(path, title) {
+				const existing = ctx.workspaceRegistry.workspaces.find((item) => item.path === path)
+				if (existing) return existing
+				const entity = {
+					id: `ws-${ctx.workspaceRegistry.workspaces.length + 1}`,
+					path,
+					title: title ?? path,
+					attached: [],
+					async attachSession(sessionId) {
+						this.attached.push(sessionId)
+					},
+				}
+				ctx.workspaceRegistry.workspaces.push(entity)
+				return entity
 			},
 		},
 		attachments: makeAttachmentStore(),
@@ -1148,3 +1170,31 @@ test('端到端：新建目录（等名字→创建→默认进去）与空目�
 
 	boot.dispose()
 })
+
+test('端到端：QQ 侧新建会话要把目录注册成工作区（否则 Web 端整个文件夹看不见）', async (t) => {
+	const dir = mkdtempSync(join(tmpdir(), 'dsh-qq-ws-'))
+	t.after(() => rmSync(dir, { recursive: true, force: true }))
+
+	const boot = bootPlugin(t, { sessions: [], live: {} })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+
+	// 「新建会话 <目录>」直接建
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: `新建会话 ${dir}`, msgId: 'M1' })
+	const reply = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 60)
+		return list.find((c) => c.kind === 'send_c2c') ?? null
+	})
+	assert.match(String(reply.args.content), /新建并切换到/, `实际回执：${reply.args.content}`)
+
+	const created = boot.ctx.workspaceRegistry.workspaces.find((ws) => ws.path === dir)
+	assert.ok(created, '目录必须被注册成工作区，否则 dsh Web 侧栏里看不到这个文件夹')
+	assert.equal(created.title, basenameOf(dir))
+	assert.equal(created.attached.length, 1, '新会话要 attach 到工作区上')
+	assert.match(created.attached[0], /^session-created-/)
+})
+
+// 与 node:path 的 basename 对齐（测试里只用最后一段做断言）
+function basenameOf(path) {
+	return String(path).split('/').filter(Boolean).pop()
+}

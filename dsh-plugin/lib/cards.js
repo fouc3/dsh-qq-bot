@@ -108,6 +108,8 @@ export const data = {
 	inbox: (action, arg = '') => `${DATA_PREFIX}:inbox:${action}${arg ? `:${arg}` : ''}`,
 	// 新建会话的目录卡片：新建目录（等名字）/ 删除目录（两步确认）
 	mkdir: (path) => `${DATA_PREFIX}:mkdir:${path}`,
+	// 「等目录名」那张提示卡片上的取消
+	mkCancel: (path) => `${DATA_PREFIX}:mkx:${path}`,
 	rmdir: (path) => `${DATA_PREFIX}:rmdir:${path}`,
 	rmdirYes: (path) => `${DATA_PREFIX}:rmdir2:${path}`,
 }
@@ -132,6 +134,9 @@ export function parseCallback(raw) {
 	}
 	if (raw.startsWith(`${DATA_PREFIX}:mkdir:`)) {
 		return { kind: 'mkdir', path: raw.slice(`${DATA_PREFIX}:mkdir:`.length) }
+	}
+	if (raw.startsWith(`${DATA_PREFIX}:mkx:`)) {
+		return { kind: 'mkcancel', path: raw.slice(`${DATA_PREFIX}:mkx:`.length) }
 	}
 	if (raw.startsWith(`${DATA_PREFIX}:rmdir2:`)) {
 		return { kind: 'rmdiryes', path: raw.slice(`${DATA_PREFIX}:rmdir2:`.length) }
@@ -247,11 +252,13 @@ export function buildSessionCard({ dir, dirs, sessions, currentLabel, page = 1, 
 /**
  * 新建会话的选目录卡片。
  *
- * 只列子目录（逐层进入），导航行是「返回上级」+「在这里新建」——
- * 两枚按钮共用一行，绝不另起一行（平台 5 行上限）。
+ * 只列子目录（逐层进入）。导航按钮共用一行（平台 5 行上限）；
+ * 「删除目录」是破坏性动作，**单独占一行**（用户要求），并且**只有空目录**才出现
+ * ——多占一行时内容页会相应少一行，保证总行数不超限。
  */
 export function buildNewSessionCard({ dir, dirs, page = 1, pageSize = 8, parentPath, empty = false, confirming = false }) {
-	const contentRows = Math.max(1, KEYBOARD_MAX_ROWS - CARD_RESERVED_ROWS)
+	const reservedRows = empty ? CARD_RESERVED_ROWS + 1 : CARD_RESERVED_ROWS
+	const contentRows = Math.max(1, KEYBOARD_MAX_ROWS - reservedRows)
 	const slots = Math.max(1, Math.min(Math.max(1, pageSize), contentRows * CARD_BUTTONS_PER_ROW))
 	const pages = Math.max(1, Math.ceil(dirs.length / slots))
 	const current = Math.min(Math.max(1, page), pages)
@@ -269,7 +276,7 @@ export function buildNewSessionCard({ dir, dirs, page = 1, pageSize = 8, parentP
 	} else {
 		lines.push('', '逐层点进目标目录，最后点 **在这里新建**。')
 		lines.push('', '> 「新建目录」= 发一个目录名，在当前目录下建，建完自动进去。')
-		if (empty) lines.push('> 这个目录是空的，所以可以「删除目录」（要再确认一次）。')
+		if (empty) lines.push('> 这个目录是空的，所以可以「删除目录」（单独一行，要再确认一次）。')
 	}
 
 	const rows = rowsOf(
@@ -295,15 +302,33 @@ export function buildNewSessionCard({ dir, dirs, page = 1, pageSize = 8, parentP
 	}
 
 	// 用户要求：**新建目录** 夹在「返回上级」与「在这里新建」之间；
-	// 只有空目录（没有会话也没有文件）才在右侧多一个「删除目录」。
+	// 「删除目录」是破坏性动作，**另起一行单独放**，且只有空目录才有。
 	const nav = []
 	if (parentPath) nav.push(callbackButton('返回上级', data.newDir(parentPath)))
 	nav.push(callbackButton('新建目录', data.mkdir(dir)))
 	nav.push(callbackButton('在这里新建', data.newHere(dir), { visited: '已新建' }))
-	if (empty) nav.push(callbackButton('删除目录', data.rmdir(dir)))
 	rows.push({ buttons: nav })
+	if (empty) rows.push({ buttons: [callbackButton('删除目录', data.rmdir(dir))] })
 
 	return { content: lines.join('\n'), keyboard: keyboardOf(clampRows(rows)) }
+}
+
+/**
+ * 「新建目录」点了之后那张"等目录名"的提示卡片。
+ *
+ * 用户要求给一个**明确的取消按钮**：不用去记"发个命令就能取消"。
+ */
+export function buildMkdirPromptCard({ dir }) {
+	const lines = [
+		'**新建目录**',
+		`> 父目录：\`${dir}\``,
+		'',
+		'> 直接发一条消息写出**目录名**（只能一层，不能带 `/`、`\\`、`..`），',
+		'> 我就在这个目录下建，**建完自动进去**。',
+		'> 不想建了，点下面的「取消」。',
+	]
+	const button = callbackButton('取消', data.mkCancel(dir))
+	return { content: lines.join('\n'), keyboard: keyboardOf([{ buttons: [button] }]) }
 }
 
 /**

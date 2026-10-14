@@ -31,6 +31,7 @@ import {
 	QUESTION_MAX_BUTTONS,
 	buildInboxCard,
 	buildInboxResult,
+	buildMkdirPromptCard,
 	buildNewSessionCard,
 	buildSessionCard,
 	data as cardData,
@@ -351,6 +352,34 @@ export function apply(ctx, rawConfig) {
 		return { ok: true, removed: path, parent: sessions.parentOf(path) ?? null, name: basename(path) }
 	}
 
+	// ── 工作区注册（让 dsh Web 端也看得到 QQ 建出来的目录+会话） ──────────────
+	/**
+	 * dsh Web 的侧栏是按**工作区**分组的，而工作区是注册表里的一条记录：
+	 * 只 `sessionController.create({cwd})` 而不建工作区，Web 端就**整个文件夹都看不见**
+	 * （线上踩过：QQ 里新建的 `openfield-file-sdk` 目录+会话在浏览器里完全找不到）。
+	 *
+	 * 这里对齐 dsh 自己的创建流程（`dsh-api-session-controller`）：
+	 * `workspaceRegistry.create(path)` → `workspace.attachSession(sessionId)`。
+	 */
+	const ensuredWorkspaces = new Set()
+	async function ensureWorkspaceFor({ path, sessionId, title }) {
+		const dir = String(path ?? '').trim()
+		if (!dir || typeof ctx.workspaceRegistry?.create !== 'function') return null
+		const key = `${dir}|${sessionId ?? ''}`
+		if (ensuredWorkspaces.has(key)) return null
+		try {
+			const workspace = await ctx.workspaceRegistry.create(dir, title || basename(dir))
+			if (sessionId && typeof workspace?.attachSession === 'function') await workspace.attachSession(sessionId)
+			ensuredWorkspaces.add(key)
+			logger.info?.('已把目录注册为工作区（Web 端可见）', { path: dir, sessionId })
+			return workspace
+		} catch (error) {
+			// 不进缓存：下次还有机会补上（比如目录刚被删又重建）
+			logger.warn?.('注册工作区失败', { path: dir, sessionId, error: String(error) })
+			return null
+		}
+	}
+
 	/**
 	 * 在指定目录新建会话，并默认切换过去。
 	 * 目录必须是真实存在的目录（防止打错路径建出一堆垃圾会话）。
@@ -372,6 +401,8 @@ export function apply(ctx, rawConfig) {
 			const sessionId = created?.sessionId
 			if (!sessionId) return { ok: false, error: '创建会话没有返回 id。' }
 			await sessions.refresh()
+			// 先建工作区再绑定：不然 Web 侧栏里不会有这个文件夹。
+			await ensureWorkspaceFor({ path, sessionId })
 			state.setBinding(openid, sessionId)
 			state.setLastCard(openid, null)
 			logger.info?.('已新建并切换会话', { cwd: path, sessionId })
@@ -806,7 +837,11 @@ export function apply(ctx, rawConfig) {
 			state.flush()
 			const result = createSubDirectory({ parent: pendingDir.parent, name: String(event.text).trim() })
 			if (!result.ok) {
-				await sendText({ openid, content: `${result.error}\n\n再发一次目录名，或发 \`新建会话\` 回到目录列表。`, markdown: true, context })
+				// 名字不合法/已存在：保持"等名字"状态，让用户直接再发一次；
+				// 想退出就点提示卡片上的「取消」。
+				state.setPendingDir(openid, pendingDir)
+				state.flush()
+				await sendText({ openid, content: `${result.error}\n\n再发一次目录名，或点上面卡片上的「取消」。`, markdown: true, context })
 				return
 			}
 			await sendText({
@@ -903,16 +938,18 @@ export function apply(ctx, rawConfig) {
 			} else {
 				state.setPendingDir(openid, { parent: parsed.path, at: new Date().toISOString() })
 				state.flush()
-				await sendText({
-					openid,
-					content:
-						`**新建目录** · 父目录 \`${parsed.path}\`\n` +
-						'> 直接发一条消息写出**目录名**（只能一层，不能带 `/`），我就在这个目录下建，建完自动进去。\n' +
-						'> 不想建了就发任意命令（比如 `新建会话`）取消。',
-					markdown: true,
-					context: ctxReply,
-				})
+				// 提示卡片自带一个明确的「取消」（用户要求），不用去记"发命令也能取消"。
+				const prompt = buildMkdirPromptCard({ dir: parsed.path })
+				await io.sendCard({ openid, content: prompt.content, keyboard: prompt.keyboard, context: ctxReply })
 			}
+			code = 0
+		} else if (parsed.kind === 'mkcancel') {
+			// 「新建目录」提示卡片上的取消：清掉等名字状态，回到目录列表。
+			const ctxReply = { eventId: event.eventId, msgId: event.msgId ?? '' }
+			state.setPendingDir(openid, null)
+			state.flush()
+			await sendText({ openid, content: '已取消新建目录。', markdown: true, context: ctxReply })
+			await showNewSessionCard({ openid, dir: parsed.path, replyContext: ctxReply })
 			code = 0
 		} else if (parsed.kind === 'rmdir') {
 			// 「删除目录」第一步：换成二次确认卡片，别的都不做。
@@ -1018,6 +1055,19 @@ export function apply(ctx, rawConfig) {
 					menu: { enabled: args?.menu?.enabled ?? true },
 				}
 				logger.info?.('已接收白名单与面板意图', { openids: openids.length, panelUsers: registered.panel.users.length })
+				// 补登记历史遗漏：以前 QQ 侧建会话只 create、没建工作区，Web 端
+				// 整个文件夹都看不到。网关每次同步（含插件重启后）都补一次，幂等。
+				try {
+					await sessions.refresh()
+					const bindings = state.get().bindings ?? {}
+					for (const sessionId of new Set(Object.values(bindings))) {
+						if (!sessionId || sessionId === 'none') continue
+						const cwd = sessions.get(sessionId)?.cwd
+						if (cwd) void ensureWorkspaceFor({ path: cwd, sessionId })
+					}
+				} catch (error) {
+					logger.warn?.('补登记工作区失败', { error: String(error) })
+				}
 				return { ok: true }
 			},
 			panel: async () => {

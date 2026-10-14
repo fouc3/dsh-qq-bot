@@ -5,6 +5,7 @@ import {
 	QUESTION_MAX_BUTTONS,
 	buildInboxCard,
 	buildInboxResult,
+	buildMkdirPromptCard,
 	buildNewSessionCard,
 	buildNoticeCard,
 	buildQuestionCard,
@@ -425,4 +426,22 @@ test('新建会话卡片：删除目录的第二步只给「取消 / 确认删�
 	assert.equal(parseCallback(data.rmdir('/home/u/empty')).kind, 'rmdir')
 	assert.equal(parseCallback(data.mkdir('/home/u/empty')).kind, 'mkdir')
 	assert.deepEqual(parseCallback(data.mkdir('/home/u/empty')), { kind: 'mkdir', path: '/home/u/empty' })
+})
+
+test('新建目录提示卡片：自带明确的「取消」按钮', () => {
+	const card = buildMkdirPromptCard({ dir: '/home/u/proj' })
+	assert.match(card.content, /新建目录/)
+	assert.match(card.content, /父目录：`\/home\/u\/proj`/)
+	assert.match(card.content, /点下面的「取消」/)
+	const buttons = card.keyboard.content.rows.flatMap((row) => row.buttons)
+	assert.deepEqual(buttons.map((b) => b.render_data.label), ['取消'], '只有一枚「取消」')
+	assert.deepEqual(parseCallback(buttons[0].action.data), { kind: 'mkcancel', path: '/home/u/proj' })
+})
+
+test('新建会话卡片：空目录的「删除目录」单独占一行（不与导航挤一起）', () => {
+	const card = buildNewSessionCard({ dir: '/home/u/empty', dirs: [], parentPath: '/home/u', empty: true })
+	const rows = card.keyboard.content.rows.map((row) => row.buttons.map((b) => b.render_data.label))
+	assert.deepEqual(rows.at(-1), ['删除目录'], '破坏性动作单独一行')
+	assert.deepEqual(rows.at(-2), ['返回上级', '新建目录', '在这里新建'])
+	assert.ok(card.keyboard.content.rows.length <= 5)
 })
