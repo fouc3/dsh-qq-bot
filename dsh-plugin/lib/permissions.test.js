@@ -86,3 +86,30 @@ test('权限：没有服务/服务报错时退化成"用不了"，不抛异常',
 	const broken = createPermissions({ ctx: fakeCtx({ throwOnCatalog: true }).ctx })
 	assert.deepEqual(broken.catalog(), [], '读目录出错也要返回空表')
 })
+
+test('权限：内置档显示 Web 同款中文（服务给的是英文名也不影响），custom 保持原样', () => {
+	const ctx = {
+		get: () => ({
+			catalog: () => ({
+				options: [
+					{ value: 'read-only', name: 'Read Only' },
+					{ value: 'workspace-write', name: 'Workspace Write' },
+					{ value: 'danger-full-access', name: 'Full access' },
+					{ value: 'auto', name: 'auto' },
+					{ value: 'my-mode', name: 'my-mode' },
+					{ value: 'team-mode', name: 'Team Mode' },
+				],
+			}),
+			current: () => 'workspace-write',
+			set() {},
+		}),
+	}
+	const permissions = createPermissions({ ctx })
+	assert.deepEqual(
+		permissions.catalog().map((o) => o.name),
+		['仅可查看', '工作区内修改', '完全权限', 'Auto review', 'My Mode', 'Team Mode'],
+		'内置档用 Web 的中文文案；kebab key 变 Title Case；配置了名字的保持原样',
+	)
+	// 回执也用中文
+	assert.match(permissions.describe('danger-full-access'), /完全权限/)
+})

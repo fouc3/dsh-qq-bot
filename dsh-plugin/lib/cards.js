@@ -46,6 +46,15 @@ export function clipLabel(text, limit = LABEL_WIDTH_LIMIT) {
 	return out ? `${out}…` : '…'
 }
 
+/**
+ * 内联键盘按钮样式（SDK `KeyboardStyle*`：0 灰 / 1 蓝 / 3 红 / 4 蓝色填充）。
+ *
+ * 线上实测：**style 4 在客户端渲染成白色**——用户因此把「取消」(style 1 = 蓝) 看成主按钮、
+ * 把「发送」(style 4) 看成次要按钮，点错过一次。所以这里统一定义：
+ * 主操作 = 蓝(1)、次要/退出 = 灰(0)、破坏性 = 红(3)，不再用 4。
+ */
+export const BUTTON_STYLE = { neutral: 0, primary: 1, danger: 3, fill: 4 }
+
 /** 指令按钮（type=2）：点击只把 data 填进输入框，用户自己发送，不产生互动事件。 */
 export function commandButton(label, data, { visited, style = 1 } = {}) {
 	return {
@@ -299,8 +308,10 @@ export function buildNewSessionCard({ dir, dirs, page = 1, pageSize = 8, parentP
 		// 二次确认：这一步只有"确认删除 / 取消"，别的动作一概不给。
 		rows.push({
 			buttons: [
-				callbackButton('取消', parentPath ? data.newDir(parentPath) : data.newPage(dir, current)),
-				callbackButton('确认删除', data.rmdirYes(dir), { style: 4, visited: '删除中' }),
+				callbackButton('取消', parentPath ? data.newDir(parentPath) : data.newPage(dir, current), {
+					style: BUTTON_STYLE.neutral,
+				}),
+				callbackButton('确认删除', data.rmdirYes(dir), { style: BUTTON_STYLE.danger, visited: '删除中' }),
 			],
 		})
 		return { content: lines.join('\n'), keyboard: keyboardOf(clampRows(rows)) }
@@ -332,7 +343,7 @@ export function buildMkdirPromptCard({ dir }) {
 		'> 我就在这个目录下建，**建完自动进去**。',
 		'> 不想建了，点下面的「取消」。',
 	]
-	const button = callbackButton('取消', data.mkCancel(dir))
+	const button = callbackButton('取消', data.mkCancel(dir), { style: BUTTON_STYLE.neutral })
 	return { content: lines.join('\n'), keyboard: keyboardOf([{ buttons: [button] }]) }
 }
 
@@ -367,7 +378,7 @@ export function buildNoticeCard({ label, sessionId, interrupted = false, source 
 		// 「发送消息」是指令按钮：只把 `发送 <会话id>` 填进 QQ 输入框（由用户自己按发送）。
 		// 填的是"只给目标"的形式 → 那条命令会**进入该会话的输入态**，可以慢慢写正文、
 		// 加附件，最后点输入态卡片上的「发送」才真正投递。
-		buttons.push(commandButton('发送消息', sendCommand(sessionId)))
+		buttons.push(commandButton('发送消息', sendCommand(sessionId), { style: BUTTON_STYLE.neutral }))
 	}
 	return { content: lines.join('\n'), keyboard: keyboardOf([{ buttons }]) }
 }
@@ -392,7 +403,8 @@ export function buildPermissionCard({ options = [], current = '', sessionId = ''
 	const perRow = buttonsPerRowFor(options.length)
 	const buttons = options.map((item) =>
 		callbackButton(item.name, data.perm(item.value), {
-			style: item.value === current ? 4 : 1,
+			// 当前那一档用蓝色（主色），其余灰色；不再用 style 4（客户端会渲染成白色）。
+			style: item.value === current ? BUTTON_STYLE.primary : BUTTON_STYLE.neutral,
 			visited: item.value === current ? '当前' : item.name,
 		}),
 	)
@@ -472,9 +484,10 @@ function renderQuestionCard({ callId, questions, indices, answers, customFor, ca
 				buttons.push(
 					callbackButton(letter, data.question(callId, qIndex, `opt-${oIndex}`), {
 						visited: letter,
-						// 选中态同时也用**按钮自身**的样式表示（4 = 蓝色填充）；
-						// 正文里的 ✅ 保留。平台上 style 就是给这种状态用的。
-						style: isSelected ? 4 : 1,
+						// 选中态也体现在按钮自身：**选中＝蓝(1)、未选中＝灰(0)**。
+						// （以前用 4 当"填充蓝"，线上客户端实际渲染成白色——正好和被"取消/发送"坑到的是同一个坑。）
+						// 正文里的 ✅ 保留。
+						style: isSelected ? BUTTON_STYLE.primary : BUTTON_STYLE.neutral,
 					}),
 				)
 			})
@@ -647,18 +660,23 @@ export function buildInboxCard({ label, sessionId, text, items = [], voice = [],
 			: '> 点「发送」才真正交给 AI；「删除」只影响这一条附件。',
 	)
 
-	const itemButtons = slice.map((item) => callbackButton(`删除 ${item.id}`, data.inbox('rm', item.id)))
+	const itemButtons = slice.map((item) =>
+		callbackButton(`删除 ${item.id}`, data.inbox('rm', item.id), { style: BUTTON_STYLE.neutral }),
+	)
 	const rows = rowsOf(itemButtons, 4)
 	if (pages > 1) {
 		const nav = []
-		if (current > 1) nav.push(callbackButton('上一页', data.inbox('page', String(current - 1))))
-		if (current < pages) nav.push(callbackButton('下一页', data.inbox('page', String(current + 1))))
+		if (current > 1) nav.push(callbackButton('上一页', data.inbox('page', String(current - 1)), { style: BUTTON_STYLE.neutral }))
+		if (current < pages) nav.push(callbackButton('下一页', data.inbox('page', String(current + 1)), { style: BUTTON_STYLE.neutral }))
 		if (nav.length) rows.push({ buttons: nav })
 	}
 	// 按钮顺序按用户要求：**取消在最左、发送在最右**（发送放右侧才顺手）。
-	const actions = [callbackButton('取消', data.inbox('cancel'))]
-	if (String(text ?? '').trim()) actions.push(callbackButton('清空正文', data.inbox('clear')))
-	actions.push(callbackButton(delayed ? '延迟发送' : '发送', data.inbox('send'), { style: 4 }))
+	// 颜色语义：发送＝蓝（主操作），取消/清空正文＝灰（次要）——不能反，用户已经点错过一次。
+	const actions = [callbackButton('取消', data.inbox('cancel'), { style: BUTTON_STYLE.neutral })]
+	if (String(text ?? '').trim()) {
+		actions.push(callbackButton('清空正文', data.inbox('clear'), { style: BUTTON_STYLE.neutral }))
+	}
+	actions.push(callbackButton(delayed ? '延迟发送' : '发送', data.inbox('send'), { style: BUTTON_STYLE.primary }))
 	rows.push({ buttons: actions })
 
 	return { content: lines.join('\n'), keyboard: keyboardOf(rows) }

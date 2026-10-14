@@ -127,12 +127,12 @@ test('提问卡片：多题一次性展示，并在正文里说明"不选直接�
 	// 命令照常生效的提示
 	assert.match(card.content, /命令.*照常生效/)
 
-	// 选中态**同时**用按钮自身的 style 表示（4 = 蓝色填充），未选中 1
+	// 选中态**同时**用按钮自身的 style 表示：选中＝蓝(1)、未选中＝灰(0)
 	const buttons = card.keyboard.content.rows.flatMap((row) => row.buttons)
 	const selected = buttons.find((b) => b.render_data.label === 'B') // 第一问的「否」
 	const unselected = buttons.find((b) => b.render_data.label === 'A') // 第一问的「是」
-	assert.equal(selected.render_data.style, 4, '选中的字母按钮要用填充样式')
-	assert.equal(unselected.render_data.style, 1, '未选中的保持普通样式')
+	assert.equal(selected.render_data.style, 1, '选中的字母按钮用蓝色')
+	assert.equal(unselected.render_data.style, 0, '未选中的用灰色')
 })
 
 test('提问卡片：按钮数超上限返回 null（调用方降级到 dsh GUI）', () => {
@@ -486,7 +486,8 @@ test('权限卡片：每行两个按钮（放不下就加宽），当前项标�
 		assert.match(card.content, new RegExp(`${index + 1}\\. \\*\\*${item.name}\\*\\*`), '正文里给序号+名字')
 	}
 	const flat = card.keyboard.content.rows.flatMap((row) => row.buttons)
-	assert.equal(flat[2].render_data.style, 4, '当前项高亮')
+	assert.equal(flat[2].render_data.style, 1, '当前项用蓝色（style 4 在客户端会渲染成白色，已弃用）')
+	assert.equal(flat[0].render_data.style, 0, '非当前项灰色')
 	assert.deepEqual(parseCallback(flat[0].action.data), { kind: 'perm', value: 'read-only' })
 
 	// 选项多到 2/行会超行数 → 自动加宽
@@ -497,4 +498,28 @@ test('权限卡片：每行两个按钮（放不下就加宽），当前项标�
 	const wide = buildPermissionCard({ options: Array.from({ length: 11 }, (_, i) => ({ value: `p${i}`, name: `级别${i}` })), current: 'p0' })
 	assert.ok(wide.keyboard.content.rows.length <= 5, '整卡行数仍合法')
 	assert.equal(wide.keyboard.content.rows[0].buttons.length, 3)
+})
+
+test('输入态卡片按钮颜色：发送＝蓝（主），取消/清空正文＝灰（次）——不能反', () => {
+	const card = buildInboxCard({ label: '项目甲(session-1)', sessionId: 'session-1', text: '正文', items: [], voice: '', mode: 'send', page: 1, pageSize: 4 })
+	const buttons = card.keyboard.content.rows.at(-1).buttons
+	assert.deepEqual(buttons.map((b) => b.render_data.label), ['取消', '清空正文', '发送'])
+	assert.equal(buttons[0].render_data.style, 0, '取消＝灰（线上用户把蓝色的取消当成了主按钮，点错过）')
+	assert.equal(buttons[1].render_data.style, 0, '清空正文＝灰')
+	assert.equal(buttons[2].render_data.style, 1, '发送＝蓝（主操作）')
+	// 延迟模式同样：主按钮是「延迟发送」
+	const delayed = buildInboxCard({ label: 'x', sessionId: 'session-1', text: '', items: [], voice: '', mode: 'delay', page: 1, pageSize: 4 })
+	const delayedButtons = delayed.keyboard.content.rows.at(-1).buttons
+	assert.deepEqual(delayedButtons.map((b) => b.render_data.label), ['取消', '延迟发送'])
+	assert.equal(delayedButtons[0].render_data.style, 0)
+	assert.equal(delayedButtons[1].render_data.style, 1)
+})
+
+test('删除确认卡片：确认删除＝红（破坏性），取消＝灰', () => {
+	const card = buildNewSessionCard({ dir: '/home/u/empty', dirs: [], parentPath: '/home/u', empty: true, confirming: true })
+	const buttons = card.keyboard.content.rows.at(-1).buttons
+	assert.equal(buttons[0].render_data.label, '取消')
+	assert.equal(buttons[0].render_data.style, 0)
+	assert.equal(buttons[1].render_data.label, '确认删除')
+	assert.equal(buttons[1].render_data.style, 3, '破坏性动作用红色，不用填充蓝')
 })

@@ -11,6 +11,38 @@
  * 只是命令回一句"这个部署没有权限服务"。
  */
 
+/**
+ * dsh Web 端（简体中文）对内置预设的文案。
+ *
+ * 为什么需要：`catalog()` 给的 `name` 来自**部署配置/服务**（线上没配 name 时就是英文，
+ * 如 "Read Only"），而 Web 选择器显示的是它自己的 i18n 文案（`preset.readOnly` → 仅可查看…）。
+ * 用户要求"卡片显示和 Web 同款中文"，所以按预设 key 覆盖；未知/custom 才回退服务给的名字。
+ * 文案取自 `@deepseek-ai/dsh-client-ui-permission-presets` 的 zh 字典。
+ */
+const PRESET_LABELS = {
+	'read-only': '仅可查看',
+	'workspace-write': '工作区内修改',
+	'danger-full-access': '完全权限',
+	auto: 'Auto review',
+	custom: '自定义',
+}
+
+/** 把 `my-mode` 这种 kebab key 变成 `My Mode`（与 Web 的 displayPresetName 行为一致）。 */
+function titleCaseKebab(name) {
+	if (!/^[a-z0-9]+(-[a-z0-9]+)*$/.test(name)) return name
+	return name
+		.split('-')
+		.map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+		.join(' ')
+}
+
+/** 一个预设对外的显示名：内置档用中文，其它用服务给的名字（kebab key 则 Title Case）。 */
+function displayName(item) {
+	const builtin = PRESET_LABELS[item.value]
+	if (builtin) return builtin
+	return titleCaseKebab(item.name || item.value)
+}
+
 /** 直接设定的 token → 预设 value 的宽松别名（中文名/英文片段/level 名都认）。 */
 const VALUE_ALIASES = {
 	只读: 'read-only',
@@ -65,7 +97,11 @@ export function createPermissions({ ctx, logger }) {
 						.filter((item) => item && typeof item.value === 'string' && item.value)
 						.map((item) => ({
 							value: item.value,
-							name: typeof item.name === 'string' && item.name ? item.name : item.value,
+							// 显示名统一走 displayName：内置三档 + auto 用 Web 同款中文
+							name: displayName({
+								value: item.value,
+								name: typeof item.name === 'string' && item.name ? item.name : item.value,
+							}),
 							description: typeof item.description === 'string' ? item.description : '',
 						}))
 				: []
