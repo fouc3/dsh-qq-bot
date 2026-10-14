@@ -16,6 +16,13 @@ export const COMMANDS = [
 		argHint: '<会话id> | <目录> <会话id> | none',
 	},
 	{
+		name: '新建会话',
+		desc: '在指定目录新建会话并切换',
+		purpose: '在指定目录新建一个 dsh 会话，并默认切换到它；不带参数时用卡片逐层选目录。',
+		usage: '新建会话 <目录>',
+		usageAlt: '新建会话                 # 不带参数：用卡片选目录',
+	},
+	{
 		name: '发送',
 		desc: '把一条消息单次投递到指定会话',
 		requiresArgs: true,
@@ -122,6 +129,8 @@ export function createCommandRunner(deps) {
 		switch (parsed.name) {
 			case '切换会话':
 				return switchSession(context, parsed)
+			case '新建会话':
+				return newSession(context, parsed)
 			case '发送':
 				return sendOnce(context, parsed)
 			case '停止':
@@ -135,8 +144,35 @@ export function createCommandRunner(deps) {
 		}
 	}
 
-	async function switchSession({ openid, replyContext }, parsed) {
+	/**
+	 * 新建会话。
+	 *
+	 * 不带参数：发"选目录"卡片（逐层进入，最后点「在这里新建」）。
+	 * 带参数：直接在目标目录新建。两条路径都在新建后**默认切换到它**。
+	 */
+	async function newSession({ openid, replyContext }, parsed) {
 		if (parsed.tokens.length === 0) {
+			await deps.showNewSessionCard({ openid, replyContext })
+			return { handled: true }
+		}
+		const cwd = parsed.tokens.join(' ').trim()
+		if (!cwd) {
+			await deps.reply({ openid, content: usageText('新建会话'), replyContext })
+			return { handled: true }
+		}
+		const result = await deps.createSession({ openid, cwd })
+		await deps.reply({
+			openid,
+			content: result.ok
+				? `已在 \`${result.cwd}\` 新建并切换到 **${result.label}**\n\n${result.hint ?? '直接发消息就能开始用。'}`
+				: `${result.error}\n\n${usageText('新建会话')}`,
+			markdown: true,
+			replyContext,
+		})
+		return { handled: true }
+	}
+
+	async function switchSession({ openid, replyContext }, parsed) {		if (parsed.tokens.length === 0) {
 			// 不带参数 = 会话选择命令
 			await deps.showSessionCard({ openid, replyContext })
 			return { handled: true }

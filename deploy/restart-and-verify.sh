@@ -9,7 +9,7 @@
 set -u -o pipefail
 
 LOG="${1:-/tmp/dsh-qq-bot-restart.log}"
-SOCKET="$HOME/.dsh/dsh-qq-bot/bridge.sock"
+export SOCKET="$HOME/.dsh/dsh-qq-bot/bridge.sock"
 
 log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >>"$LOG"; }
 

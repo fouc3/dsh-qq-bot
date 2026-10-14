@@ -15,6 +15,7 @@
  * 所以本 bundle 自包含：工具定义用原始 JSON Schema，用户消息本地构造。
  */
 import { randomUUID } from 'node:crypto'
+import { statSync } from 'node:fs'
 
 import { createState } from './lib/state.js'
 import { createSocketServer } from './lib/socket.js'
@@ -23,7 +24,7 @@ import { createSessions } from './lib/sessions.js'
 import { createQuestionBridge } from './lib/questions.js'
 import { createRounds } from './lib/rounds.js'
 import { buildReplyTool } from './lib/reply-tool.js'
-import { buildSessionCard, callbackButton, data as cardData, parseCallback } from './lib/cards.js'
+import { buildNewSessionCard, buildSessionCard, data as cardData, parseCallback } from './lib/cards.js'
 import { createCommandRunner, menuItems, panelItems, parseCommand } from './lib/commands.js'
 import {
 	EXCLUDED_COMMANDS,
@@ -193,7 +194,7 @@ export function apply(ctx, rawConfig) {
 		},
 	}
 
-	// ── 会话选择卡片 ─────────────────────────────────────────────────────────
+	// ── 会话选择卡片 / 新建会话选目录卡片 ───────────────────────────────────
 	async function showSessionCard({ openid, dir, page = 1, replyContext = {} }) {
 		const bound = state.bindingOf(openid)
 		const boundCwd = bound && bound !== 'none' ? sessions.get(bound)?.cwd : null
@@ -205,15 +206,60 @@ export function apply(ctx, rawConfig) {
 			currentLabel: bound && bound !== 'none' ? sessions.label(bound) : null,
 			page,
 			pageSize: Number(config.sessionPageSize) || 8,
+			// 「返回上级」由卡片自己并进导航行：另起一行会突破平台 5 行上限，
+			// 整条消息被 40034029 拒收（线上踩过）。
+			parentPath: sessions.parentOf(start),
 			switchCommand: (sessionId) => (sessionId === 'none' ? '切换会话 none' : `切换会话 ${sessionId}`),
 		})
-		const parent = sessions.parentOf(start)
-		if (parent) {
-			// 「返回上级」单独一行，和会话按钮区分开
-			card.keyboard.content.rows.push({ buttons: [callbackButton('返回上级', cardData.dir(parent))] })
-		}
 		await io.sendCard({ openid, content: card.content, keyboard: card.keyboard, context: replyContext })
 		logger.info?.('已发会话选择卡片', { dir: start, sessions: sessions.sessionsInDir(start).length })
+	}
+
+	/** 新建会话的"选目录"卡片（逐层进入，最后点「在这里新建」）。 */
+	async function showNewSessionCard({ openid, dir, page = 1, replyContext = {} }) {
+		const bound = state.bindingOf(openid)
+		const boundCwd = bound && bound !== 'none' ? sessions.get(bound)?.cwd : null
+		const start = dir || boundCwd || sessions.defaultRoot()
+		const card = buildNewSessionCard({
+			dir: start,
+			dirs: sessions.listDirs(start),
+			page,
+			pageSize: Number(config.sessionPageSize) || 8,
+			parentPath: sessions.parentOf(start),
+		})
+		await io.sendCard({ openid, content: card.content, keyboard: card.keyboard, context: replyContext })
+		logger.info?.('已发新建会话选目录卡片', { dir: start })
+	}
+
+	/**
+	 * 在指定目录新建会话，并默认切换过去。
+	 * 目录必须是真实存在的目录（防止打错路径建出一堆垃圾会话）。
+	 */
+	async function createSessionHere({ openid, cwd }) {
+		const raw = String(cwd ?? '').trim()
+		if (!raw) return { ok: false, error: '目录不能为空。' }
+		const path = expandHome(raw)
+		// 只允许在**已存在**的目录里新建：打错一个字符就建出一堆垃圾会话很难收。
+		let isDir = false
+		try {
+			isDir = statSync(path).isDirectory()
+		} catch {
+			return { ok: false, error: `\`${path}\` 打不开（不存在或没权限）。` }
+		}
+		if (!isDir) return { ok: false, error: `\`${path}\` 不是目录。` }
+		try {
+			const created = await ctx.sessionController.create({ cwd: path })
+			const sessionId = created?.sessionId
+			if (!sessionId) return { ok: false, error: '创建会话没有返回 id。' }
+			await sessions.refresh()
+			state.setBinding(openid, sessionId)
+			state.setLastCard(openid, null)
+			logger.info?.('已新建并切换会话', { cwd: path, sessionId })
+			return { ok: true, cwd: path, sessionId, label: sessions.label(sessionId), hint: '直接发消息就能开始用。' }
+		} catch (error) {
+			logger.warn?.('新建会话失败', { cwd: path, error: String(error) })
+			return { ok: false, error: `在 \`${path}\` 新建会话失败：${String(error?.message ?? error)}` }
+		}
 	}
 
 	// ── 消息投递（打断 + 用户级上下文注入 + 唤醒） ───────────────────────────
@@ -269,6 +315,8 @@ export function apply(ctx, rawConfig) {
 		reply: ({ openid, content, markdown = true, replyContext = {} }) =>
 			sendText({ openid, content, markdown, context: replyContext }),
 		showSessionCard: ({ openid, replyContext }) => showSessionCard({ openid, replyContext }),
+		showNewSessionCard: ({ openid, replyContext }) => showNewSessionCard({ openid, replyContext }),
+		createSession: ({ openid, cwd }) => createSessionHere({ openid, cwd }),
 		deliver: ({ sessionId, openid, text, interrupt }) =>
 			deliver({ sessionId, openid, text, interrupt, origin: 'qq', context: {} }),
 		stopSession: async (sessionId) => {
@@ -452,7 +500,9 @@ export function apply(ctx, rawConfig) {
 		} else if (parsed.kind === 'dir') {
 			code = 0
 			try {
-				await showSessionCard({
+				// 同一套目录浏览有两种模式：切换会话 / 新建会话选目录。
+				const show = parsed.mode === 'new' ? showNewSessionCard : showSessionCard
+				await show({
 					openid,
 					dir: parsed.path,
 					page: parsed.page,
@@ -461,6 +511,20 @@ export function apply(ctx, rawConfig) {
 			} catch (error) {
 				logger.warn?.('切换目录失败', { error: String(error) })
 				code = 1
+			}
+		} else if (parsed.kind === 'newhere') {
+			// 「在这里新建」：建完默认切过去，并把结果回给 QQ。
+			code = 0
+			const result = await createSessionHere({ openid, cwd: parsed.path })
+			if (result.ok) {
+				await sendText({
+					openid,
+					content: `已在 \`${result.cwd}\` 新建并切换到 **${result.label}**\n\n直接发消息就能开始用。`,
+					markdown: true,
+					context: { eventId: event.eventId, msgId: event.msgId ?? '' },
+				})
+			} else {
+				await sendText({ openid, content: result.error, markdown: true, context: { eventId: event.eventId, msgId: event.msgId ?? '' } })
 			}
 		} else if (parsed.kind === 'needreply') {
 			const result = await rounds.needReply({

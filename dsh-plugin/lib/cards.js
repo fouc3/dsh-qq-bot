@@ -97,6 +97,11 @@ export const data = {
 	dir: (path) => `${DATA_PREFIX}:dir:${path}`,
 	needReply: (sessionId) => `${DATA_PREFIX}:needreply:${sessionId}`,
 	page: (path, page) => `${DATA_PREFIX}:dir:${path}?page=${page}`,
+	// 新建会话的目录浏览用独立前缀：同一个"点文件夹"动作要能区分是哪张卡片，
+	// 否则点进子目录后会错误地回到"切换会话"卡片（回调 data 里带模式，天然无状态）。
+	newDir: (path) => `${DATA_PREFIX}:newdir:${path}`,
+	newPage: (path, page) => `${DATA_PREFIX}:newdir:${path}?page=${page}`,
+	newHere: (path) => `${DATA_PREFIX}:new:${path}`,
 	// callId 放在最后：它是变长的，这样解析时"剩余部分就是 callId"，不会被分隔符切坏。
 	question: (callId, questionIndex, action) => `${DATA_PREFIX}:q:${questionIndex}:${action}:${callId}`,
 }
@@ -106,6 +111,9 @@ export function parseCallback(raw) {
 	if (typeof raw !== 'string' || !raw.startsWith(`${DATA_PREFIX}:`)) return null
 	if (raw.startsWith(`${DATA_PREFIX}:needreply:`)) {
 		return { kind: 'needreply', sessionId: raw.slice(`${DATA_PREFIX}:needreply:`.length) }
+	}
+	if (raw.startsWith(`${DATA_PREFIX}:new:`)) {
+		return { kind: 'newhere', path: raw.slice(`${DATA_PREFIX}:new:`.length) }
 	}
 	if (raw.startsWith(`${DATA_PREFIX}:q:`)) {
 		const rest = raw.slice(`${DATA_PREFIX}:q:`.length)
@@ -118,13 +126,20 @@ export function parseCallback(raw) {
 		if (!callId || !Number.isInteger(questionIndex) || !action) return null
 		return { kind: 'question', callId, questionIndex, action }
 	}
+	if (raw.startsWith(`${DATA_PREFIX}:newdir:`)) {
+		return { kind: 'dir', mode: 'new', ...splitDirPayload(raw.slice(`${DATA_PREFIX}:newdir:`.length)) }
+	}
 	if (raw.startsWith(`${DATA_PREFIX}:dir:`)) {
-		const rest = raw.slice(`${DATA_PREFIX}:dir:`.length)
-		const [path, query] = rest.split('?')
-		const page = query && query.startsWith('page=') ? Number(query.slice(5)) || 1 : 1
-		return { kind: 'dir', path, page }
+		return { kind: 'dir', mode: 'switch', ...splitDirPayload(raw.slice(`${DATA_PREFIX}:dir:`.length)) }
 	}
 	return null
+}
+
+/** 拆目录回调里的路径与页码（path 可能自带冒号，所以只切问号）。 */
+function splitDirPayload(rest) {
+	const [path, query] = rest.split('?')
+	const page = query && query.startsWith('page=') ? Number(query.slice(5)) || 1 : 1
+	return { path, page }
 }
 
 // ── 卡片 ─────────────────────────────────────────────────────────────────
@@ -158,7 +173,7 @@ function clampRows(rows, maxRows = KEYBOARD_MAX_ROWS, maxPerRow = KEYBOARD_MAX_B
 		.filter((row) => (row.buttons ?? []).length > 0)
 }
 
-export function buildSessionCard({ dir, dirs, sessions, currentLabel, page = 1, pageSize = 8, switchCommand }) {
+export function buildSessionCard({ dir, dirs, sessions, currentLabel, page = 1, pageSize = 8, switchCommand, parentPath }) {
 	// 目录与会话共用同一页预算：先目录（导航优先），再会话。
 	// 这样无论目录多少，键盘都不会超过平台行数上限。
 	const contentRows = Math.max(1, KEYBOARD_MAX_ROWS - CARD_RESERVED_ROWS)
@@ -194,7 +209,47 @@ export function buildSessionCard({ dir, dirs, sessions, currentLabel, page = 1, 
 	if (current > 1) pager.push(callbackButton('上一页', data.page(dir, current - 1)))
 	if (current < pages) pager.push(callbackButton('下一页', data.page(dir, current + 1)))
 	if (pager.length > 0) rows.push({ buttons: pager })
-	rows.push({ buttons: [commandButton('不指定会话', switchCommand('none'))] })
+
+	// 导航行：「返回上级」与「不指定会话」必须共用同一行 —— 绝不能另起一行，
+	// 否则总行数会超平台 5 行上限，整条消息被 40034029 拒收（线上踩过）。
+	const nav = []
+	if (parentPath) nav.push(callbackButton('返回上级', data.dir(parentPath)))
+	nav.push(commandButton('不指定会话', switchCommand('none')))
+	rows.push({ buttons: nav })
+
+	return { content: lines.join('\n'), keyboard: keyboardOf(clampRows(rows)) }
+}
+
+/**
+ * 新建会话的选目录卡片。
+ *
+ * 只列子目录（逐层进入），导航行是「返回上级」+「在这里新建」——
+ * 两枚按钮共用一行，绝不另起一行（平台 5 行上限）。
+ */
+export function buildNewSessionCard({ dir, dirs, page = 1, pageSize = 8, parentPath }) {
+	const contentRows = Math.max(1, KEYBOARD_MAX_ROWS - CARD_RESERVED_ROWS)
+	const slots = Math.max(1, Math.min(Math.max(1, pageSize), contentRows * CARD_BUTTONS_PER_ROW))
+	const pages = Math.max(1, Math.ceil(dirs.length / slots))
+	const current = Math.min(Math.max(1, page), pages)
+	const slice = dirs.slice((current - 1) * slots, current * slots)
+
+	const lines = ['**新建会话**', `> 目标目录：\`${dir}\``, `子目录 ${dirs.length} 个`]
+	if (pages > 1) lines.push(`第 ${current}/${pages} 页`)
+	lines.push('', '逐层点进目标目录，最后点 **在这里新建**。')
+
+	const rows = rowsOf(
+		slice.map((sub) => callbackButton(sub.name, data.newDir(sub.path))),
+		CARD_BUTTONS_PER_ROW,
+	)
+	const pager = []
+	if (current > 1) pager.push(callbackButton('上一页', data.newPage(dir, current - 1)))
+	if (current < pages) pager.push(callbackButton('下一页', data.newPage(dir, current + 1)))
+	if (pager.length > 0) rows.push({ buttons: pager })
+
+	const nav = []
+	if (parentPath) nav.push(callbackButton('返回上级', data.newDir(parentPath)))
+	nav.push(callbackButton('在这里新建', data.newHere(dir), { visited: '已新建' }))
+	rows.push({ buttons: nav })
 
 	return { content: lines.join('\n'), keyboard: keyboardOf(clampRows(rows)) }
 }
