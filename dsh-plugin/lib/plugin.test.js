@@ -991,3 +991,38 @@ test('端到端：输入态——附件只能走卡片上的「发送」；裸�
 
 	boot.dispose()
 })
+
+test('端到端：输入态已经有内容时，`发送 <别的会话>` 不会把攒的东西丢掉', async (t) => {
+	const agent = makeAgent('session-1')
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': agent } })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M1' })
+	await drainFor(boot.socketPath, 60)
+
+	// 进输入态并写正文
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '发送', msgId: 'M2' })
+	await drainFor(boot.socketPath, 80)
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '这段别弄丢了', msgId: 'M3' })
+	await drainFor(boot.socketPath, 80)
+
+	// 切到另一个会话：应当拒绝并说明，而不是静默清空
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '发送 session-2', msgId: 'M4' })
+	const refused = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /没给你切/.test(String(c.args.content))) ?? null
+	})
+	assert.match(refused.args.content, /session-1/)
+	assert.match(refused.args.content, /session-2/)
+
+	// 正文还在：再写一句，卡片里应当两段都在
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '再来一句', msgId: 'M5' })
+	const card = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.filter((c) => c.kind === 'send_c2c' && c.args.keyboard).at(-1) ?? null
+	})
+	assert.match(card.args.content, /这段别弄丢了/)
+	assert.match(card.args.content, /再来一句/)
+	assert.match(card.args.content, /session-1/, '还在给原来的会话攒')
+	boot.dispose()
+})

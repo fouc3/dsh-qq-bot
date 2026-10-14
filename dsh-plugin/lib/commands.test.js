@@ -123,8 +123,14 @@ test('发送：裸发进输入态；缺内容回用法；带目标与内容则�
 	assert.equal(calls.delivered.length, 0)
 
 	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('发送 session-2'))
-	assert.match(calls.replies.at(-1).content, /用法/)
+	// 只给目标会话 = 进**那个会话**的输入态（用户要求：不再回用法）
+	assert.deepEqual(calls.inputs, [
+		{ openid: 'U1', sessionId: 'session-1' },
+		{ openid: 'U1', sessionId: 'session-2' },
+	])
 	assert.equal(calls.delivered.length, 0)
+	// 绑定没被改
+	assert.equal(s.bindingOf('U1'), 'session-1')
 
 	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('发送 session-2 帮我看下这个'))
 	assert.equal(calls.delivered.length, 1)
@@ -132,8 +138,18 @@ test('发送：裸发进输入态；缺内容回用法；带目标与内容则�
 	assert.equal(calls.delivered[0].text, '帮我看下这个')
 	assert.equal(calls.delivered[0].interrupt, false, '发送不打断')
 	assert.match(calls.replies.at(-1).content, /已投递/)
-	// 绑定没被改
-	assert.equal(s.bindingOf('U1'), 'session-1')
+})
+
+test('发送：认不出目标时回用法、目标不存在时明确报错（都不会误进输入态）', async () => {
+	const { runner, calls } = makeRunner({ seed: boundSeed() })
+
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('发送 你好'))
+	assert.equal(calls.inputs.length, 0)
+	assert.match(calls.replies.at(-1).content, /用法/)
+
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('发送 session-nope'))
+	assert.equal(calls.inputs.length, 0)
+	assert.match(calls.replies.at(-1).content, /没找到会话|目录/)
 })
 
 test('发送：没绑定会话时裸发不进输入态，而是回用法', async () => {

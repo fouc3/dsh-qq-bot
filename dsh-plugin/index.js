@@ -359,10 +359,29 @@ export function apply(ctx, rawConfig) {
 		return card
 	}
 
-	/** 裸发 `发送`：进入当前会话的输入态。 */
+	/**
+	 * 进入输入态（裸发 `发送` = 当前会话；`发送 <会话id>` = 指定会话）。
+	 *
+	 * 已经有内容时**不让静默换目标**：那会把攒好的正文/附件一起丢掉。
+	 */
 	async function beginInput({ openid, sessionId, replyContext = {} }) {
 		const before = inbox.active(openid)
-		if (before && ((before.items ?? []).length > 0 || inbox.textOf(before))) {
+		const pendingItems = (before?.items ?? []).length
+		const pendingText = inbox.textOf(before)
+		const hasContent = Boolean(pendingText) || pendingItems > 0
+		if (hasContent && before.sessionId !== sessionId) {
+			await sendText({
+				openid,
+				content:
+					`你现在有一个给 **${sessions.label(before.sessionId)}** 的输入框（正文 ${pendingText ? `${pendingText.length} 字` : '空'} + 附件 ${pendingItems} 个）。\n` +
+					`> 先点那张卡片上的「发送」发出去，或点「取消」丢掉，再切到 **${sessions.label(sessionId)}** —— 直接切会把攒的内容丢掉，所以这里没给你切。`,
+				markdown: true,
+				context: replyContext,
+			})
+			await showInboxCard({ openid, sessionId: before.sessionId, context: replyContext })
+			return { ok: false, reason: 'inbox-other-session' }
+		}
+		if (hasContent) {
 			await sendText({
 				openid,
 				content: '已经有一个没发出去的输入框了，接着往里加就行；不想留就点卡片上的「取消」。',

@@ -31,12 +31,14 @@ export const COMMANDS = [
 	},
 	{
 		name: '发送',
-		desc: '进输入态（带参数=单次投递）',
+		desc: '进输入态（带会话=指定目标）',
 		purpose:
-			'裸发 `发送` = 进入**当前会话的输入态**：之后你发的文字与附件都先攒着（机器人回一张预览卡片，每个附件可单独删除），点卡片上的「发送」才把正文 + 附件一起交给 AI；' +
-			'带参数 `发送 <会话id> <内容>` 仍是单次投递（不打断，忙则排队），此形式**不支持附件**。',
+			'发 `发送` = 进入**当前会话的输入态**，发 `发送 <会话id>` = 进入**那个会话的输入态**：' +
+			'之后你发的文字与附件都先攒着（机器人回一张预览卡片，每个附件可单独删除），点卡片上的「发送」才把正文 + 附件一起交给 AI；' +
+			'`发送 <会话id> <内容>` 仍是单次投递（不打断，忙则排队），此形式**不支持附件**。',
 		usage: '发送',
-		usageAlt: '发送 <会话id> <内容>            # 单次投递（不带附件）',
+		usageAlt: '发送 <会话id>                   # 进那个会话的输入态',
+		usageAlt2: '发送 <会话id> <内容>          # 单次投递（不带附件）',
 	},
 	{
 		name: '停止',
@@ -89,9 +91,9 @@ export function usageText(name) {
 	if (!cmd) return ''
 	const lines = [`**${cmd.name}**`]
 	if (cmd.purpose) lines.push(`> 作用：${cmd.purpose}`)
-	if (cmd.usage) {
-		lines.push(`用法：\`${cmd.usage}\`` + (cmd.usageAlt ? ` 或 \`${cmd.usageAlt}\`` : ''))
-	}
+	// usage / usageAlt / usageAlt2 是同一份数据里的几种写法，统一渲染成"用法：A 或 B 或 C"。
+	const usages = [cmd.usage, cmd.usageAlt, cmd.usageAlt2].filter(Boolean)
+	if (usages.length > 0) lines.push(`用法：${usages.map((item) => `\`${item}\``).join(' 或 ')}`)
 	if (cmd.selection) lines.push(`用法：\`${cmd.name}\`（不带参数进入会话选择）或 \`${cmd.name} ${cmd.argHint}\``)
 	return lines.join('\n')
 }
@@ -273,7 +275,9 @@ export function createCommandRunner(deps) {
 			if (!sessionId || sessionId === 'none') {
 				await deps.reply({
 					openid,
-					content: '当前没有绑定会话，没法进入输入态。先 `切换会话`，或用 `发送 <会话id> <内容>` 单次投递。',
+					content:
+						'当前没有绑定会话，没法进入输入态。先 `切换会话`，或用 `发送 <会话id>` 进那个会话的输入态，' +
+						'或用 `发送 <会话id> <内容>` 单次投递。',
 					markdown: true,
 					replyContext,
 				})
@@ -291,13 +295,14 @@ export function createCommandRunner(deps) {
 			await deps.reply({ openid, content: usageText('发送'), replyContext })
 			return { handled: true }
 		}
-		if (!target.content) {
-			await deps.reply({ openid, content: usageText('发送'), replyContext })
-			return { handled: true }
-		}
 		const session = sessions.get(target.sessionId)
 		if (!session) {
 			await deps.reply({ openid, content: `没找到会话 \`${target.sessionId}\`。`, markdown: true, replyContext })
+			return { handled: true }
+		}
+		// 只给了目标、没给内容：进入**那个会话**的输入态（而不是回用法）。
+		if (!target.content) {
+			await deps.beginInput?.({ openid, sessionId: target.sessionId, replyContext })
 			return { handled: true }
 		}
 		await deps.deliver({
