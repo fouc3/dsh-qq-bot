@@ -37,6 +37,12 @@
         # 只有单道题自己就放不下时才降级到 dsh GUI 回答（并在 QQ 侧说明）。
         maxQuestionButtons: 20
 
+        # 附件（输入态）：单条自动下载上限。小于它的自动下载进 dsh 附件服务；
+        # 超过它只登记 url，卡片上标「未下载」，模型需要时调 qq_fetch_attachment 拉。
+        maxAttachmentBytes: 52428800
+        # 模型主动拉取单个附件时的上限（比自动下载宽松，但仍然要有边界）。
+        maxFetchBytes: 524288000
+
         # 等待 Go 侧 ack 的时限（超过就认为"尚未确认送达"，由工具结果如实告知 AI）。
         replyAckTimeoutMs: 8000
         # 结束通知的兜底：turn/end 没到也在此毫秒数后补发一次（按 会话+轮次 去重）。

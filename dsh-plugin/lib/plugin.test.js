@@ -16,6 +16,7 @@ import { join } from 'node:path'
 import { apply, name as pluginName, inject as pluginInject } from '../index.js'
 import { data as cardData, parseCallback } from './cards.js'
 import { REPLY_TOOL_NAME } from './reply-tool.js'
+import { ATTACHMENT_TOOL_NAME } from './attachment-tool.js'
 
 // ── 假 dsh 服务 ─────────────────────────────────────────────────────────────
 
@@ -104,6 +105,7 @@ function makeCtx({ sessionSummaries = [], live = {}, commands = null } = {}) {
 				archived.push(sessionId)
 			},
 		},
+		attachments: makeAttachmentStore(),
 	}
 
 	return {
@@ -111,8 +113,65 @@ function makeCtx({ sessionSummaries = [], live = {}, commands = null } = {}) {
 		liveAgents,
 		archived,
 		events,
+		attachments: ctx.attachments,
 		dispose() {
 			for (const disposer of disposers.reverse()) disposer()
+		},
+	}
+}
+
+// ── 假附件服务（dsh 的 ctx.attachments） ────────────────────────────────────
+
+function makeAttachmentStore() {
+	const images = []
+	const files = []
+	return {
+		images,
+		files,
+		async saveImages(inputs) {
+			return inputs.map((input) => {
+				images.push(input)
+				return {
+					attachmentId: `img-${images.length}`,
+					mediaType: input.mediaType,
+					bytes: input.data?.length ?? 0,
+					width: 1,
+					height: 1,
+					name: input.name,
+				}
+			})
+		},
+		async saveFileStream({ data, name }) {
+			let bytes = 0
+			for await (const chunk of data) bytes += chunk.length
+			files.push({ name, bytes })
+			return { attachmentId: `file-${files.length}`, name, bytes }
+		},
+		fileHostPath(ref) {
+			return `/home/u/.dsh/attachments/v1/objects/${ref.attachmentId}`
+		},
+	}
+}
+
+/** 装一个假的 fetch：所有 URL 都返回 fixed 字节数，方便断言下载真的发生了。 */
+function stubFetch(bytes = 16) {
+	const previous = globalThis.fetch
+	const calls = []
+	globalThis.fetch = async (url) => {
+		calls.push(String(url))
+		return {
+			ok: true,
+			status: 200,
+			headers: { get: () => null },
+			body: (async function* () {
+				yield new Uint8Array(bytes)
+			})(),
+		}
+	}
+	return {
+		calls,
+		restore() {
+			globalThis.fetch = previous
 		},
 	}
 }
@@ -248,7 +307,7 @@ test('插件导出形态正确，且 apply() 会建出 0600 的 socket', async (
 	boot.dispose()
 })
 
-test('register → panel：白名单快照 + 五条命令的面板定义（只绑定配置指定的私聊）', async (t) => {
+test('register → panel：白名单快照 + 七条命令的面板定义（只绑定配置指定的私聊）', async (t) => {
 	const boot = bootPlugin(t, { sessions: SUMMARIES })
 	await waitFor(() => existsSync(boot.socketPath))
 
@@ -368,9 +427,10 @@ test('端到端：命令 → 会话卡片；绑定后普通消息进会话；一
 	assert.ok(agent.followed[0].id, '消息必须带 id')
 	assert.ok(Object.isFrozen(agent.followed[0]), '交给框架的消息必须是不可变快照')
 
-	assert.equal(agent.tools.length, 1, '应为该会话注册 qq_reply')
-	assert.equal(agent.tools[0].name, REPLY_TOOL_NAME)
-	assert.equal(agent.tools[0].parameters.type, 'object')
+	const toolNames = agent.tools.map((tool) => tool.name)
+	assert.deepEqual(toolNames.sort(), [ATTACHMENT_TOOL_NAME, REPLY_TOOL_NAME].sort(), '应为该会话注册 qq_reply 与附件拉取工具')
+	const replyTool = agent.tools.find((tool) => tool.name === REPLY_TOOL_NAME)
+	assert.equal(replyTool.parameters.type, 'object')
 
 	// 4b) 会话正在运行时再来一条普通消息：先打断，再投递新一轮
 	agent.status = 'running'
@@ -739,5 +799,130 @@ test('待答提问期间：桥命令优先执行，不会被当成「其他」�
 	const settledAnswers = await answer
 	assert.deepEqual(settledAnswers, { answers: [{ id: 'q1', selected: ['甲'] }] })
 	assert.equal(nextCalled, false)
+	boot.dispose()
+})
+
+test('端到端：输入态——附件只能走卡片上的「发送」；裸发附件被丢弃并提示', async (t) => {
+	const fetchStub = stubFetch(16)
+	t.after(() => fetchStub.restore())
+	const agent = makeAgent('session-1')
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': agent } })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+
+	// 先绑定会话
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M1' })
+	await drainFor(boot.socketPath, 60)
+	assert.equal(agent.followed.length, 0)
+
+	// 0) 没进输入态时直接发附件：丢弃 + 回一句提示，且**不进会话**
+	await rpc(boot.socketPath, 'event', {
+		kind: 'c2c_message',
+		openid: 'U1',
+		text: '',
+		msgId: 'M-STRAY',
+		attachments: [{ kind: 'image', contentType: 'image/png', filename: 'stray.png', size: 100, url: 'https://x/stray.png' }],
+	})
+	const stray = await waitFor(async () => (await drainFor(boot.socketPath, 40)).find((c) => c.kind === 'send_c2c'))
+	assert.match(stray.args.content, /已丢弃/)
+	assert.equal(agent.followed.length, 0, '裸发的附件绝不能进会话')
+	assert.equal(fetchStub.calls.length, 0, '被丢弃的附件不该下载')
+	assert.equal(boot.attachments.images.length, 0)
+
+	// 1) 裸发 `发送` → 进入输入态：回一句说明 + 一张预览卡片
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '发送', msgId: 'M2' })
+	const entered = await drainFor(boot.socketPath, 80)
+	const card = entered.filter((c) => c.kind === 'send_c2c' && c.args.keyboard).at(-1)
+	assert.ok(card, '进入输入态要发预览卡片')
+	assert.match(card.args.content, /输入框/)
+	assert.equal(card.args.markdown, true, '带键盘的卡片必须是 markdown')
+	const cardButtons = () => card.args.keyboard.content.rows.flatMap((row) => row.buttons)
+	assert.ok(cardButtons().some((b) => b.render_data.label === '发送'), '卡片上要有「发送」')
+	assert.equal(agent.followed.length, 0, '进输入态不该投给 AI')
+
+	// 2) 输入态里发文字：攒成正文，只回卡片，**不投给 AI**
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '看看这张图', msgId: 'M3' })
+	const afterText = await drainFor(boot.socketPath, 80)
+	const textCard = afterText.filter((c) => c.kind === 'send_c2c' && c.args.keyboard).at(-1)
+	assert.match(textCard.args.content, /看看这张图/)
+	assert.equal(agent.followed.length, 0, '输入态里的文字不该直接投给 AI')
+
+	// 3) 输入态里发图片：自动下载进附件服务，并入列成 A1
+	await rpc(boot.socketPath, 'event', {
+		kind: 'c2c_message',
+		openid: 'U1',
+		text: '',
+		msgId: 'M4',
+		attachments: [{ kind: 'image', contentType: 'image/png', filename: 'cat.png', size: 100, url: 'https://x/cat.png' }],
+	})
+	const afterImage = await waitFor(async () => {
+		const commands = await drainFor(boot.socketPath, 60)
+		return commands.filter((c) => c.kind === 'send_c2c' && c.args.keyboard).at(-1) ?? null
+	})
+	assert.match(afterImage.args.content, /A1/)
+	assert.match(afterImage.args.content, /cat\.png/)
+	assert.equal(boot.attachments.images.length, 1, '图片要存进 dsh 附件服务')
+	assert.equal(boot.attachments.images[0].mediaType, 'image/png')
+	assert.equal(agent.followed.length, 0)
+
+	// 4) 点卡片上的「发送」→ 才真正投给 AI：分节消息（附件清单）+ 正文（含图片块）
+	const sendButton = afterImage.args.keyboard.content.rows
+		.flatMap((row) => row.buttons)
+		.find((b) => b.render_data.label === '发送')
+	await rpc(boot.socketPath, 'event', {
+		kind: 'interaction',
+		openid: 'U1',
+		buttonData: sendButton.action.data,
+		eventId: 'INT-SEND',
+		msgId: afterImage.args.messageId ?? 'CARD',
+	})
+	await waitFor(() => agent.followed.length === 2)
+	const [sectionMessage, mainMessage] = agent.followed
+	assert.equal(sectionMessage.form, 'snapshot', '附件清单要单独一条分节消息')
+	assert.match(sectionMessage.content[0].text, /## 用户随消息附带的附件/)
+	assert.match(sectionMessage.content[0].text, /A1 图片 cat\.png/)
+	assert.equal(mainMessage.form, undefined)
+	assert.equal(mainMessage.content[0].text, '看看这张图')
+	assert.equal(mainMessage.content[1].type, 'image', '图片要以 image 块随正文走')
+	assert.equal(mainMessage.content[1].attachment.attachmentId, 'img-1')
+
+	// 投递后输入态被清空（状态文件是 200ms 防抖落盘，等它写完再读）
+	await new Promise((resolve) => setTimeout(resolve, 260))
+	const persisted = JSON.parse(readFileSync(boot.stateFile, 'utf8'))
+	assert.equal(persisted.inbox?.U1, undefined, '投递后要清掉输入态')
+
+	// 5) 语音没有平台转写 → 拦不住就白拦了：这次发送必须被拒绝
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '发送', msgId: 'M5' })
+	await drainFor(boot.socketPath, 60)
+	await rpc(boot.socketPath, 'event', {
+		kind: 'c2c_message',
+		openid: 'U1',
+		text: '',
+		msgId: 'M6',
+		attachments: [{ kind: 'voice', contentType: 'voice', url: 'https://x/voice.silk' }],
+	})
+	const voiceCard = await waitFor(async () => {
+		const commands = await drainFor(boot.socketPath, 60)
+		return commands.filter((c) => c.kind === 'send_c2c' && c.args.keyboard).at(-1) ?? null
+	})
+	assert.match(voiceCard.args.content, /无法识别/)
+	const beforeBlocked = agent.followed.length
+	const voiceSend = voiceCard.args.keyboard.content.rows
+		.flatMap((row) => row.buttons)
+		.find((b) => b.render_data.label === '发送')
+	await rpc(boot.socketPath, 'event', {
+		kind: 'interaction',
+		openid: 'U1',
+		buttonData: voiceSend.action.data,
+		eventId: 'INT-VOICE',
+		msgId: voiceCard.args.messageId ?? 'CARD2',
+	})
+	const blocked = await waitFor(async () => {
+		const commands = await drainFor(boot.socketPath, 60)
+		return commands.find((c) => c.kind === 'send_c2c' && /被拦住/.test(String(c.args.content))) ?? null
+	})
+	assert.match(blocked.args.content, /删除/)
+	assert.equal(agent.followed.length, beforeBlocked, '有无法识别的语音时绝不能投递')
+
 	boot.dispose()
 })

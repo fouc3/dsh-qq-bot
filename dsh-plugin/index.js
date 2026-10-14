@@ -24,8 +24,11 @@ import { createSessions } from './lib/sessions.js'
 import { createQuestionBridge } from './lib/questions.js'
 import { createRounds } from './lib/rounds.js'
 import { buildReplyTool } from './lib/reply-tool.js'
+import { ATTACHMENT_TOOL_NAME, buildAttachmentTool } from './lib/attachment-tool.js'
+import { DEFAULT_MAX_ATTACHMENT_BYTES, DEFAULT_MAX_FETCH_BYTES, createInbox, formatBytes } from './lib/inbox.js'
 import {
 	QUESTION_MAX_BUTTONS,
+	buildInboxCard,
 	buildNewSessionCard,
 	buildSessionCard,
 	data as cardData,
@@ -43,7 +46,7 @@ import {
 } from './lib/dsh-commands.js'
 
 export const name = 'dsh-qq-bot'
-export const inject = ['agents', 'sessions', 'sessionController', 'workspaceRegistry', 'tools', 'commands']
+export const inject = ['agents', 'sessions', 'sessionController', 'workspaceRegistry', 'tools', 'commands', 'attachments']
 
 /**
  * 递归冻结：与 `createUserMessage` 一样，交给框架的消息必须是不可变快照。
@@ -55,13 +58,46 @@ function deepFreeze(value, seen = new WeakSet()) {
 	return Object.freeze(value)
 }
 
+/** 链接卡片（ark）当文字处理：抽标题/描述/跳转链接，让 AI 知道用户分享的是什么。 */
+function arkAsText(ark) {
+	if (!ark) return ''
+	const bits = []
+	const kind = ark.name || ark.kind
+	if (kind) bits.push(`[链接卡片·${kind}]`)
+	if (ark.title) bits.push(ark.title)
+	if (ark.desc) bits.push(`（${ark.desc}）`)
+	if (ark.url) bits.push(ark.url)
+	return bits.join(' ').trim()
+}
+
 /** 构造一条 user 消息（等价于 @deepseek-ai/dsh-llm 的 createUserMessage）。 */
-function makeUserMessage(text, source) {
+function makeUserMessage(text, source, images = []) {
+	const content = [{ type: 'text', text: String(text) }]
+	// 图片以 image 块随消息走：模型支持视觉就是真看图，不支持时由 dsh 自动降级成
+	// 「图片已存到 <路径>」的占位文本（前端粘贴走的是同一条路）。
+	for (const ref of images) content.push({ type: 'image', attachment: ref })
 	return deepFreeze({
 		id: randomUUID(),
 		role: 'user',
-		content: [{ type: 'text', text: String(text) }],
+		content,
 		source,
+	})
+}
+
+/**
+ * 构造一条「分节消息」：语音转写、附件清单这类要**单独放**的内容。
+ *
+ * 与正文分开的理由（用户要求）：语音转写可能出错，混进正文会被模型当成用户的原话。
+ */
+function makeSectionMessage(sections, source = { kind: 'dsh-qq-bot' }) {
+	const text = sections.map((section) => `## ${section.name}\n${section.text}`).join('\n\n')
+	return deepFreeze({
+		id: randomUUID(),
+		role: 'user',
+		content: [{ type: 'text', text }],
+		source,
+		form: 'snapshot',
+		sections: sections.map((section) => ({ name: section.name, text: section.text })),
 	})
 }
 
@@ -82,6 +118,10 @@ export function apply(ctx, rawConfig) {
 		questionTimeoutMs: rawConfig?.questionTimeoutMs ?? 600000,
 		// 单张提问卡片的按钮上限（平台 5 行 × 每行 4 个）；超了就由提问桥拆成多张卡片。
 		maxQuestionButtons: rawConfig?.maxQuestionButtons ?? QUESTION_MAX_BUTTONS,
+		// 附件（图片/文件/视频）自动下载的单条上限；超过就只登记 url，等模型按需用工具拉。
+		maxAttachmentBytes: rawConfig?.maxAttachmentBytes ?? DEFAULT_MAX_ATTACHMENT_BYTES,
+		// 模型主动拉取单个附件的上限（比自动下载宽松，但仍然要有边界）。
+		maxFetchBytes: rawConfig?.maxFetchBytes ?? DEFAULT_MAX_FETCH_BYTES,
 		replyAckTimeoutMs: rawConfig?.replyAckTimeoutMs ?? 8000,
 		noticeFallbackMs: rawConfig?.noticeFallbackMs ?? 3000,
 		sessionPageSize: rawConfig?.sessionPageSize ?? 8,
@@ -97,6 +137,8 @@ export function apply(ctx, rawConfig) {
 	const state = createState({ file: stateFile, logger })
 	const outbox = createOutbox({ logger })
 	const sessions = createSessions({ ctx, logger, idStyle: config.idStyle })
+	// 输入态（"输入框"）：附件先进这里，点卡片上的「发送」才交给 AI。
+	const inbox = createInbox({ state, attachments: ctx.attachments, config, logger })
 
 	// ── 会话级序号：被动回复按 msg_id+msg_seq 去重，所以每条消息都要递增 ──────
 	const seqByKey = new Map()
@@ -277,7 +319,7 @@ export function apply(ctx, rawConfig) {
 	}
 
 	// ── 消息投递（打断 + 用户级上下文注入 + 唤醒） ───────────────────────────
-	async function deliver({ sessionId, openid, text, interrupt = true, origin = 'qq', context = {} }) {
+	async function deliver({ sessionId, openid, text, interrupt = true, origin = 'qq', context = {}, images = [], sections = [] }) {
 		const agent = await agentFor(sessionId)
 		if (!agent) {
 			await sendText({
@@ -296,7 +338,138 @@ export function apply(ctx, rawConfig) {
 		// 被打断时把「这条消息」当作打断来源：通知里会带一行「> 打断来自：…」。
 		const round = rounds.beginRound({ sessionId, openid, origin, context, interruptSource: interrupt ? text : '' })
 		round.pendingContext = rounds.roundContextText(round)
-		agent.followup(makeUserMessage(text, { kind: 'dsh-qq-bot' }))
+		// 附件与语音转写放「单独的位置」：先投一条分节消息（语音转写排在附件前面，优先级更高），
+		// 再投正文。这样转写错了也不会跟用户真正的指令混成一句被误读。
+		if (sections.length) agent.followup(makeSectionMessage(sections))
+		agent.followup(makeUserMessage(text, { kind: 'dsh-qq-bot' }, images))
+		return { ok: true }
+	}
+
+	// ── 输入态（"输入框"）：附件先入列，点卡片上的「发送」才投递 ──────────────
+	/** 把当前输入态渲染成预览卡片（每次都重发，用户看到的就是"输入框"的当前样子）。 */
+	async function showInboxCard({ openid, sessionId, context = {}, page = 1 }) {
+		const entry = inbox.active(openid)
+		if (!entry) return null
+		const card = buildInboxCard({
+			label: sessions.label(sessionId),
+			sessionId,
+			text: inbox.textOf(entry),
+			items: entry.items,
+			voice: inbox.voiceText(entry),
+			page,
+			pageSize: Number(config.sessionPageSize) || 8,
+		})
+		await io.sendCard({ openid, content: card.content, keyboard: card.keyboard, context })
+		return card
+	}
+
+	/** 裸发 `发送`：进入当前会话的输入态。 */
+	async function beginInput({ openid, sessionId, replyContext = {} }) {
+		const before = inbox.active(openid)
+		if (before && ((before.items ?? []).length > 0 || inbox.textOf(before))) {
+			await sendText({
+				openid,
+				content: '已经有一个没发出去的输入框了，接着往里加就行；不想留就点卡片上的「取消」。',
+				markdown: true,
+				context: replyContext,
+			})
+		}
+		inbox.begin({ openid, sessionId })
+		await sendText({
+			openid,
+			content:
+				`已进入 **${sessions.label(sessionId)}** 的输入态。\n` +
+				'> 下面发的文字会攒成正文，图片/文件/语音/视频自动入列；\n' +
+				'> 点卡片上的「发送」才真正交给 AI，「删除 A1」可以单独去掉某个附件。',
+			markdown: true,
+			context: replyContext,
+		})
+		await showInboxCard({ openid, sessionId, context: replyContext })
+		return { ok: true }
+	}
+
+	/** 点卡片上的「发送」：正文 + 语音转写 + 附件一起投给 AI。 */
+	async function sendFromInbox({ openid, context = {} }) {
+		const entry = inbox.active(openid)
+		if (!entry) {
+			await sendText({ openid, content: '现在不在输入态。发 `发送` 进入输入态。', markdown: true, context })
+			return { ok: false, reason: 'no-input-mode' }
+		}
+		const blocking = inbox.blockingVoice(entry)
+		if (blocking.length > 0) {
+			await sendText({
+				openid,
+				content:
+					`有 ${blocking.length} 条语音拿不到平台转写（${blocking.map((item) => item.id).join(' / ')}），` +
+					'按你的要求这次发送被拦住了：先点「删除」把它们去掉，再发送。',
+				markdown: true,
+				context,
+			})
+			return { ok: false, reason: 'voice-unrecognized' }
+		}
+		const text = inbox.textOf(entry)
+		const items = entry.items ?? []
+		if (!text && items.length === 0) {
+			await sendText({ openid, content: '输入框是空的：先发正文或附件。', markdown: true, context })
+			return { ok: false, reason: 'empty' }
+		}
+
+		const images = []
+		const attachmentLines = []
+		for (const item of items) {
+			const name = item.filename || item.id
+			if (item.status === 'stored' && item.image) {
+				images.push(item.ref)
+				attachmentLines.push(`- ${item.id} 图片 ${name}（作为图片随本条消息给出）`)
+				continue
+			}
+			if (item.status === 'stored') {
+				const host = ctx.attachments?.fileHostPath?.(item.ref) ?? ''
+				attachmentLines.push(`- ${item.id} ${item.kind === 'video' ? '视频' : '文件'} ${name}：只读副本在 \`${host}\``)
+				continue
+			}
+			attachmentLines.push(
+				`- ${item.id} ${item.kind === 'video' ? '视频' : item.kind === 'voice' ? '语音' : '文件'} ${name}：没有自动下载（${item.note || '未知原因'}）` +
+					`，需要内容时调用 \`${ATTACHMENT_TOOL_NAME}\`（id="${item.id}"）拉取`,
+			)
+		}
+		const sections = []
+		const voice = inbox.voiceText(entry)
+		if (voice.length > 0) {
+			// 语音转写单独一段，且排在附件前面：它可能出错，优先级却最高（用户要求）。
+			sections.push({ name: '用户语音的平台转写（可能有误）', text: voice.map((line) => `- ${line}`).join('\n') })
+		}
+		if (attachmentLines.length > 0) sections.push({ name: '用户随消息附带的附件', text: attachmentLines.join('\n') })
+
+		const sessionId = entry.sessionId
+		const label = sessions.label(sessionId)
+		inbox.rememberDelivery({ sessionId, items })
+		inbox.drain({ openid })
+		const cardId = state.lastCardOf(openid)
+		if (cardId) await io.recallCard(openid, cardId)
+		const body = text || '（用户只发了附件，没有写正文）'
+		await deliver({ sessionId, openid, text: body, interrupt: true, origin: 'qq', context, images, sections })
+		await sendText({
+			openid,
+			content: `已发送到 **${label}**（正文 ${text ? `${text.length} 字` : '空'} + 附件 ${items.length} 个）。`,
+			markdown: true,
+			context,
+		})
+		return { ok: true }
+	}
+
+	/** 退出输入态（卡片上的「取消」）。 */
+	async function cancelInbox({ openid, context = {} }) {
+		const entry = inbox.drain({ openid })
+		const count = (entry?.items ?? []).length
+		const cardId = state.lastCardOf(openid)
+		if (cardId) await io.recallCard(openid, cardId)
+		await sendText({
+			openid,
+			content: `已退出输入态${count ? `，丢弃了 ${count} 个附件` : ''}。普通消息照旧直接进会话。`,
+			markdown: true,
+			context,
+		})
 		return { ok: true }
 	}
 
@@ -332,6 +505,8 @@ export function apply(ctx, rawConfig) {
 		showSessionCard: ({ openid, replyContext }) => showSessionCard({ openid, replyContext }),
 		showNewSessionCard: ({ openid, replyContext }) => showNewSessionCard({ openid, replyContext }),
 		createSession: ({ openid, cwd }) => createSessionHere({ openid, cwd }),
+		// 裸发 `发送` 进入输入态（详细设计见 lib/inbox.js 顶部注释）。
+		beginInput: ({ openid, sessionId, replyContext }) => beginInput({ openid, sessionId, replyContext }),
 		// 进度是**只读**的：只用 agents.get（不 resume、不 cancel）；拿不到活跃 agent 就如实说没在跑。
 		progress: async ({ sessionId }) => {
 			const label = sessions.get(sessionId) ? sessions.label(sessionId) : sessionId
@@ -384,10 +559,17 @@ export function apply(ctx, rawConfig) {
 			agent.ctx.effect(() => {
 				// 直接注册 ToolDefinition：bundle 自包含，不依赖 dsh 包里的 defineTool。
 				const toolDisposer = agent.ctx.tools.register(buildReplyTool({ outbox, config, logger, target }))
+				// 没自动下载的附件（过大/下载失败）：让模型按需拉一份只读副本。
+				const attachDisposer = agent.ctx.tools.register(buildAttachmentTool({ inbox, logger, target }))
 				const roundsDisposer = rounds.attachAgent(agent, sessionId)
 				return () => {
 					try {
 						toolDisposer?.()
+					} catch {
+						// 忽略
+					}
+					try {
+						attachDisposer?.()
 					} catch {
 						// 忽略
 					}
@@ -398,7 +580,7 @@ export function apply(ctx, rawConfig) {
 					}
 				}
 			}, 'dsh-qq-bot: agent scope')
-			logger.debug?.('已为会话注册 qq_reply 与轮次监听', { sessionId })
+			logger.debug?.('已为会话注册 qq_reply / qq_fetch_attachment 与轮次监听', { sessionId })
 		} catch (error) {
 			attached.delete(sessionId)
 			logger.warn?.('为会话注册工具失败', { sessionId, error: String(error) })
@@ -500,7 +682,34 @@ export function apply(ctx, rawConfig) {
 		// 3) 有待答提问：普通文本＝该题的「其他」答案
 		if (questions.hasPending(openid) && (await questions.handleText(openid, event.text))) return
 
-		// 4) 普通消息 → 当前绑定会话
+		// 4) 输入态：文字攒成正文、附件自动入列，都只回一张预览卡片（**不投给 AI**）。
+		//    用户明确要求：附件只能通过卡片上的「发送」交出去。
+		const income = inbox.active(openid)
+		const incoming = Array.isArray(event.attachments) ? event.attachments : []
+		const arkText = arkAsText(event.ark)
+		if (income) {
+			if (incoming.length > 0) await inbox.addAttachments({ openid, attachments: incoming })
+			const parts = []
+			if (arkText) parts.push(arkText)
+			if (event.quote) parts.push(`[引用的消息] ${event.quote}`)
+			if (String(event.text ?? '').trim()) parts.push(String(event.text).trim())
+			if (parts.length > 0) inbox.appendText({ openid, text: parts.join('\n\n') })
+			await showInboxCard({ openid, sessionId: income.sessionId, context })
+			return
+		}
+
+		// 5) 没进输入态时直接发来的附件：丢弃 + 回一句提示（用户选的「丢弃并回一句」）。
+		//    链接卡片当文字处理（它不是可下载的附件），所以这里只数真正的附件。
+		if (incoming.length > 0) {
+			await sendText({
+				openid,
+				content: `这条消息带的 ${incoming.length} 个附件已丢弃：附件只能先发 \`发送\` 进入输入态，再传进来。`,
+				markdown: true,
+				context,
+			})
+		}
+
+		// 6) 普通消息 → 当前绑定会话
 		const bound = state.bindingOf(openid)
 		if (!bound || bound === 'none') {
 			await sendText({
@@ -517,7 +726,11 @@ export function apply(ctx, rawConfig) {
 			return
 		}
 		// 引用消息：把被引用的那条也带进会话，否则 AI 看不到用户在说哪一条。
-		const body = (event.quote ? `[引用的消息] ${event.quote}\n\n${event.text}` : event.text).trim()
+		// 链接卡片（ark）当文字带进去；真正的附件在第 5 步已经丢弃并提示过了。
+		const body = [arkText, event.quote ? `[引用的消息] ${event.quote}` : '', event.text]
+			.map((part) => String(part ?? '').trim())
+			.filter(Boolean)
+			.join('\n\n')
 		if (!body) return
 		await deliver({ sessionId: bound, openid, text: body, interrupt: true, origin: 'qq', context })
 	}
@@ -568,6 +781,30 @@ export function apply(ctx, rawConfig) {
 		} else if (parsed.kind === 'question') {
 			const result = await questions.handleCallback({ ...parsed, callId: parsed.callId }, { openid })
 			code = result.code
+		} else if (parsed.kind === 'inbox') {
+			const ctxReply = { eventId: event.eventId, msgId: event.msgId ?? '' }
+			const entry = inbox.active(openid)
+			if (!entry) {
+				await sendText({ openid, content: '这个输入框已经结束了。发 `发送` 重新进入输入态。', markdown: true, context: ctxReply })
+			} else if (parsed.action === 'rm') {
+				inbox.removeItem({ openid, itemId: parsed.arg })
+				await showInboxCard({ openid, sessionId: entry.sessionId, context: ctxReply })
+				code = 0
+			} else if (parsed.action === 'clear') {
+				inbox.clearText({ openid })
+				await showInboxCard({ openid, sessionId: entry.sessionId, context: ctxReply })
+				code = 0
+			} else if (parsed.action === 'page') {
+				await showInboxCard({ openid, sessionId: entry.sessionId, context: ctxReply, page: parsed.page })
+				code = 0
+			} else if (parsed.action === 'cancel') {
+				await cancelInbox({ openid, context: ctxReply })
+				code = 0
+			} else if (parsed.action === 'send') {
+				const result = await sendFromInbox({ openid, context: ctxReply })
+				// 被拦住（语音没转写/空输入框）时回 code 1：按钮保持可点，用户处理完还能再试。
+				code = result.ok ? 0 : 1
+			}
 		}
 		outbox.enqueue('respond_interaction', { interactionId: event.eventId, code })
 	}

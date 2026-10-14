@@ -104,6 +104,8 @@ export const data = {
 	newHere: (path) => `${DATA_PREFIX}:new:${path}`,
 	// callId 放在最后：它是变长的，这样解析时"剩余部分就是 callId"，不会被分隔符切坏。
 	question: (callId, questionIndex, action) => `${DATA_PREFIX}:q:${questionIndex}:${action}:${callId}`,
+	// 输入态预览卡片：rm:<附件id> / page:<n> / send / clear / cancel
+	inbox: (action, arg = '') => `${DATA_PREFIX}:inbox:${action}${arg ? `:${arg}` : ''}`,
 }
 
 /** 解析回调 data；不是本插件的数据返回 null。 */
@@ -111,6 +113,15 @@ export function parseCallback(raw) {
 	if (typeof raw !== 'string' || !raw.startsWith(`${DATA_PREFIX}:`)) return null
 	if (raw.startsWith(`${DATA_PREFIX}:needreply:`)) {
 		return { kind: 'needreply', sessionId: raw.slice(`${DATA_PREFIX}:needreply:`.length) }
+	}
+	if (raw.startsWith(`${DATA_PREFIX}:inbox:`)) {
+		const rest = raw.slice(`${DATA_PREFIX}:inbox:`.length)
+		const first = rest.indexOf(':')
+		const action = first < 0 ? rest : rest.slice(0, first)
+		const arg = first < 0 ? '' : rest.slice(first + 1)
+		if (!action) return null
+		if (action === 'page') return { kind: 'inbox', action, page: Number(arg) || 1 }
+		return { kind: 'inbox', action, arg }
 	}
 	if (raw.startsWith(`${DATA_PREFIX}:new:`)) {
 		return { kind: 'newhere', path: raw.slice(`${DATA_PREFIX}:new:`.length) }
@@ -437,4 +448,98 @@ export function buildQuestionCard(input) {
 	const cards = buildQuestionCards(input)
 	if (!cards || cards.length !== 1) return null
 	return { content: cards[0].content, keyboard: cards[0].keyboard }
+}
+
+// ── 输入态预览卡片 ───────────────────────────────────────────────────────
+
+/** 卡片上附件要显示的字节数（没有就省略）。 */
+function sizeLabel(size) {
+	const bytes = Number(size)
+	if (!Number.isFinite(bytes) || bytes <= 0) return ''
+	if (bytes < 1024) return `${bytes} B`
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+	return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+}
+
+const KIND_LABEL = { image: '图片', file: '文件', video: '视频', voice: '语音', unknown: '附件' }
+
+/** 一行附件描述（正文里用，状态写得直白一点）。 */
+export function describeInboxItem(item) {
+	const bits = [`**${item.id}**`, KIND_LABEL[item.kind] ?? '附件']
+	if (item.filename) bits.push(item.filename)
+	const size = sizeLabel(item.size)
+	if (size) bits.push(size)
+	const head = bits.join(' · ')
+	switch (item.status) {
+		case 'stored':
+			return `${head} · ✅ 已下载`
+		case 'voice':
+			return `${head} · 🎙 转写：${item.asrText}`
+		case 'voice-unrecognized':
+			return `${head} · ⚠️ **无法识别**：平台没有给出转写文本，请先删除它再「发送」`
+		case 'oversize':
+			return `${head} · ⚠️ 未下载（${item.note || '超过自动下载上限'}）`
+		default:
+			return `${head} · ⚠️ 未下载（${item.note || '自动下载失败'}）`
+	}
+}
+
+/**
+ * 输入态预览卡片。
+ *
+ * 「发送」是唯一把内容交给 AI 的入口；附件各自一个「删除」按钮；
+ * 语音转写单独一段（排在附件之前，用户明确要求）。
+ *
+ * @param {object} input
+ * @param {string} [input.label] 会话显示名
+ * @param {string} input.sessionId
+ * @param {string} input.text 已攒的正文
+ * @param {Array<object>} [input.items] 附件条目（inbox.js 的形状）
+ * @param {string[]} [input.voice] 语音转写文本
+ * @param {number} [input.page]
+ * @param {number} [input.pageSize]
+ * @returns {{content:string, keyboard:object}}
+ */
+export function buildInboxCard({ label, sessionId, text, items = [], voice = [], page = 1, pageSize = 8 }) {
+	const total = items.length
+	const pages = Math.max(1, Math.ceil(total / Math.max(1, pageSize)))
+	const current = Math.min(Math.max(1, Number(page) || 1), pages)
+	const slice = items.slice((current - 1) * pageSize, current * pageSize)
+
+	const lines = [`**输入框** · ${label ?? sessionId}`, `> 会话：\`${sessionId}\``, '']
+	lines.push('**正文**')
+	if (String(text ?? '').trim()) {
+		for (const line of String(text).split('\n')) lines.push(`> ${line || ' '}`)
+	} else {
+		lines.push('> （还没写正文：直接发一条文字就会填进来）')
+	}
+
+	if (voice.length) {
+		lines.push('', '---', '', '**语音转写**（独立一段，优先级高于其它附件）')
+		for (const item of voice) lines.push(`> 🎙 ${item}`)
+	}
+
+	lines.push('', '---', '', `**附件（${total}）**`)
+	if (total === 0) {
+		lines.push('> （还没有附件：直接发图片/文件/语音/视频就会入列）')
+	} else {
+		for (const item of slice) lines.push(describeInboxItem(item))
+	}
+	if (pages > 1) lines.push('', `> 第 ${current}/${pages} 页（每页 ${pageSize} 个），用下面的「上一页/下一页」翻。`)
+	lines.push('', '> 点「发送」才真正交给 AI；「删除」只影响这一条附件。')
+
+	const itemButtons = slice.map((item) => callbackButton(`删除 ${item.id}`, data.inbox('rm', item.id)))
+	const rows = rowsOf(itemButtons, 4)
+	if (pages > 1) {
+		const nav = []
+		if (current > 1) nav.push(callbackButton('上一页', data.inbox('page', String(current - 1))))
+		if (current < pages) nav.push(callbackButton('下一页', data.inbox('page', String(current + 1))))
+		if (nav.length) rows.push({ buttons: nav })
+	}
+	const actions = [callbackButton('发送', data.inbox('send'), { style: 4 })]
+	if (String(text ?? '').trim()) actions.push(callbackButton('清空正文', data.inbox('clear')))
+	actions.push(callbackButton('取消', data.inbox('cancel')))
+	rows.push({ buttons: actions })
+
+	return { content: lines.join('\n'), keyboard: keyboardOf(rows) }
 }

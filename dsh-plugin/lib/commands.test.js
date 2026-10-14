@@ -35,7 +35,7 @@ function makeSessions() {
 }
 
 function makeRunner({ seed = {} } = {}) {
-	const calls = { replies: [], delivered: [], stopped: [], archived: [], cards: [] }
+	const calls = { replies: [], delivered: [], stopped: [], archived: [], cards: [], inputs: [] }
 	const state = createState({ seed })
 	const runner = createCommandRunner({
 		sessions: makeSessions(),
@@ -44,6 +44,10 @@ function makeRunner({ seed = {} } = {}) {
 		reply: async ({ openid, content }) => calls.replies.push({ openid, content }),
 		showSessionCard: async ({ openid, dir }) => calls.cards.push({ openid, dir }),
 		deliver: async (req) => calls.delivered.push(req),
+		beginInput: async ({ openid, sessionId }) => {
+			calls.inputs.push({ openid, sessionId })
+			return { ok: true }
+		},
 		stopSession: async (sessionId) => {
 			calls.stopped.push(sessionId)
 			return { ok: true }
@@ -69,7 +73,8 @@ test('parseCommand：可带一个前导斜杠，非命令返回 null', () => {
 	assert.equal(parseCommand('你好'), null)
 	assert.equal(parseCommand('/'), null)
 	assert.equal(parseCommand(''), null)
-	assert.equal(requiresArgs('发送'), true)
+	assert.equal(requiresArgs('发送'), false, '裸发 `发送` 要能进输入态，所以不算"必须带参"')
+	assert.equal(requiresArgs('延迟发送'), true)
 	assert.equal(requiresArgs('停止'), false)
 })
 
@@ -109,11 +114,12 @@ test('切换会话：归档会话不能接入', async () => {
 	assert.match(calls.replies.at(-1).content, /已归档/)
 })
 
-test('发送：无参/缺内容回用法；带目标与内容则投递（不打断）', async () => {
+test('发送：裸发进输入态；缺内容回用法；带目标与内容则投递（不打断）', async () => {
 	const { runner, calls, state: s } = makeRunner({ seed: boundSeed() })
 
+	// 裸发 `发送` = 进当前会话的输入态（不投递、不打断）
 	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('发送'))
-	assert.match(calls.replies.at(-1).content, /用法/)
+	assert.deepEqual(calls.inputs, [{ openid: 'U1', sessionId: 'session-1' }])
 	assert.equal(calls.delivered.length, 0)
 
 	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('发送 session-2'))
@@ -128,6 +134,13 @@ test('发送：无参/缺内容回用法；带目标与内容则投递（不打�
 	assert.match(calls.replies.at(-1).content, /已投递/)
 	// 绑定没被改
 	assert.equal(s.bindingOf('U1'), 'session-1')
+})
+
+test('发送：没绑定会话时裸发不进输入态，而是回用法', async () => {
+	const { runner, calls } = makeRunner()
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('发送'))
+	assert.equal(calls.inputs.length, 0)
+	assert.match(calls.replies.at(-1).content, /没有绑定会话/)
 })
 
 test('延迟发送：带目标与内容登记；无参/缺内容回用法', async () => {

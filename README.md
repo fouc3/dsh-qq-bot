@@ -29,6 +29,7 @@ QQ 用户 ──私聊──▶ QQ 开放平台 ──WebSocket──▶ Go: dsh
 | 私聊消息转发 | QQ 消息 → 绑定会话；**会话正在跑就先打断**，空闲则直接开轮 |
 | AI 回复到 QQ | AI 调用 `qq_reply` 工具；每条回复开头带 `【标题(会话id)】` |
 | 富媒体 | `qq_reply` 可发图片/视频/语音/文件：本机路径走分片上传，公网 URL 直传 |
+| 输入态与附件 | 裸发 `发送` 进入**输入态**：文字攒成正文、图片/文件/语音/视频自动入列（每个附件一个「删除」按钮），点预览卡片上的「发送」才交给 AI；没进输入态时直接发来的附件**丢弃并提示**；语音只用**平台转写**且单独一段、转写失败**拦住发送**；超限附件不自动下载，模型可调 `qq_fetch_attachment` 按需拉 |
 | 结束通知 | 每轮结束发 `标题(会话id)已结束` + 一个「我需要回复」按钮 |
 | 未回复补救 | **不再要求 AI 必须回复**：没回复时用户点「我需要回复」→ 注入唤醒消息要求 AI 回复该用户，并提示已触发 |
 | 提问桥 | dsh 的 `ask_user_question` 在 QQ 侧渲染成 md 选择卡片：**按钮只写字母 A/B/C**，字母对照与选项小字写在题干与按钮之间；支持「其他」打字、提交（空提交=跳过）；一卡放不下（上限 20 个按钮）自动拆多张卡片，每张都能提交 |
@@ -134,7 +135,7 @@ ls -ld ~/.dsh/dsh-qq-bot ~/.dsh/dsh-qq-bot/bridge.sock   # 应为 drwx------ 与
   - `whitelist.users[].openid`：**白名单**（空 = 谁都不能用）；`panel: true` 的那条就是**被绑定指令面板的私聊**；
   - 任意字符串值可写 `${ENV_VAR}`，**引用了未设置的变量会启动失败**（不用环境变量就留空）；
   - 未知键名会启动失败，拼错不会静默忽略。
-- **插件侧**：`dsh-plugin/cordis.patch.yml` 里这一行的 `config:`（缺省值见文件内注释）：`socketPath`、可选 `token`、`stateFile`、回复前缀模板、结束通知模板、提问超时等。
+- **插件侧**：`dsh-plugin/cordis.patch.yml` 里这一行的 `config:`（缺省值见文件内注释）：`socketPath`、可选 `token`、`stateFile`、回复前缀模板、结束通知模板、提问超时、附件自动下载上限 `maxAttachmentBytes`（默认 50 MiB）与模型按需拉取上限 `maxFetchBytes`（默认 500 MiB）等。
 
 **openid 怎么拿**：让目标账号给机器人发一条私聊，网关会记一条 WARN：
 
@@ -187,12 +188,18 @@ level=WARN msg="已丢弃非白名单用户的私聊" openid=2A3B4C… text_len=
   —— `lib/cards.test.js` + `lib/plugin.test.js`（断言 `action.type` 与 `recall_c2c`）
 - ✅ 每轮结束发「标题(会话id)已结束」+「我需要回复」；被顶替/未认领/被停止的轮次不发
   —— `lib/rounds.test.js` + `lib/plugin.test.js`
-- ✅ 点「我需要回复」：绑定不符=4、运行中=2、成功=0，并注入唤醒消息 + 回「已触发」
+- ✅ 点「我需要回复」：绑定不符=4、运行中=1（失败，绝不用 2）、成功=0，并注入唤醒消息 + 回「已触发」
   —— `lib/rounds.test.js` + `lib/plugin.test.js`
 - ✅ `延迟发送 <目标> <内容>` 登记、只在本轮**正常结束**时投递、投递后清槽；无参回用法
   —— `lib/rounds.test.js`「只在正常结束时投递」+ `lib/commands.test.js`
 - ✅ 提问：`ask_user_question` → QQ 卡片（按钮只写字母、对照与选项小字在正文、选项/多选/「其他」打字/空提交=跳过/只撤回并重发被点的那张/一卡放不下拆多张/超时或放不下时交回 GUI 并在 QQ 侧说明）
   —— `lib/questions.test.js` + `lib/plugin.test.js`「提问桥」
+- ✅ 输入态：裸发 `发送` 进入；输入态里文字只攒正文、附件自动入列并回预览卡片（**不投给 AI**）；点卡片「发送」才投递（分节消息带附件清单/语音转写 + 正文带图片块）；「删除 A1」只删一条；「取消」清空退出
+  —— `lib/inbox.test.js` + `lib/plugin.test.js`「输入态」
+- ✅ 附件：图片走 `saveImages`（image 块进视觉通道）、文件/视频走 `saveFileStream`（只读副本路径）；语音只用平台转写且单独一段；没有转写的语音标「无法识别」并**拦住发送**；超自动上限（默认 50 MiB）不下载，模型用 `qq_fetch_attachment` 按需拉（默认上限 500 MiB）
+  —— `lib/inbox.test.js` + `lib/attachment-tool.js` + `lib/plugin.test.js`「输入态」
+- ✅ 没进输入态时直接发来的附件：丢弃 + 回一句提示（不会悄悄进会话）
+  —— `lib/plugin.test.js`「输入态」
 - ✅ UNIX socket 通道：目录 0700 / socket 0600 / 可选 token / 帧上限 1 MiB / 残留 socket 清理 / health 诊断
   —— `lib/socket.test.js` + Go `internal/bridge/socketclient_test.go`
 - ✅ 出站队列 at-least-once（失败不消费、超时重投沿用原 id、撤回不重投、ack 唤醒等待者）

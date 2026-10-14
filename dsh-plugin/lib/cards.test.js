@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 
 import {
 	QUESTION_MAX_BUTTONS,
+	buildInboxCard,
 	buildNewSessionCard,
 	buildNoticeCard,
 	buildQuestionCard,
@@ -275,4 +276,65 @@ test('parseCallback 覆盖四类数据，非本插件的数据返回 null', () =
 	})
 	assert.equal(parseCallback('something-else'), null)
 	assert.equal(parseCallback(undefined), null)
+})
+
+test('parseCallback：输入态卡片的删除/翻页/发送/清空/取消都能还原', () => {
+	assert.deepEqual(parseCallback(data.inbox('rm', 'A3')), { kind: 'inbox', action: 'rm', arg: 'A3' })
+	assert.deepEqual(parseCallback(data.inbox('page', '2')), { kind: 'inbox', action: 'page', page: 2 })
+	assert.deepEqual(parseCallback(data.inbox('send')), { kind: 'inbox', action: 'send', arg: '' })
+	assert.deepEqual(parseCallback(data.inbox('clear')), { kind: 'inbox', action: 'clear', arg: '' })
+	assert.deepEqual(parseCallback(data.inbox('cancel')), { kind: 'inbox', action: 'cancel', arg: '' })
+})
+
+test('输入态预览卡片：每个附件一个「删除」，语音转写单独一段且排在附件之前', () => {
+	const card = buildInboxCard({
+		label: 'proj-a(session-1)',
+		sessionId: 'session-1',
+		text: '看看这个',
+		items: [
+			{ id: 'A1', kind: 'image', filename: 'cat.png', size: 2048, status: 'stored', image: true },
+			{ id: 'A2', kind: 'video', filename: 'big.mp4', size: 999, status: 'oversize', note: '超过自动下载上限 50.0 MB' },
+			{ id: 'A3', kind: 'voice', status: 'voice', asrText: '帮我看下' },
+		],
+		voice: ['帮我看下'],
+	})
+
+	assert.match(card.content, /\*\*输入框\*\*/)
+	assert.match(card.content, /看看这个/)
+	assert.match(card.content, /A1.*cat\.png.*已下载/)
+	assert.match(card.content, /A2.*未下载/)
+	assert.match(card.content, /A3.*转写：帮我看下/)
+	assert.ok(
+		card.content.indexOf('**语音转写**') < card.content.indexOf('**附件（3）**'),
+		'语音转写要排在附件之前（优先级更高）',
+	)
+
+	const labels = card.keyboard.content.rows.flatMap((row) => row.buttons.map((b) => b.render_data.label))
+	assert.deepEqual(labels, ['删除 A1', '删除 A2', '删除 A3', '发送', '清空正文', '取消'])
+	assert.ok(card.keyboard.content.rows.length <= 5)
+})
+
+test('输入态预览卡片：附件多时翻页，且每页都不超平台行数', () => {
+	const items = Array.from({ length: 10 }, (_, i) => ({
+		id: `A${i + 1}`,
+		kind: 'file',
+		filename: `f${i + 1}.bin`,
+		size: 10,
+		status: 'stored',
+	}))
+	const first = buildInboxCard({ label: 'x(s-1)', sessionId: 's-1', text: '', items, page: 1, pageSize: 8 })
+	const labels = first.keyboard.content.rows.flatMap((row) => row.buttons.map((b) => b.render_data.label))
+	assert.equal(labels.filter((label) => label.startsWith('删除')).length, 8)
+	assert.ok(labels.includes('下一页'))
+	assert.ok(!labels.includes('上一页'))
+	assert.ok(!labels.includes('清空正文'), '没正文就不出现「清空正文」')
+	assert.match(first.content, /第 1\/2 页/)
+	assert.ok(first.keyboard.content.rows.length <= 5)
+
+	const second = buildInboxCard({ label: 'x(s-1)', sessionId: 's-1', text: '', items, page: 2, pageSize: 8 })
+	const secondLabels = second.keyboard.content.rows.flatMap((row) => row.buttons.map((b) => b.render_data.label))
+	assert.equal(secondLabels.filter((label) => label.startsWith('删除')).length, 2)
+	assert.ok(secondLabels.includes('上一页'))
+	assert.ok(!secondLabels.includes('下一页'))
+	assert.ok(second.keyboard.content.rows.length <= 5)
 })

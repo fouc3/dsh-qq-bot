@@ -8,8 +8,10 @@ import (
 	qqbotsdk "github.com/fouc3/qq-bot-sdk"
 )
 
+// allowOne 是"只放行 OPENID-A"的门守，多个用例共用。
+func allowOne(openid string) bool { return openid == "OPENID-A" }
+
 func TestDecideC2C(t *testing.T) {
-	allowOne := func(openid string) bool { return openid == "OPENID-A" }
 
 	cases := []struct {
 		name        string
@@ -58,14 +60,14 @@ func TestDecideC2C(t *testing.T) {
 			wantReason:  "空文本",
 		},
 		{
-			name: "非纯文本（ARK 卡片）",
+			name: "非文本消息且没有可读内容（空 ark 卡片）",
 			data: &qqbotsdk.C2CMessageCreateData{
 				ID: "M3", Content: "", MessageType: 3,
 				Author: &qqbotsdk.User{UserOpenID: "OPENID-A"},
 			},
 			allowed:     allowOne,
 			wantForward: false,
-			wantReason:  "非纯文本消息",
+			wantReason:  "非文本消息且没有可读内容",
 		},
 		{
 			name: "不配置白名单时不做门守（供单测/灰度）",
@@ -111,6 +113,118 @@ func TestDecideC2C(t *testing.T) {
 		}, allowOne)
 		if got.Event.Text != "第一行\n第二行" {
 			t.Errorf("内部换行不该被压掉：%q", got.Event.Text)
+		}
+	})
+}
+
+// 附件与 ark 卡片必须能被转发：以前只认文字，"发张图给 AI 看"根本进不来。
+func TestDecideC2CForwardsAttachments(t *testing.T) {
+	author := &qqbotsdk.User{UserOpenID: "OPENID-A"}
+
+	t.Run("图片消息：没有文字也要转发，并归一化成 image", func(t *testing.T) {
+		got := DecideC2C(&qqbotsdk.C2CMessageCreateData{
+			ID: "M-IMG", Content: "", MessageType: 7,
+			Author: author,
+			Attachments: []qqbotsdk.MessageAttachment{{
+				URL: "https://multimedia.nt.qq.com.cn/download?fileid=abc", Filename: "cat.png",
+				Size: 2048, ContentType: qqbotsdk.AttachmentContentTypePNG,
+			}},
+		}, allowOne)
+		if !got.Forward {
+			t.Fatalf("图片消息应转发，reason=%q", got.Reason)
+		}
+		if len(got.Event.Attachments) != 1 {
+			t.Fatalf("Attachments = %d，期望 1", len(got.Event.Attachments))
+		}
+		item := got.Event.Attachments[0]
+		if item.Kind != AttachmentKindImage || item.Filename != "cat.png" || item.Size != 2048 {
+			t.Errorf("附件归一化不对：%+v", item)
+		}
+		if !strings.Contains(item.URL, "fileid=abc") {
+			t.Errorf("下载地址应原样带着：%q", item.URL)
+		}
+	})
+
+	t.Run("语音：平台转写跟着走；没有转写时 asrText 为空（插件侧要拦住发送）", func(t *testing.T) {
+		got := DecideC2C(&qqbotsdk.C2CMessageCreateData{
+			ID: "M-VOICE", MessageType: 7, Author: author,
+			Attachments: []qqbotsdk.MessageAttachment{
+				{URL: "https://x/voice.silk", ContentType: qqbotsdk.AttachmentContentTypeVoice, ASRReferText: "帮我看看这个 bug"},
+				{URL: "https://x/voice2.silk", ContentType: qqbotsdk.AttachmentContentTypeVoice, VoiceWavURL: "https://x/voice2.wav"},
+			},
+		}, allowOne)
+		if !got.Forward || len(got.Event.Attachments) != 2 {
+			t.Fatalf("Forward=%v len=%d", got.Forward, len(got.Event.Attachments))
+		}
+		if got.Event.Attachments[0].Kind != AttachmentKindVoice {
+			t.Errorf("Kind = %q", got.Event.Attachments[0].Kind)
+		}
+		if got.Event.Attachments[0].ASRText != "帮我看看这个 bug" {
+			t.Errorf("转写文本要原样带上：%q", got.Event.Attachments[0].ASRText)
+		}
+		if got.Event.Attachments[1].ASRText != "" {
+			t.Errorf("没有转写就该是空的：%q", got.Event.Attachments[1].ASRText)
+		}
+		if got.Event.Attachments[1].VoiceWavURL != "https://x/voice2.wav" {
+			t.Errorf("wav 地址要留档：%q", got.Event.Attachments[1].VoiceWavURL)
+		}
+	})
+
+	t.Run("视频与未知类型分别归一化", func(t *testing.T) {
+		got := DecideC2C(&qqbotsdk.C2CMessageCreateData{
+			ID: "M-MEDIA", MessageType: 7, Author: author,
+			Attachments: []qqbotsdk.MessageAttachment{
+				{URL: "https://x/a.mp4", ContentType: qqbotsdk.AttachmentContentTypeMP4},
+				{URL: "https://x/b.bin", ContentType: "application/octet-stream"},
+			},
+		}, allowOne)
+		if got.Event.Attachments[0].Kind != AttachmentKindVideo {
+			t.Errorf("Kind = %q，期望 video", got.Event.Attachments[0].Kind)
+		}
+		if got.Event.Attachments[1].Kind != AttachmentKindUnknown {
+			t.Errorf("Kind = %q，期望 unknown", got.Event.Attachments[1].Kind)
+		}
+	})
+
+	t.Run("没有下载地址的附件被丢掉，不产生空条目", func(t *testing.T) {
+		got := DecideC2C(&qqbotsdk.C2CMessageCreateData{
+			ID: "M-NOURL", Content: "", MessageType: 7, Author: author,
+			Attachments: []qqbotsdk.MessageAttachment{{ContentType: qqbotsdk.AttachmentContentTypePNG}},
+		}, allowOne)
+		if got.Forward {
+			t.Fatal("没有可下载内容的附件消息不该转发")
+		}
+		if !strings.Contains(got.Reason, "没有可读内容") {
+			t.Errorf("Reason = %q", got.Reason)
+		}
+	})
+
+	t.Run("文字 + 附件混发：两样都带上", func(t *testing.T) {
+		got := DecideC2C(&qqbotsdk.C2CMessageCreateData{
+			ID: "M-MIX", Content: " 看看这张图 ", MessageType: 7, Author: author,
+			Attachments: []qqbotsdk.MessageAttachment{{URL: "https://x/1.jpg", ContentType: qqbotsdk.AttachmentContentTypeJPEG}},
+		}, allowOne)
+		if !got.Forward || got.Event.Text != "看看这张图" || len(got.Event.Attachments) != 1 {
+			t.Fatalf("混发应同时带上文字与附件：%+v", got.Event)
+		}
+	})
+
+	t.Run("ark 卡片：抽标题/描述/跳转链接，没有文字也能转发", func(t *testing.T) {
+		got := DecideC2C(&qqbotsdk.C2CMessageCreateData{
+			ID: "M-ARK", Content: "", MessageType: qqbotsdk.EventMsgTypeArk, Author: author,
+			ArkData: &qqbotsdk.ARKData{
+				ArkType: qqbotsdk.ARKTypeTuwen, ArkName: "图文", Prompt: "[QQ小程序]",
+				Fields: map[string]any{"title": "某篇文章", "desc": "摘要文字", "jump_url": "https://example.com/a"},
+			},
+		}, allowOne)
+		if !got.Forward {
+			t.Fatalf("带内容的 ark 卡片应转发，reason=%q", got.Reason)
+		}
+		if got.Event.Ark == nil || got.Event.Ark.Title != "某篇文章" || got.Event.Ark.Desc != "摘要文字" || got.Event.Ark.URL != "https://example.com/a" {
+			t.Fatalf("ark 摘要不对：%+v", got.Event.Ark)
+		}
+		if got.Event.Text != "" {
+			t.Errorf("ark 卡片的文字不该被伪造：%q", got.Event.Text)
 		}
 	})
 }

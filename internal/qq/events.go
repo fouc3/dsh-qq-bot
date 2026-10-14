@@ -20,7 +20,133 @@ type Event struct {
 	ButtonData string `json:"buttonData,omitempty"`
 	// Quote 是用户引用的那条消息的文本（引用消息才有；QQ 的 message_type=103）。
 	Quote string `json:"quote,omitempty"`
-	At    string `json:"at,omitempty"`
+	// Attachments 是这条消息带的图片/文件/语音/视频（可能为空）。
+	// 网关**只转发元数据**（含下载地址），下载与入库由 dsh 插件负责：
+	// 插件那边正好要用字节去喂 dsh 的附件服务，没必要在 Go 侧再落地一份临时文件。
+	Attachments []Attachment `json:"attachments,omitempty"`
+	// Ark 是链接/小程序卡片的摘要（ark 消息才有）。
+	Ark *Ark   `json:"ark,omitempty"`
+	At  string `json:"at,omitempty"`
+}
+
+// 附件种类（SDK 的 content_type 归一化后的取值）。
+const (
+	AttachmentKindImage = "image"
+	AttachmentKindFile  = "file"
+	AttachmentKindVideo = "video"
+	AttachmentKindVoice = "voice"
+	// AttachmentKindUnknown 是认不出的 content_type（照样转发，插件按文件处理）。
+	AttachmentKindUnknown = "unknown"
+)
+
+// Attachment 是消息里一个附件的元数据。
+type Attachment struct {
+	// Kind 是归一化后的种类：image / file / video / voice / unknown。
+	Kind string `json:"kind"`
+	// ContentType 是平台给的原始 content_type（如 image/png、voice、file）。
+	ContentType string `json:"contentType,omitempty"`
+	// Filename 是平台给的文件名（图片也可能为空）。
+	Filename string `json:"filename,omitempty"`
+	// Size 是字节数（平台可能给 0，表示未知）。
+	Size int64 `json:"size,omitempty"`
+	// URL 是下载地址（平台给的签名直链）。
+	URL string `json:"url,omitempty"`
+	// VoiceWavURL 是语音的 wav 版本地址（本项目默认不下载音频，仅留档）。
+	VoiceWavURL string `json:"voiceWavUrl,omitempty"`
+	// ASRText 是平台给这条语音做的转写文本；为空表示平台没有转写——
+	// 插件侧会把它标成「无法识别」并拦住发送。
+	ASRText string `json:"asrText,omitempty"`
+}
+
+// Ark 是 ark 卡片（链接分享、小程序分享）里我们关心的几个字段。
+type Ark struct {
+	// Kind 是平台给的 ark_type（如 tuwen、miniapp）。
+	Kind string `json:"kind,omitempty"`
+	// Name 是平台给的中文类型名（如「图文」）。
+	Name string `json:"name,omitempty"`
+	// Prompt 是卡片对用户展示的提示语。
+	Prompt string `json:"prompt,omitempty"`
+	// Title / Desc / URL 从 fields 里抽出来（键名见 SDK 的 ARKData 注释）。
+	Title string `json:"title,omitempty"`
+	Desc  string `json:"desc,omitempty"`
+	URL   string `json:"url,omitempty"`
+}
+
+// attachmentKind 把平台的 content_type 归一化成我们的种类。
+func attachmentKind(contentType string) string {
+	switch strings.ToLower(strings.TrimSpace(contentType)) {
+	case qqbotsdk.AttachmentContentTypeJPEG, qqbotsdk.AttachmentContentTypePNG, qqbotsdk.AttachmentContentTypeGIF:
+		return AttachmentKindImage
+	case qqbotsdk.AttachmentContentTypeMP4:
+		return AttachmentKindVideo
+	case qqbotsdk.AttachmentContentTypeVoice:
+		return AttachmentKindVoice
+	case qqbotsdk.AttachmentContentTypeFile:
+		return AttachmentKindFile
+	default:
+		return AttachmentKindUnknown
+	}
+}
+
+// attachmentsOf 把平台附件列表归一化；只有地址和内容类型都在的才转发
+// （没有下载地址的附件对插件毫无用处，留着只会让投递端多一类分支）。
+func attachmentsOf(raw []qqbotsdk.MessageAttachment) []Attachment {
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make([]Attachment, 0, len(raw))
+	for _, item := range raw {
+		if strings.TrimSpace(item.URL) == "" {
+			continue
+		}
+		out = append(out, Attachment{
+			Kind:        attachmentKind(item.ContentType),
+			ContentType: item.ContentType,
+			Filename:    item.Filename,
+			Size:        item.Size,
+			URL:         item.URL,
+			VoiceWavURL: item.VoiceWavURL,
+			ASRText:     strings.TrimSpace(item.ASRReferText),
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// arkOf 把 ark 卡片抽成摘要；没有 ark_type 也没有任何字段时返回 nil。
+func arkOf(data *qqbotsdk.ARKData) *Ark {
+	if data == nil {
+		return nil
+	}
+	field := func(keys ...string) string {
+		for _, key := range keys {
+			if data.Fields == nil {
+				break
+			}
+			value, ok := data.Fields[key]
+			if !ok {
+				continue
+			}
+			if text, ok := value.(string); ok && strings.TrimSpace(text) != "" {
+				return strings.TrimSpace(text)
+			}
+		}
+		return ""
+	}
+	ark := &Ark{
+		Kind:   strings.TrimSpace(data.ArkType),
+		Name:   strings.TrimSpace(data.ArkName),
+		Prompt: strings.TrimSpace(data.Prompt),
+		Title:  field("title", "nickname"),
+		Desc:   field("desc", "tag"),
+		URL:    field("jump_url", "url"),
+	}
+	if ark.Kind == "" && ark.Name == "" && ark.Prompt == "" && ark.Title == "" && ark.Desc == "" && ark.URL == "" {
+		return nil
+	}
+	return ark
 }
 
 // quotedText 取出引用消息里被引用的文本（不是引用消息、或引用的是图片等无文本内容时返回空串）。
@@ -124,9 +250,13 @@ func DecideC2C(data *qqbotsdk.C2CMessageCreateData, allowed func(string) bool) D
 	// 引用消息：被引用的内容在 MsgElements 里（message_type=103）。
 	// 只引用不说话（text 空）也要转发，否则"引用某条回复"这种用法会失效。
 	quote := quotedText(data)
-	if text == "" && quote == "" {
+	// 附件（图片/文件/语音/视频）与 ark 卡片：光有它们、没有文字也要转发，
+	// 否则"发一张图给 AI 看"这种用法根本进不来。
+	attachments := attachmentsOf(data.Attachments)
+	ark := arkOf(data.ArkData)
+	if text == "" && quote == "" && len(attachments) == 0 && ark == nil {
 		if data.MessageType != qqbotsdk.EventMsgTypeText {
-			return Decision{OpenID: openid, Reason: fmt.Sprintf("非纯文本消息（message_type=%d, attachments=%d）", data.MessageType, len(data.Attachments))}
+			return Decision{OpenID: openid, Reason: fmt.Sprintf("非文本消息且没有可读内容（message_type=%d, attachments=%d）", data.MessageType, len(data.Attachments))}
 		}
 		return Decision{OpenID: openid, Reason: "空文本"}
 	}
@@ -134,12 +264,14 @@ func DecideC2C(data *qqbotsdk.C2CMessageCreateData, allowed func(string) bool) D
 		Forward: true,
 		OpenID:  openid,
 		Event: Event{
-			Kind:   KindC2CMessage,
-			OpenID: openid,
-			Text:   text,
-			Quote:  quote,
-			MsgID:  data.ID,
-			At:     nowRFC3339(),
+			Kind:        KindC2CMessage,
+			OpenID:      openid,
+			Text:        text,
+			Quote:       quote,
+			MsgID:       data.ID,
+			Attachments: attachments,
+			Ark:         ark,
+			At:          nowRFC3339(),
 		},
 	}
 }

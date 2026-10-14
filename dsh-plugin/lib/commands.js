@@ -31,11 +31,12 @@ export const COMMANDS = [
 	},
 	{
 		name: '发送',
-		desc: '把一条消息单次投递到指定会话',
-		requiresArgs: true,
-		purpose: '把一条消息单次投递到指定会话，不改绑定、不打断（忙则排队）。',
-		usage: '发送 <会话id> <内容>',
-		usageAlt: '发送 <目录> <会话id> <内容>',
+		desc: '进输入态（带参数=单次投递）',
+		purpose:
+			'裸发 `发送` = 进入**当前会话的输入态**：之后你发的文字与附件都先攒着（机器人回一张预览卡片，每个附件可单独删除），点卡片上的「发送」才把正文 + 附件一起交给 AI；' +
+			'带参数 `发送 <会话id> <内容>` 仍是单次投递（不打断，忙则排队），此形式**不支持附件**。',
+		usage: '发送',
+		usageAlt: '发送 <会话id> <内容>            # 单次投递（不带附件）',
 	},
 	{
 		name: '停止',
@@ -266,6 +267,21 @@ export function createCommandRunner(deps) {
 	}
 
 	async function sendOnce({ openid, replyContext }, parsed) {
+		// 裸发 `发送`：进入**当前会话**的输入态（不打断正在跑的 AI）。
+		if (parsed.tokens.length === 0) {
+			const sessionId = currentSessionId(openid)
+			if (!sessionId || sessionId === 'none') {
+				await deps.reply({
+					openid,
+					content: '当前没有绑定会话，没法进入输入态。先 `切换会话`，或用 `发送 <会话id> <内容>` 单次投递。',
+					markdown: true,
+					replyContext,
+				})
+				return { handled: true }
+			}
+			await deps.beginInput?.({ openid, sessionId, replyContext })
+			return { handled: true }
+		}
 		const target = sessions.resolveRef(parsed.tokens)
 		if (target?.error) {
 			await deps.reply({ openid, content: `${target.error}\n\n${usageText('发送')}`, replyContext })
@@ -292,7 +308,7 @@ export function createCommandRunner(deps) {
 		})
 		await deps.reply({
 			openid,
-			content: `已投递到 ${sessions.describe(target.sessionId)}（不打断，忙则排队）。`,
+			content: `已投递到 ${sessions.describe(target.sessionId)}（不打断，忙则排队；这种单次投递不带附件，附件请走输入态）。`,
 			markdown: true,
 			replyContext,
 		})

@@ -14,12 +14,23 @@ export const EMPTY_STATE = {
 	delayed: {}, // sessionId -> { content, openid, at }
 	whitelist: { openids: [] },
 	notices: {}, // "sessionId:turn" -> true（结束通知去重）
+	inbox: {}, // openid -> { sessionId, text, seq, items[] }（「发送」输入态）
+	attachSeq: {}, // openid -> 已分配到的附件序号（附件 id 永不重用）
 }
 
 function normalize(raw) {
-	const base = { ...EMPTY_STATE, bindings: {}, lastCard: {}, delayed: {}, whitelist: { openids: [] }, notices: {} }
+	const base = {
+		...EMPTY_STATE,
+		bindings: {},
+		lastCard: {},
+		delayed: {},
+		whitelist: { openids: [] },
+		notices: {},
+		inbox: {},
+		attachSeq: {},
+	}
 	if (!raw || typeof raw !== 'object') return base
-	for (const key of ['bindings', 'lastCard', 'delayed']) {
+	for (const key of ['bindings', 'lastCard', 'delayed', 'inbox', 'attachSeq']) {
 		if (raw[key] && typeof raw[key] === 'object') base[key] = { ...raw[key] }
 	}
 	if (raw.whitelist && typeof raw.whitelist === 'object' && Array.isArray(raw.whitelist.openids)) {
@@ -165,6 +176,31 @@ export function createState({ file, logger, seed, debounceMs = 200 } = {}) {
 		},
 		noticeSeen(key) {
 			return Boolean(data.notices[key])
+		},
+
+		// ── 「发送」输入态（附件先入列，点卡片上的「发送」才投递） ─────────────
+		inboxOf(openid) {
+			const entry = data.inbox[openid]
+			return entry && typeof entry === 'object' ? entry : null
+		},
+		setInbox(openid, entry) {
+			return this.update((s) => {
+				if (entry) s.inbox[openid] = entry
+				else delete s.inbox[openid]
+			})
+		},
+		clearInbox(openid) {
+			return this.setInbox(openid, null)
+		},
+		/** 分配下一个附件 id（`A1`、`A2`…，跨输入态单调递增，绝不重用）。 */
+		nextAttachmentId(openid) {
+			let id = ''
+			this.update((s) => {
+				const next = (Number(s.attachSeq[openid]) || 0) + 1
+				s.attachSeq[openid] = next
+				id = `A${next}`
+			})
+			return id
 		},
 	}
 }
