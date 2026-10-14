@@ -46,6 +46,7 @@ import {
 	listCommands,
 	runCommand,
 	splitSlashLine,
+	splitModeCommand,
 } from './lib/dsh-commands.js'
 
 export const name = 'dsh-qq-bot'
@@ -423,6 +424,21 @@ export function apply(ctx, rawConfig) {
 	}
 
 	/**
+	 * 会话是不是在 plan 模式。
+	 *
+	 * 用可选访问 `ctx.get('planMode')`（不写进 inject）：
+	 * 没有 plan 服务的 profile 里插件照样要能激活。
+	 */
+	function isPlanModeActive(agent) {
+		try {
+			const controller = ctx.get?.('planMode')
+			return Boolean(controller?.get?.(agent)?.active)
+		} catch {
+			return false
+		}
+	}
+
+	/**
 	 * 在指定目录新建会话，并默认切换过去。
 	 * 目录必须是真实存在的目录（防止打错路径建出一堆垃圾会话）。
 	 */
@@ -478,6 +494,11 @@ export function apply(ctx, rawConfig) {
 		// 被打断时把「这条消息」当作打断来源：通知里会带一行「> 打断来自：…」。
 		const round = rounds.beginRound({ sessionId, openid, origin, context, interruptSource: interrupt ? text : '' })
 		round.pendingContext = rounds.roundContextText(round)
+		// plan 模式下补一句：计划正文也要发到 QQ（否则坐在这边只看得见"已结束"）。
+		if (isPlanModeActive(agent)) {
+			round.pendingContext +=
+				'\n本会话处于 **plan 模式**：提交计划（`exit_plan_mode`）时请**同时用 `qq_reply` 把计划正文发一份到 QQ**——审批仍在 dsh 界面，QQ 端只做"看得到"。'
+		}
 		// 附件清单/语音转写与正文**同一条消息**（各自一个块）：
 		// followup 的语义是"独占一轮"，分两条发会让正文卡在待发送里（踩过）。
 		agent.followup(makeUserMessage(text, { kind: 'dsh-qq-bot' }, images, sections))
@@ -679,6 +700,18 @@ export function apply(ctx, rawConfig) {
 		onDeliver: async ({ sessionId, openid, text, origin, images = [], sections = [] }) => {
 			await deliver({ sessionId, openid, text, interrupt: false, origin: origin ?? 'delayed', context: {}, images, sections })
 		},
+		// plan 模式下模型提交计划：把计划正文也发到 QQ（host 的审批界面 QQ 端看不到）。
+		onPlan: async ({ sessionId, plan }) => {
+			const openid = openidForSession(sessionId)
+			if (!openid) return
+			const body = plan.length > 1800 ? `${plan.slice(0, 1800)}\n\n…（计划过长，已截断）` : plan
+			await sendText({
+				openid,
+				content: `**计划（plan 模式提交，审批仍在 dsh 界面）**\n\n${body}`,
+				markdown: true,
+				context: {},
+			})
+		},
 	})
 
 	const questions = createQuestionBridge({ state, outbox, config, logger, io })
@@ -859,7 +892,9 @@ export function apply(ctx, rawConfig) {
 			const bound = state.bindingOf(openid)
 			const agent = bound && bound !== 'none' ? await agentFor(bound) : null
 			if (agent) {
-				const outcome = await runCommand(ctx.commands, agent, slash.line, { logger })
+				// `/plan <文本>` 要拆开：命令切模式，文本走本桥投递（见 splitModeCommand 的注释）。
+				const split = splitModeCommand(slash)
+				const outcome = await runCommand(ctx.commands, agent, split.command, { logger })
 				if (outcome.handled) {
 					await sendText({
 						openid,
@@ -867,6 +902,9 @@ export function apply(ctx, rawConfig) {
 						markdown: false,
 						context,
 					})
+					if (split.message) {
+						await deliver({ sessionId: bound, openid, text: split.message, interrupt: true, origin: 'qq', context })
+					}
 					return
 				}
 			}

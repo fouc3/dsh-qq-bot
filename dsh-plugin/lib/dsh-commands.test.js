@@ -9,6 +9,7 @@ import {
 	isSlashLine,
 	listCommands,
 	runCommand,
+	splitModeCommand,
 	splitSlashLine,
 } from './dsh-commands.js'
 import { menuItems } from './commands.js'
@@ -143,4 +144,27 @@ test('runCommand：解析不到返回 handled=false；成功/失败都如实回�
 
 	// 命令服务缺失 → 不算 handled，交给普通消息通路
 	assert.deepEqual(await runCommand(undefined, agent, '/compact', {}), { handled: false })
+})
+
+test('splitModeCommand：/plan 带文本拆成「命令 + 消息」；模式词与别的命令不拆', () => {
+	// `/plan <文本>` → 命令只留 /plan，文本交给本桥投递
+	assert.deepEqual(splitModeCommand(splitSlashLine('/plan 参考：/tmp/api.md 来写修改计划')), {
+		command: '/plan',
+		message: '参考：/tmp/api.md 来写修改计划',
+	})
+	assert.deepEqual(splitModeCommand(splitSlashLine('/plan 多行\n第二行')), { command: '/plan', message: '多行\n第二行' })
+
+	// 模式词/裸命令：整行照旧执行
+	for (const line of ['/plan', '/plan off', '/plan on']) {
+		const slash = splitSlashLine(line)
+		const out = splitModeCommand(slash)
+		assert.equal(out.message, '', `${line} 不该被拆成消息`)
+		assert.equal(out.command, slash.line, `${line} 应整行执行`)
+	}
+	// dsh 自己的判断大小写敏感（只认小写 off）：`ON` 会被它当成要给 AI 的文本，这里保持一致
+	assert.deepEqual(splitModeCommand(splitSlashLine('/plan ON')), { command: '/plan', message: 'ON' })
+
+	// 别的命令一律原样
+	assert.deepEqual(splitModeCommand(splitSlashLine('/compact 别的东西')), { command: '/compact 别的东西', message: '' })
+	assert.deepEqual(splitModeCommand(null), { command: '', message: '' })
 })

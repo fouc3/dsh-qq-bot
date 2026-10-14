@@ -1252,3 +1252,86 @@ test('端到端：启动补登记——本桥以前跑过轮次的会话（notic
 	assert.equal(ws.attached.length, 1, '会话要挂到工作区上')
 	assert.equal(ws.attached[0], 'session-legacy')
 })
+
+test('端到端：/plan 带文本 → 命令只切模式，正文走本桥投递（不再被 steer 绕过）', async (t) => {
+	const agent = makeAgent('session-1')
+	const executed = []
+	const boot = bootPlugin(t, {
+		sessions: SUMMARIES,
+		live: { 'session-1': agent },
+		commands: {
+			async list() {
+				return [{ name: 'plan', description: 'Enter or leave plan mode' }]
+			},
+			async execute(target, line) {
+				executed.push({ sessionId: target.id, line })
+				return {
+					commandId: 'c1',
+					result: { kind: 'success', text: line === '/plan' ? 'Plan mode on. Use /plan off to leave.' : 'Plan mode off.' },
+				}
+			},
+		},
+	})
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M1' })
+	await drainFor(boot.socketPath, 60)
+
+	// 1) `/plan <文本>`：命令只该收到「/plan」
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '/plan 参考：/tmp/api.md 来写修改计划', msgId: 'M2' })
+	await waitFor(() => agent.followed.length === 1)
+	assert.deepEqual(
+		executed.map((item) => item.line),
+		['/plan'],
+		'只把「/plan」交给 dsh：整行交给它会被 steer 绕过本桥（线上就是这个 bug）',
+	)
+	assert.equal(agent.followed[0].content[0].text, '参考：/tmp/api.md 来写修改计划', '剩下的文本要作为本桥消息投给 AI')
+	const afterPlan = await drainFor(boot.socketPath, 60)
+	assert.ok(
+		afterPlan.some((c) => c.kind === 'send_c2c' && /Plan mode on/.test(String(c.args.content))),
+		'命令回执要发到 QQ',
+	)
+
+	// 这一轮归本桥结算：跑完必须有「已结束」通知 + 快照里带 QQ 上下文（被 steer 的轮两样都没有）
+	agent.handlers['session/event'](null, { type: 'turn/start', data: { turn: 7 } })
+	agent.handlers['session/event'](null, { type: 'turn/end', data: { turn: 7, reason: { kind: 'completed' } } })
+	const notice = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /已结束/.test(String(c.args.content))) ?? null
+	})
+	assert.match(String(notice.args.content), /已结束/)
+	assert.ok(notice.args.keyboard, '结束通知要带「我需要回复」按钮')
+
+	// 2) `/plan off` 是模式词：整行照旧执行，不投递
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '/plan off', msgId: 'M3' })
+	await waitFor(() => executed.length === 2)
+	assert.equal(executed[1].line, '/plan off')
+	assert.equal(agent.followed.length, 1, '/plan off 不该投递任何消息')
+
+	boot.dispose()
+})
+
+test('端到端：plan 模式下提交计划（exit_plan_mode）会把计划正文发到 QQ', async (t) => {
+	const agent = makeAgent('session-1')
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': agent } })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M1' })
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '写个计划', msgId: 'M2' })
+	await waitFor(() => agent.followed.length === 1)
+
+	agent.handlers['session/event'](null, { type: 'turn/start', data: { turn: 3 } })
+	agent.handlers['session/event'](null, {
+		type: 'tool/call',
+		data: { name: 'exit_plan_mode', arguments: { plan: '# 修改计划\n\n1. 第一步' }, step: 1, callId: 'call-1' },
+	})
+	const planMsg = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /修改计划/.test(String(c.args.content))) ?? null
+	})
+	assert.match(String(planMsg.args.content), /第一步/)
+	assert.match(String(planMsg.args.content), /plan 模式提交/)
+	assert.equal(planMsg.args.markdown, true)
+
+	boot.dispose()
+})

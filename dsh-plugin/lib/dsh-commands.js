@@ -37,6 +37,28 @@ export function splitSlashLine(text) {
 	return { name: match[1], rest: match[2] ?? '', line }
 }
 
+/**
+ * `/plan <文本>` 要拆成"命令 + 消息"两件事。
+ *
+ * dsh 的 `/plan` 的输入是 `[off|message]`：文本非 `off` 时它会**进入 plan 模式**
+ * 并把这段文本 `agent.steer(createUserMessage({source:{kind:'user'}}))` 塞进会话。
+ * 那条 steer 起出来的轮次**不经过本桥的投递路径**，于是：
+ *   - 轮次没有被 `beginRound` 认领 → 没有进度/思考流、没有「已结束 + 我需要回复」通知；
+ *   - 也就没有注入"这条消息来自 QQ、要回请用 qq_reply"的上下文 → 模型不知道要回 QQ。
+ * 线上表现就是「思考没出现、发了没反应」。
+ *
+ * 所以这里自己拆：命令只剩 `/plan`（切模式，不 steer），文本交给本桥正常投递。
+ *
+ * @returns {{command:string, message:string}} message 为空表示按原样执行整行
+ */
+export function splitModeCommand(slash) {
+	if (!slash || slash.name !== 'plan') return { command: slash?.line ?? '', message: '' }
+	const rest = String(slash.rest ?? '').trim()
+	// `off` / `on` 是模式词，不是要给 AI 的消息
+	if (!rest || rest === 'off' || rest === 'on') return { command: slash.line, message: '' }
+	return { command: `/${slash.name}`, message: rest }
+}
+
 /** 过滤 + 归一化描述符（去掉不兼容命令与无效项）。 */
 export function filterCommands(descriptors, excluded = EXCLUDED_COMMANDS) {
 	return (descriptors ?? [])

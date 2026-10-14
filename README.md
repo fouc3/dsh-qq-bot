@@ -44,7 +44,7 @@ QQ 用户 ──私聊──▶ QQ 开放平台 ──WebSocket──▶ Go: dsh
 | 结束通知 | 正常结束 `…已结束`；被打断 `…被打断` + `> 打断来自：<那条消息>`（拿不到来源就不带引用行） |
 | 卡片键盘限额 | 内联键盘最多 5 行、每行最多 5 按钮（平台硬限制）：目录与会话共用一页预算、装不下就翻页，导航按钮永远并进一行 |
 | 失败退避 | 出站命令按失败类型处理：限速类（40034100/50002 等）指数退避重试（2s→4s→8s，最多 4 次），参数类硬错直接丢弃——避免无限重投把自己打成风暴 |
-| dsh 内置命令 | QQ 里发 `/compact`、`/model`、`/goal`… 直接走 `ctx.commands.execute` 执行（不经模型）；这些命令在菜单里**收进二级菜单**（顶层留给桥命令）；技能不在内，「反馈」不兼容 |
+| dsh 内置命令 | QQ 里发 `/compact`、`/model`、`/goal`… 直接走 `ctx.commands.execute` 执行（不经模型）；这些命令在菜单里**收进二级菜单**（顶层留给桥命令）；技能不在内，「反馈」不兼容。**`/plan <文本>` 特殊处理**：只把 `/plan` 交给 dsh 切模式，文本走本桥正常投递（否则 dsh 会把它 `steer` 进会话、绕过本桥的轮次跟踪，QQ 侧看不到思考与结束通知）；plan 模式下模型提交的计划也会转发到 QQ |
 
 ---
 
@@ -215,6 +215,8 @@ level=WARN msg="已丢弃非白名单用户的私聊" openid=2A3B4C… text_len=
   与认不出的命令回退成普通消息；命令在菜单里收进二级菜单且不超顶层 10 项
   —— `lib/dsh-commands.test.js` + `lib/plugin.test.js`「dsh 内置命令从 QQ 直接执行」;
   网关侧 `internal/qq/panel_clip_test.go`（`sub_menu_items` 落库 + 名宽截断 + 菜单差异检测）
+- ✅ `/plan <文本>`：命令只切模式（`/plan`）、文本走本桥投递（带 QQ 上下文、轮次跟踪、结束通知）；`/plan off`/`/plan on`/`/plan` 原样执行；plan 模式下 `exit_plan_mode` 的计划正文转发到 QQ
+  —— `lib/dsh-commands.test.js`「splitModeCommand」+ `lib/plugin.test.js`「/plan 带文本」「提交计划」
 - ✅ 插件在真 `dsh web` 进程里挂载并可用 —— `application: applied`；通道 0600、目录 700；
   对通道发 `health` 得到真实会话数（197）、发 `panel` 得到 7 条命令 + `c2c/specific`
 - ✅ `git log` 有提交 —— 见仓库历史

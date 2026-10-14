@@ -9,6 +9,14 @@ import { buildNoticeCard } from './cards.js'
 import { REPLY_TOOL_NAME } from './reply-tool.js'
 
 /**
+ * plan 模式下模型提交计划的工具名。
+ *
+ * 取自 `@deepseek-ai/dsh-plan-mode` 的 `EXIT_PLAN_MODE`；它**始终注册**
+ * （文档写明"stays registered while plan mode is inactive"），所以不能靠"工具在不在"判断是否在 plan 模式。
+ */
+export const PLAN_TOOL_NAME = 'exit_plan_mode'
+
+/**
  * 互动回应码（平台固定语义，**别随手改**）：
  *   0 成功（按钮变「已触发」，此后不可再点）
  *   1 失败（按钮保持可点，可重试）
@@ -34,6 +42,7 @@ export function createRounds({
 	contextMessage,
 	agentFor,
 	onDeliver,
+	onPlan,
 	nextSeqFor,
 }) {
 	const rounds = new Map()
@@ -215,6 +224,12 @@ export function createRounds({
 				break
 			case 'tool/call':
 				if (event.data?.name === REPLY_TOOL_NAME) round.replied = true
+				// plan 模式下模型提交计划：`exit_plan_mode` 的计划正文是给 host 审批界面看的，
+				// QQ 端一点也看不到 —— 这里转发一份过去（用户要求 QQ 也能看到计划）。
+				if (event.data?.name === PLAN_TOOL_NAME) {
+					const plan = String(event.data?.arguments?.plan ?? '').trim()
+					if (plan) void onPlan?.({ sessionId: round.sessionId, plan })
+				}
 				break
 			case 'turn/end': {
 				const turn = event.data?.turn
