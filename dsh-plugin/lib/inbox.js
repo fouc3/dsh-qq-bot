@@ -242,11 +242,14 @@ export function createInbox({ state, attachments, config = {}, logger, fetchImpl
 		return (entry?.items ?? []).filter((item) => item.status === ATTACH_STATUS.voiceUnrecognized)
 	}
 
+	/** 有平台转写的语音条目：它们只以**文本**进消息，不算"附件"（别再去列"未下载"）。 */
+	function voiceItems(entry) {
+		return (entry?.items ?? []).filter((item) => item.status === ATTACH_STATUS.voice && item.asrText)
+	}
+
 	/** 语音转写（独立一段，优先级高于其它附件）。 */
 	function voiceText(entry) {
-		return (entry?.items ?? [])
-			.filter((item) => item.status === ATTACH_STATUS.voice && item.asrText)
-			.map((item) => item.asrText)
+		return voiceItems(entry).map((item) => item.asrText)
 	}
 
 	function storedFiles(entry) {
@@ -314,6 +317,7 @@ export function createInbox({ state, attachments, config = {}, logger, fetchImpl
 		textOf,
 		blockingVoice,
 		voiceText,
+		voiceItems,
 		storedFiles,
 		storedImages,
 		unavailable,

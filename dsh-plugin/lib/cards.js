@@ -536,9 +536,10 @@ export function buildInboxCard({ label, sessionId, text, items = [], voice = [],
 		if (current < pages) nav.push(callbackButton('下一页', data.inbox('page', String(current + 1))))
 		if (nav.length) rows.push({ buttons: nav })
 	}
-	const actions = [callbackButton('发送', data.inbox('send'), { style: 4 })]
+	// 按钮顺序按用户要求：**取消在最左、发送在最右**（发送放右侧才顺手）。
+	const actions = [callbackButton('取消', data.inbox('cancel'))]
 	if (String(text ?? '').trim()) actions.push(callbackButton('清空正文', data.inbox('clear')))
-	actions.push(callbackButton('取消', data.inbox('cancel')))
+	actions.push(callbackButton('发送', data.inbox('send'), { style: 4 }))
 	rows.push({ buttons: actions })
 
 	return { content: lines.join('\n'), keyboard: keyboardOf(rows) }

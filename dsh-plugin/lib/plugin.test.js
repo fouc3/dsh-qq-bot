@@ -876,15 +876,16 @@ test('端到端：输入态——附件只能走卡片上的「发送」；裸�
 		eventId: 'INT-SEND',
 		msgId: afterImage.args.messageId ?? 'CARD',
 	})
-	await waitFor(() => agent.followed.length === 2)
-	const [sectionMessage, mainMessage] = agent.followed
-	assert.equal(sectionMessage.form, 'snapshot', '附件清单要单独一条分节消息')
-	assert.match(sectionMessage.content[0].text, /## 用户随消息附带的附件/)
-	assert.match(sectionMessage.content[0].text, /A1 图片 cat\.png/)
-	assert.equal(mainMessage.form, undefined)
-	assert.equal(mainMessage.content[0].text, '看看这张图')
-	assert.equal(mainMessage.content[1].type, 'image', '图片要以 image 块随正文走')
-	assert.equal(mainMessage.content[1].attachment.attachmentId, 'img-1')
+	// followup 的语义是"独占一轮"：分两条发会让正文卡在待发送里（线上踩过），
+	// 所以整次投递必须只有一条消息，附件清单是它自己的 content 块。
+	await waitFor(() => agent.followed.length === 1)
+	const delivered = agent.followed[0]
+	assert.equal(delivered.form, undefined, '不该用 snapshot 形式：它就是用户这条消息')
+	assert.match(delivered.content[0].text, /^## 用户随消息附带的附件/)
+	assert.match(delivered.content[0].text, /A1 图片 cat\.png/)
+	assert.equal(delivered.content[1].text, '看看这张图')
+	assert.equal(delivered.content[2].type, 'image', '图片要以 image 块随正文走')
+	assert.equal(delivered.content[2].attachment.attachmentId, 'img-1')
 
 	// 投递后输入态被清空（状态文件是 200ms 防抖落盘，等它写完再读）
 	await new Promise((resolve) => setTimeout(resolve, 260))
@@ -923,6 +924,54 @@ test('端到端：输入态——附件只能走卡片上的「发送」；裸�
 	})
 	assert.match(blocked.args.content, /删除/)
 	assert.equal(agent.followed.length, beforeBlocked, '有无法识别的语音时绝不能投递')
+
+	// 6) 删掉那条无法识别的语音 + 补一条有转写的语音 → 能发送，且转写单独成块、
+	//    不再被当成"没下载的附件"
+	const deleteButton = voiceCard.args.keyboard.content.rows
+		.flatMap((row) => row.buttons)
+		.find((b) => b.render_data.label.startsWith('删除'))
+	await rpc(boot.socketPath, 'event', {
+		kind: 'interaction',
+		openid: 'U1',
+		buttonData: deleteButton.action.data,
+		eventId: 'INT-DEL',
+		msgId: voiceCard.args.messageId ?? 'CARD2',
+	})
+	await drainFor(boot.socketPath, 60)
+	await rpc(boot.socketPath, 'event', {
+		kind: 'c2c_message',
+		openid: 'U1',
+		text: '看看这个报错',
+		msgId: 'M7',
+		attachments: [{ kind: 'voice', contentType: 'voice', url: 'https://x/voice2.silk', asrText: '帮我查一下这个报错' }],
+	})
+	const finalCard = await waitFor(async () => {
+		const commands = await drainFor(boot.socketPath, 60)
+		return commands.filter((c) => c.kind === 'send_c2c' && c.args.keyboard).at(-1) ?? null
+	})
+	assert.match(finalCard.args.content, /转写：帮我查一下这个报错/)
+	const finalSend = finalCard.args.keyboard.content.rows
+		.flatMap((row) => row.buttons)
+		.find((b) => b.render_data.label === '发送')
+	const actionRow = finalCard.args.keyboard.content.rows.at(-1).buttons.map((b) => b.render_data.label)
+	assert.deepEqual(actionRow, ['取消', '清空正文', '发送'], '操作行必须是：取消在左、发送在右')
+	await rpc(boot.socketPath, 'event', {
+		kind: 'interaction',
+		openid: 'U1',
+		buttonData: finalSend.action.data,
+		eventId: 'INT-SEND2',
+		msgId: finalCard.args.messageId ?? 'CARD3',
+	})
+	await waitFor(() => agent.followed.length === beforeBlocked + 1)
+	const voiceMessage = agent.followed.at(-1)
+	assert.match(voiceMessage.content[0].text, /^## 用户语音的平台转写/)
+	assert.match(voiceMessage.content[0].text, /- A\d+：帮我查一下这个报错/)
+	assert.equal(voiceMessage.content[1].text, '看看这个报错')
+	assert.ok(
+		!String(voiceMessage.content[0].text).includes('没有自动下载'),
+		'语音只以文本进消息，不该再列成"没下载的附件"',
+	)
+	assert.equal(voiceMessage.content.length, 2, '没有其它附件时不该多出块')
 
 	boot.dispose()
 })

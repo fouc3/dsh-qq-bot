@@ -310,7 +310,8 @@ test('输入态预览卡片：每个附件一个「删除」，语音转写单�
 	)
 
 	const labels = card.keyboard.content.rows.flatMap((row) => row.buttons.map((b) => b.render_data.label))
-	assert.deepEqual(labels, ['删除 A1', '删除 A2', '删除 A3', '发送', '清空正文', '取消'])
+	// 用户要求：取消在最左、发送在最右
+	assert.deepEqual(labels, ['删除 A1', '删除 A2', '删除 A3', '取消', '清空正文', '发送'])
 	assert.ok(card.keyboard.content.rows.length <= 5)
 })
 

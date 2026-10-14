@@ -70,9 +70,22 @@ function arkAsText(ark) {
 	return bits.join(' ').trim()
 }
 
-/** 构造一条 user 消息（等价于 @deepseek-ai/dsh-llm 的 createUserMessage）。 */
-function makeUserMessage(text, source, images = []) {
-	const content = [{ type: 'text', text: String(text) }]
+/**
+ * 构造一条 user 消息（等价于 @deepseek-ai/dsh-llm 的 createUserMessage）。
+ *
+ * `sections`（语音转写、附件清单）跟在正文**同一条消息**里，但各自一个 content 块、
+ * 带 `## 标题`——所以转写错了也不会跟用户的原话混成一句。
+ *
+ * 为什么不另发一条消息：`agent.followup()` 的语义是「这条消息独占自己的一轮」，
+ * 连发两条 = 第二条被挂成"待发送"等下一轮（线上踩过：正文卡在待发送里，
+ * 附件清单先跑了）。要一起给模型，就必须是一条消息。
+ */
+function makeUserMessage(text, source, images = [], sections = []) {
+	const content = []
+	for (const section of sections) {
+		content.push({ type: 'text', text: `## ${section.name}\n${section.text}` })
+	}
+	content.push({ type: 'text', text: String(text) })
 	// 图片以 image 块随消息走：模型支持视觉就是真看图，不支持时由 dsh 自动降级成
 	// 「图片已存到 <路径>」的占位文本（前端粘贴走的是同一条路）。
 	for (const ref of images) content.push({ type: 'image', attachment: ref })
@@ -81,23 +94,6 @@ function makeUserMessage(text, source, images = []) {
 		role: 'user',
 		content,
 		source,
-	})
-}
-
-/**
- * 构造一条「分节消息」：语音转写、附件清单这类要**单独放**的内容。
- *
- * 与正文分开的理由（用户要求）：语音转写可能出错，混进正文会被模型当成用户的原话。
- */
-function makeSectionMessage(sections, source = { kind: 'dsh-qq-bot' }) {
-	const text = sections.map((section) => `## ${section.name}\n${section.text}`).join('\n\n')
-	return deepFreeze({
-		id: randomUUID(),
-		role: 'user',
-		content: [{ type: 'text', text }],
-		source,
-		form: 'snapshot',
-		sections: sections.map((section) => ({ name: section.name, text: section.text })),
 	})
 }
 
@@ -338,10 +334,9 @@ export function apply(ctx, rawConfig) {
 		// 被打断时把「这条消息」当作打断来源：通知里会带一行「> 打断来自：…」。
 		const round = rounds.beginRound({ sessionId, openid, origin, context, interruptSource: interrupt ? text : '' })
 		round.pendingContext = rounds.roundContextText(round)
-		// 附件与语音转写放「单独的位置」：先投一条分节消息（语音转写排在附件前面，优先级更高），
-		// 再投正文。这样转写错了也不会跟用户真正的指令混成一句被误读。
-		if (sections.length) agent.followup(makeSectionMessage(sections))
-		agent.followup(makeUserMessage(text, { kind: 'dsh-qq-bot' }, images))
+		// 附件清单/语音转写与正文**同一条消息**（各自一个块）：
+		// followup 的语义是"独占一轮"，分两条发会让正文卡在待发送里（踩过）。
+		agent.followup(makeUserMessage(text, { kind: 'dsh-qq-bot' }, images, sections))
 		return { ok: true }
 	}
 
@@ -415,8 +410,12 @@ export function apply(ctx, rawConfig) {
 		}
 
 		const images = []
+		const voiceItems = inbox.voiceItems(entry)
+		const voiceIds = new Set(voiceItems.map((item) => item.id))
 		const attachmentLines = []
 		for (const item of items) {
+			// 语音只以文本进消息（在"语音转写"那一段里），别在这儿再说它"没下载"。
+			if (voiceIds.has(item.id)) continue
 			const name = item.filename || item.id
 			if (item.status === 'stored' && item.image) {
 				images.push(item.ref)
@@ -434,10 +433,12 @@ export function apply(ctx, rawConfig) {
 			)
 		}
 		const sections = []
-		const voice = inbox.voiceText(entry)
-		if (voice.length > 0) {
+		if (voiceItems.length > 0) {
 			// 语音转写单独一段，且排在附件前面：它可能出错，优先级却最高（用户要求）。
-			sections.push({ name: '用户语音的平台转写（可能有误）', text: voice.map((line) => `- ${line}`).join('\n') })
+			sections.push({
+				name: '用户语音的平台转写（可能有误，别当成用户的原话）',
+				text: voiceItems.map((item) => `- ${item.id}：${item.asrText}`).join('\n'),
+			})
 		}
 		if (attachmentLines.length > 0) sections.push({ name: '用户随消息附带的附件', text: attachmentLines.join('\n') })
 
@@ -447,7 +448,7 @@ export function apply(ctx, rawConfig) {
 		inbox.drain({ openid })
 		const cardId = state.lastCardOf(openid)
 		if (cardId) await io.recallCard(openid, cardId)
-		const body = text || '（用户只发了附件，没有写正文）'
+		const body = text || '（用户没有写正文：内容见上面的分节，请按语音转写/附件回应）'
 		await deliver({ sessionId, openid, text: body, interrupt: true, origin: 'qq', context, images, sections })
 		await sendText({
 			openid,
