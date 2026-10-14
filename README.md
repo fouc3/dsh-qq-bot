@@ -31,11 +31,11 @@ QQ 用户 ──私聊──▶ QQ 开放平台 ──WebSocket──▶ Go: dsh
 | 富媒体 | `qq_reply` 可发图片/视频/语音/文件：本机路径走分片上传，公网 URL 直传 |
 | 结束通知 | 每轮结束发 `标题(会话id)已结束` + 一个「我需要回复」按钮 |
 | 未回复补救 | **不再要求 AI 必须回复**：没回复时用户点「我需要回复」→ 注入唤醒消息要求 AI 回复该用户，并提示已触发 |
-| 提问桥 | dsh 的 `ask_user_question` 在 QQ 侧渲染成选择卡片（按钮/「其他」打字/提交，空提交=跳过） |
+| 提问桥 | dsh 的 `ask_user_question` 在 QQ 侧渲染成 md 选择卡片：**按钮只写字母 A/B/C**，字母对照与选项小字写在题干与按钮之间；支持「其他」打字、提交（空提交=跳过） |
 | 指令面板 | 5 条命令注册到 QQ 指令面板 + 自定义菜单，面板只绑定配置指定的私聊 |
 | 会话选择 | md 卡片：文件夹是回调按钮、会话是指令按钮（点了只把 `切换会话 <id>` 填进输入框） |
 | 白名单 | 只有配置里列出的 QQ 私聊能控制 bot；其他账号的消息一律丢弃并记日志 |
-| 延迟发送 | `延迟发送 <内容>` 注册待发消息，AI 本轮**正常结束**后再投递给会话 |
+| 延迟发送 | `延迟发送 <会话id> <内容>` 登记待发消息，该会话本轮**正常结束**后再投递给会话 |
 
 ---
 
@@ -84,9 +84,11 @@ dsh plugin --profile web add /home/fouc3/Projects/DSH-QQ-Bot/dsh-plugin
 > 2. 或者把本插件装到一个干净的 profile 里，例如
 >    `dsh rescue --from-default-profile web` 建一个副本 profile 再 `install_bundle`。
 >
-> 不装 profile 也能先验证补丁能被 Loader 接受：
-> `dsh --profile web --patch ./dsh-plugin/cordis.patch.yml --dump-config`（应能在组合树里
-> 看到 `dsh-qq-bot` 这一行）。
+> **不能用 `--patch` 把插件"插"进现有 profile**（已实测）：覆盖式补丁只能按 id 改写
+> **已有**条目，新增条目会报 `patch: entry "<id>" not found`。bundle 自带的
+> `cordis.patch.yml` 之所以能新增条目，是因为它随包由 `install_bundle` 在包的上下文里
+> 合并进 profile —— 所以安装这一步绕不开 `plugin_manager`。
+> （`--dump-config` 只回显补丁行，能查 YAML 方言是否正确，但**不代表已经挂载**。）
 
 ### 3. 起服务并核对
 
