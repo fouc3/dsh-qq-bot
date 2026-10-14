@@ -20,6 +20,7 @@ const QUESTIONS = [
 function setup(config = {}) {
 	const sent = []
 	const recalled = []
+	const notified = []
 	const io = {
 		sendCard: async ({ openid, content, keyboard }) => {
 			sent.push({ openid, content, keyboard })
@@ -28,15 +29,18 @@ function setup(config = {}) {
 		recallCard: async (openid, messageId) => {
 			recalled.push({ openid, messageId })
 		},
+		notify: async ({ openid, content }) => {
+			notified.push({ openid, content })
+		},
 	}
 	const bridge = createQuestionBridge({
 		state: createState({}),
 		outbox: createOutbox({}),
-		config: { questionTimeoutMs: 1000, maxQuestionButtons: 15, ...config },
+		config: { questionTimeoutMs: 1000, maxQuestionButtons: 20, ...config },
 		logger: {},
 		io,
 	})
-	return { bridge, sent, recalled }
+	return { bridge, sent, recalled, notified }
 }
 
 const tick = () => new Promise((resolve) => setImmediate(resolve))
@@ -114,11 +118,53 @@ test('提问：超时交回 dsh GUI（返回 null）并撤回卡片', async () =
 	assert.equal(bridge.pendingCount(), 0)
 })
 
-test('提问：按钮超上限时不发卡片，直接交回 GUI', async () => {
-	const { bridge, sent } = setup({ maxQuestionButtons: 2 })
+test('提问：按钮超上限时不发卡片，直接交回 GUI —— 但要在 QQ 里明说一句', async () => {
+	const { bridge, sent, notified } = setup({ maxQuestionButtons: 2 })
 	const answers = bridge.ask({ callId: 'call-5', questions: QUESTIONS, openid: 'U1', sessionId: 'session-1' })
 	assert.equal(await answers, null)
 	assert.equal(sent.length, 0)
+	assert.equal(notified.length, 1, '降级不能无声无息：线上就是这样漏掉的')
+	assert.match(notified[0].content, /交回/)
+	assert.equal(bridge.pendingCount(), 0)
+})
+
+test('提问：一卡放不下就拆多张；点哪张只重发哪张，提交时全部撤回', async () => {
+	const { bridge, sent, recalled, notified } = setup()
+	const mk = (n) => ({
+		id: `q${n}`,
+		question: `第${n}题`,
+		options: Array.from({ length: 5 }, (_, i) => ({ label: `o${n}-${i}` })),
+	})
+	const questions = [1, 2, 3, 4, 5, 6].map(mk)
+	const answers = bridge.ask({ callId: 'call-multi', questions, openid: 'U1', sessionId: 'session-1' })
+	await tick()
+
+	assert.equal(sent.length, 2, '6 道题 × 5 选项要拆成两张卡片')
+	assert.equal(recalled.length, 0, '初次发送不能撤回任何卡片（第一张不能被第二张顶掉）')
+
+	// 第 4 题在第二张卡上：只撤回并重发第二张
+	const clicked = await bridge.handleCallback(
+		{ kind: 'question', callId: 'call-multi', questionIndex: 3, action: 'opt-0' },
+		{ openid: 'U1' },
+	)
+	assert.equal(clicked.code, 0)
+	assert.equal(sent.length, 3)
+	assert.deepEqual(recalled.map((entry) => entry.messageId), ['CARD-2'], '只撤回被点的那张卡片')
+	assert.match(sent[2].content, /✅ o4-0/)
+
+	// 在第一张卡上提交：所有卡片都要撤回
+	const submitted = await bridge.handleCallback(
+		{ kind: 'question', callId: 'call-multi', questionIndex: 0, action: 'submit' },
+		{ openid: 'U1' },
+	)
+	assert.equal(submitted.code, 0)
+	assert.deepEqual(recalled.map((entry) => entry.messageId), ['CARD-2', 'CARD-1', 'CARD-3'])
+
+	const result = await answers
+	assert.equal(result.length, 6)
+	assert.deepEqual(result[3], { id: 'q4', selected: ['o4-0'] })
+	assert.equal(bridge.pendingCount(), 0)
+	assert.equal(notified.length, 0)
 })
 
 test('提问：点击者与提问对象不一致时拒绝，且不是重复/过期码', async () => {

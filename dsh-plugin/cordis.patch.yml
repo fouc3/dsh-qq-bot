@@ -32,8 +32,10 @@
         # 提问桥：QQ 侧等待用户作答的时限（dsh 默认 legacy 模式没有超时，
         # 这里是该提问在 QQ 侧的唯一时间界）；超时后交回 dsh GUI 回答。
         questionTimeoutMs: 600000
-        # 提问卡片最多铺多少个按钮；超限降级到 dsh GUI 回答。
-        maxQuestionButtons: 15
+        # 单张提问卡片的按钮上限（平台硬限是 5 行 × 每行 5 个，这里按每行 4 个排版，
+        # 故 20 = 5 行 × 4 个）；一次提问放不下一张卡就**拆成多张卡片**，
+        # 只有单道题自己就放不下时才降级到 dsh GUI 回答（并在 QQ 侧说明）。
+        maxQuestionButtons: 20
 
         # 等待 Go 侧 ack 的时限（超过就认为"尚未确认送达"，由工具结果如实告知 AI）。
         replyAckTimeoutMs: 8000

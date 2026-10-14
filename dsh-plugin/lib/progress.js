@@ -59,6 +59,10 @@ export function extractAssistantText(message) {
 /**
  * 采一份快照。纯读事件，不改任何状态。
  *
+ * `now` 既接受时间戳（测试用），也接受取时间的函数（默认就是 `Date.now`）。
+ * 线上踩过：默认参数是函数却被当成时间戳用，`Date.now - startedAt` 直接算出
+ * NaN，进度里显示成「已跑 NaN 分 NaN 秒」；单测都显式传数字，正好漏掉默认分支。
+ *
  * @param {{status?:string, session?:object}|null} agent
  * @returns {{
  *   status: string, midTurn: boolean, turn: number|null, startedAt: number|null,
@@ -67,6 +71,7 @@ export function extractAssistantText(message) {
  * }}
  */
 export function snapshotProgress(agent, { now = Date.now, maxScan = 800 } = {}) {
+	const nowMs = typeof now === 'function' ? Number(now()) : Number(now)
 	const snapshot = {
 		status: String(agent?.status ?? 'unknown'),
 		midTurn: false,
@@ -77,6 +82,7 @@ export function snapshotProgress(agent, { now = Date.now, maxScan = 800 } = {}) 
 		lastText: '',
 		lastEventAgoMs: null,
 		scanned: 0,
+		takenAt: Number.isFinite(nowMs) ? nowMs : null,
 	}
 	const session = agent?.session
 	if (!session || typeof session.seq !== 'number' || typeof session.eventAt !== 'function') {
@@ -116,26 +122,33 @@ export function snapshotProgress(agent, { now = Date.now, maxScan = 800 } = {}) 
 		}
 	}
 
-	if (snapshot.startedAt !== null) snapshot.elapsedMs = Math.max(0, now - snapshot.startedAt)
-	if (lastEventTime !== null) snapshot.lastEventAgoMs = Math.max(0, now - lastEventTime)
+	if (snapshot.startedAt !== null && Number.isFinite(nowMs)) {
+		snapshot.elapsedMs = Math.max(0, nowMs - snapshot.startedAt)
+	}
+	if (lastEventTime !== null && Number.isFinite(nowMs)) {
+		snapshot.lastEventAgoMs = Math.max(0, nowMs - lastEventTime)
+	}
 	return snapshot
 }
 
 const formatAgo = (ms) => {
-	if (ms === null || ms === undefined) return ''
+	if (!Number.isFinite(ms)) return ''
 	if (ms < 1000) return '刚刚'
 	if (ms < 60_000) return `${Math.round(ms / 1000)} 秒前`
 	return `${Math.floor(ms / 60_000)} 分 ${Math.round((ms % 60_000) / 1000)} 秒前`
 }
 
 const formatElapsed = (ms) => {
-	if (ms === null || ms === undefined) return ''
+	// 有限性守卫：宁可说「未知时长」，也绝不把 NaN 印到用户面前。
+	if (!Number.isFinite(ms)) return ''
 	if (ms < 60_000) return `${Math.round(ms / 1000)} 秒`
 	return `${Math.floor(ms / 60_000)} 分 ${Math.round((ms % 60_000) / 1000)} 秒`
 }
 
 /** 渲染成 QQ 可用的 markdown（只用标题/引用/列表，绝不用表格）。 */
 export function renderProgress({ label, snapshot, sessionId }) {
+	// 「几秒前」按**采样时刻**算，而不是渲染时刻：渲染可能晚很多，口径要一致。
+	const takenAt = Number.isFinite(snapshot?.takenAt) ? snapshot.takenAt : Date.now()
 	const lines = ['**进度快照**', `> 会话：${label ?? sessionId}`, `> 状态：${describeStatus(snapshot)}`]
 	if (snapshot.midTurn) {
 		lines.push('> 说明：只读查询，**没有打断它**（AI 还在继续跑）')
@@ -147,7 +160,8 @@ export function renderProgress({ label, snapshot, sessionId }) {
 	} else {
 		lines.push('', '**最近动作**（从新到旧）')
 		for (const action of snapshot.actions) {
-			const ago = formatAgo(action.at === null ? null : Date.now() - action.at)
+			const at = Number.isFinite(action?.at) ? action.at : null
+			const ago = formatAgo(at === null ? null : takenAt - at)
 			lines.push(`- ${action.name}${action.args ? `：${action.args}` : ''}${ago ? `（${ago}）` : ''}`)
 		}
 	}

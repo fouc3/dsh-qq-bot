@@ -2,9 +2,11 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
+	QUESTION_MAX_BUTTONS,
 	buildNewSessionCard,
 	buildNoticeCard,
 	buildQuestionCard,
+	buildQuestionCards,
 	buildSessionCard,
 	callbackButton,
 	clipLabel,
@@ -134,6 +136,59 @@ test('提问卡片：按钮数超上限返回 null（调用方降级到 dsh GUI�
 		maxButtons: 5,
 	})
 	assert.equal(card, null)
+})
+
+// 补票：线上真踩过——4 道题 17 个按钮，超过旧上限 15 后**整张卡片返回 null**，
+// 静默降级到 dsh GUI，QQ 侧的用户什么都看不到，提问一直悬着。
+test('提问卡片：4 道题 17 个按钮要能放进一张卡（旧上限 15 会整张作废）', () => {
+	const questions = [
+		{ id: 'q1', question: '一', options: [{ label: 'a1' }, { label: 'a2' }, { label: 'a3' }, { label: 'a4' }, { label: 'a5' }] },
+		{ id: 'q2', question: '二', options: [{ label: 'b1' }, { label: 'b2' }, { label: 'b3' }] },
+		{ id: 'q3', question: '三', options: [{ label: 'c1' }, { label: 'c2' }] },
+		{ id: 'q4', question: '四', options: [{ label: 'd1' }, { label: 'd2' }] },
+	]
+	const cards = buildQuestionCards({ callId: 'c4', questions })
+	assert.ok(cards, '4 道题必须能出卡（否则 QQ 用户看不到提问）')
+	assert.equal(cards.length, 1, '17 个按钮放进一张卡，不该拆')
+	assert.equal(cards[0].indices.length, 4)
+	const rows = cards[0].keyboard.content.rows
+	assert.ok(rows.length <= 5, `行数 ${rows.length} 超平台上限（会 40034029 拒收）`)
+	const buttons = rows.flatMap((row) => row.buttons)
+	assert.equal(buttons.length, 17)
+	assert.equal(buttons.filter((b) => b.render_data.label === '提交').length, 1)
+	assert.ok(QUESTION_MAX_BUTTONS >= 17)
+})
+
+test('提问卡片：一卡放不下就拆成多张，每张都带「提交」且不超平台行数', () => {
+	const mk = (n, count) => ({ id: `q${n}`, question: `第${n}题`, options: Array.from({ length: count }, (_, i) => ({ label: `o${n}-${i}` })) })
+	const questions = [mk(1, 5), mk(2, 5), mk(3, 5), mk(4, 5), mk(5, 5), mk(6, 5)]
+	const cards = buildQuestionCards({ callId: 'c5', questions })
+	assert.ok(cards)
+	assert.ok(cards.length > 1, '36 个选项放不下一张卡，必须拆分')
+	assert.deepEqual(
+		cards.flatMap((card) => card.indices),
+		[0, 1, 2, 3, 4, 5],
+		'拆分后每道题都要出现，且只出现一次',
+	)
+	for (const card of cards) {
+		const rows = card.keyboard.content.rows
+		assert.ok(rows.length <= 5, `拆出来的卡片行数 ${rows.length} 超限`)
+		const buttons = rows.flatMap((row) => row.buttons)
+		assert.ok(buttons.length <= QUESTION_MAX_BUTTONS, `单卡按钮 ${buttons.length} 超上限`)
+		assert.equal(buttons.filter((b) => b.render_data.label === '提交').length, 1, '每张卡片都要能「提交」')
+	}
+	assert.match(cards[1].content, /本卡是第 2\/2 张/)
+	assert.match(cards[1].content, /提交/)
+	// 第二张卡里的选项回调要带**真实题序**（3/4/5），不能从 0 重排
+	const labels = cards[1].keyboard.content.rows
+		.flatMap((row) => row.buttons)
+		.map((b) => b.action.data)
+	assert.ok(labels.some((raw) => /:q:3:opt-0:/.test(raw)), `第二张卡的按钮要指向第 4 题，实际：${labels.join(' | ')}`)
+})
+
+test('提问卡片：单道题自己就放不下时仍然返回 null（不截断选项）', () => {
+	const questions = [{ id: 'q1', question: '题', options: Array.from({ length: 30 }, (_, i) => ({ label: `选项${i}` })) }]
+	assert.equal(buildQuestionCards({ callId: 'c6', questions }), null)
 })
 
 test('会话卡片不超平台键盘限额（≤5 行、每行 ≤5 按钮），装不下就翻页', () => {

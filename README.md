@@ -31,8 +31,8 @@ QQ 用户 ──私聊──▶ QQ 开放平台 ──WebSocket──▶ Go: dsh
 | 富媒体 | `qq_reply` 可发图片/视频/语音/文件：本机路径走分片上传，公网 URL 直传 |
 | 结束通知 | 每轮结束发 `标题(会话id)已结束` + 一个「我需要回复」按钮 |
 | 未回复补救 | **不再要求 AI 必须回复**：没回复时用户点「我需要回复」→ 注入唤醒消息要求 AI 回复该用户，并提示已触发 |
-| 提问桥 | dsh 的 `ask_user_question` 在 QQ 侧渲染成 md 选择卡片：**按钮只写字母 A/B/C**，字母对照与选项小字写在题干与按钮之间；支持「其他」打字、提交（空提交=跳过） |
-| 指令面板 | 5 条命令注册到 QQ 指令面板 + 自定义菜单，面板只绑定配置指定的私聊 |
+| 提问桥 | dsh 的 `ask_user_question` 在 QQ 侧渲染成 md 选择卡片：**按钮只写字母 A/B/C**，字母对照与选项小字写在题干与按钮之间；支持「其他」打字、提交（空提交=跳过）；一卡放不下（上限 20 个按钮）自动拆多张卡片，每张都能提交 |
+| 指令面板 | 7 条命令注册到 QQ 指令面板 + 自定义菜单，面板只绑定配置指定的私聊 |
 | 会话选择 | md 卡片：文件夹是回调按钮、会话是指令按钮（点了只把 `切换会话 <id>` 填进输入框） |
 | 白名单 | 只有配置里列出的 QQ 私聊能控制 bot；其他账号的消息一律丢弃并记日志 |
 | 延迟发送 | `延迟发送 <会话id> <内容>` 登记待发消息，该会话本轮**正常结束**后再投递给会话 |
@@ -178,9 +178,11 @@ level=WARN msg="已丢弃非白名单用户的私聊" openid=2A3B4C… text_len=
 - ✅ 被动回复失效（超 60 分钟 / 超 4 次）自动改发主动消息 —— Go `internal/qq/messaging_test.go`
 - ✅ 富媒体上传：URL 直发、本机文件分片（校验和 + 预签名 PUT + 失败重试）、超限报错
   —— Go `internal/qq/media_test.go`（含分片与 `md5_10m`）
-- ✅ 五个命令都可用；不带参数的 `停止`/`归档` 作用于当前会话；需要参数的命令无参时回作用+用法
-  —— `lib/commands.test.js` + `lib/plugin.test.js`「发送 / 延迟发送 / 停止 / 归档」
-- ✅ 指令面板定义：5 条命令、`c2c` + 指定私聊、按 remark 复用与目标差量 —— Go `internal/qq/panel_test.go`；插件 `lib/plugin.test.js`「register → panel」
+- ✅ 七个命令都可用（切换会话 / 新建会话 / 进度 / 发送 / 停止 / 归档 / 延迟发送）；不带参数的 `停止`/`归档` 作用于当前会话；需要参数的命令无参时回作用+用法
+  —— `lib/commands.test.js` + `lib/plugin.test.js`「发送 / 延迟发送 / 停止 / 归档 / 进度」
+- ✅ `进度` 是**只读快照**（不 cancel、不 resume、不发消息）：当前轮次、已跑多久、最近 3 个动作、最近一段输出；默认时钟不能算出 `NaN`（线上踩过「已跑 NaN 分 NaN 秒」）
+  —— `lib/progress.test.js`
+- ✅ 指令面板定义：7 条命令、`c2c` + 指定私聊、按 remark 复用与目标差量 —— Go `internal/qq/panel_test.go`；插件 `lib/plugin.test.js`「register → panel」
 - ✅ 会话选择卡片：文件夹是回调按钮（逐层进入、每步撤回上一张）、会话是指令按钮（只填输入框、不直接切换）
   —— `lib/cards.test.js` + `lib/plugin.test.js`（断言 `action.type` 与 `recall_c2c`）
 - ✅ 每轮结束发「标题(会话id)已结束」+「我需要回复」；被顶替/未认领/被停止的轮次不发
@@ -189,7 +191,7 @@ level=WARN msg="已丢弃非白名单用户的私聊" openid=2A3B4C… text_len=
   —— `lib/rounds.test.js` + `lib/plugin.test.js`
 - ✅ `延迟发送 <目标> <内容>` 登记、只在本轮**正常结束**时投递、投递后清槽；无参回用法
   —— `lib/rounds.test.js`「只在正常结束时投递」+ `lib/commands.test.js`
-- ✅ 提问：`ask_user_question` → QQ 卡片（按钮只写字母、对照与选项小字在正文、选项/多选/「其他」打字/空提交=跳过/每步撤回上一张/超时交回 GUI）
+- ✅ 提问：`ask_user_question` → QQ 卡片（按钮只写字母、对照与选项小字在正文、选项/多选/「其他」打字/空提交=跳过/只撤回并重发被点的那张/一卡放不下拆多张/超时或放不下时交回 GUI 并在 QQ 侧说明）
   —— `lib/questions.test.js` + `lib/plugin.test.js`「提问桥」
 - ✅ UNIX socket 通道：目录 0700 / socket 0600 / 可选 token / 帧上限 1 MiB / 残留 socket 清理 / health 诊断
   —— `lib/socket.test.js` + Go `internal/bridge/socketclient_test.go`
@@ -200,7 +202,7 @@ level=WARN msg="已丢弃非白名单用户的私聊" openid=2A3B4C… text_len=
   —— `lib/dsh-commands.test.js` + `lib/plugin.test.js`「dsh 内置命令从 QQ 直接执行」;
   网关侧 `internal/qq/panel_clip_test.go`（`sub_menu_items` 落库 + 名宽截断 + 菜单差异检测）
 - ✅ 插件在真 `dsh web` 进程里挂载并可用 —— `application: applied`；通道 0600、目录 700；
-  对通道发 `health` 得到真实会话数（197）、发 `panel` 得到 5 条命令 + `c2c/specific`
+  对通道发 `health` 得到真实会话数（197）、发 `panel` 得到 7 条命令 + `c2c/specific`
 - ✅ `git log` 有提交 —— 见仓库历史
 - ⏳ 普通消息进 dsh 后，AI 调 `qq_reply` 时 QQ 真的收到，且开头是 `【标题(会话id)】`
 - ⏳ 真实 QQ 客户端的按钮点按行为（单聊 `author.user_openid` 字段已对照 SDK 源码确认：

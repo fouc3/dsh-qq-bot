@@ -5,12 +5,14 @@
  *   - **按钮上只写字母 A/B/C…**；
  *   - 字母对应哪个选项、选项下面的小字（description）全部写在题干与按钮之间的正文里；
  *   - 支持「其他」：用户直接发文字即作为该题的"其他"答案；
- *   - 多题一次性展示；不选任何字母直接点「提交」= 跳过该题；
- *   - 每次选择都先尝试撤回上一张卡片，撤回失败只记 WARN。
+ *   - 多题一次性展示；一卡放不下就**拆成多张卡片**（每张都带「提交」）；
+ *   - 不选任何字母直接点「提交」= 跳过该题；
+ *   - 每次选择都只撤回并重发**被点的那张卡片**，撤回失败只记 WARN。
  *
- * 超时或被取消时返回 null，由调用方 `next()` 交回 dsh GUI —— 绝不吞掉提问。
+ * 超时、被取消、或卡片放不下/发不出去时返回 null，由调用方 `next()` 交回 dsh GUI
+ * —— 绝不吞掉提问；降级时还会在 QQ 里明说一句，免得用户什么都看不到。
  */
-import { buildQuestionCard } from './cards.js'
+import { buildQuestionCards, QUESTION_MAX_BUTTONS } from './cards.js'
 
 export function createQuestionBridge({ state, outbox, config, logger, io }) {
 	const pending = new Map() // callId → entry
@@ -25,25 +27,65 @@ export function createQuestionBridge({ state, outbox, config, logger, io }) {
 		return callId ? entryOfCall(callId) : null
 	}
 
-	async function render(entry) {
-		const card = buildQuestionCard({
+	function maxButtons() {
+		return Number(config.maxQuestionButtons) || QUESTION_MAX_BUTTONS
+	}
+
+	/** 按当前已答状态重新生成一次提问的所有卡片（分组只取决于题目，下标稳定）。 */
+	function cardsOf(entry) {
+		return buildQuestionCards({
 			callId: entry.callId,
 			questions: entry.questions,
 			answers: entry.answers,
 			customFor: entry.customFor,
-			maxButtons: Number(config.maxQuestionButtons) || 15,
+			maxButtons: maxButtons(),
 		})
+	}
+
+	/** 第 cardIndex 张卡片在第几组（按题序归属）。 */
+	function cardIndexOfQuestion(entry, questionIndex) {
+		const index = (entry.groups ?? []).findIndex((indices) => indices.includes(questionIndex))
+		return index < 0 ? 0 : index
+	}
+
+	async function render(entry, cardIndex = 0) {
+		const card = cardsOf(entry)?.[cardIndex]
 		if (!card) return null
-		// 每次选择都先撤回上一张卡片（撤回失败只 WARN，不阻塞新卡）
-		if (entry.cardMsgId) await io.recallCard(entry.openid, entry.cardMsgId)
+		// 只撤回**这张卡**的上一条；一次提问可能有好几张卡，别把别的卡也撤了。
+		if (entry.cardMsgIds[cardIndex]) await io.recallCard(entry.openid, entry.cardMsgIds[cardIndex])
 		const messageId = await io.sendCard({
 			openid: entry.openid,
 			content: card.content,
 			keyboard: card.keyboard,
 			context: entry.context,
+			// 交给桥自己按卡片下标撤回，别让 io 顺手撤掉上一张（那是另一组题）。
+			keepPrevious: true,
 		})
-		entry.cardMsgId = messageId ?? entry.cardMsgId ?? null
+		if (messageId) {
+			entry.cardMsgIds[cardIndex] = messageId
+			entry.cardIndex = cardIndex
+		}
 		return messageId
+	}
+
+	/** 把这次提问发出去的**所有**卡片都撤回（尽力而为）。 */
+	async function recallAll(entry) {
+		const ids = (entry.cardMsgIds ?? []).filter(Boolean)
+		entry.cardMsgIds = []
+		for (const messageId of ids) await io.recallCard(entry.openid, messageId)
+	}
+
+	/** 卡片发不出去/放不下时的兜底：告诉用户已经交回 dsh GUI，别无声无息。 */
+	async function notifyFallback(entry, reason) {
+		try {
+			await io.notify?.({
+				openid: entry.openid,
+				content: `**提问没能发到 QQ**（${reason}）。\n> 已经交回 dsh Web 端等你回答；也可以把问题拆小一点再问我一次。`,
+				context: entry.context,
+			})
+		} catch (error) {
+			logger?.warn?.('提问降级提示发送失败', { callId: entry.callId, error: String(error) })
+		}
 	}
 
 	/**
@@ -53,18 +95,6 @@ export function createQuestionBridge({ state, outbox, config, logger, io }) {
 	async function ask({ callId, questions, openid, sessionId, context = {}, signal }) {
 		if (!openid || !Array.isArray(questions) || questions.length === 0) return null
 
-		const probe = buildQuestionCard({
-			callId,
-			questions,
-			answers: {},
-			customFor: null,
-			maxButtons: Number(config.maxQuestionButtons) || 15,
-		})
-		if (!probe) {
-			logger?.warn?.('提问按钮数超过上限，交回 dsh GUI', { callId, questions: questions.length })
-			return null
-		}
-
 		const entry = {
 			callId,
 			openid,
@@ -72,10 +102,20 @@ export function createQuestionBridge({ state, outbox, config, logger, io }) {
 			questions,
 			answers: {},
 			customFor: null,
-			cardMsgId: null,
+			cardMsgIds: [],
+			cardIndex: 0,
+			groups: null,
 			context,
 			settled: false,
 		}
+
+		const probe = cardsOf(entry)
+		if (!probe) {
+			logger?.warn?.('提问放不下一张卡片，交回 dsh GUI', { callId, questions: questions.length, maxButtons: maxButtons() })
+			await notifyFallback(entry, '按钮太多，QQ 卡片放不下')
+			return null
+		}
+		entry.groups = probe.map((card) => card.indices)
 		pending.set(callId, entry)
 		byOpenid.set(openid, callId)
 
@@ -96,13 +136,20 @@ export function createQuestionBridge({ state, outbox, config, logger, io }) {
 		}
 
 		try {
-			const messageId = await render(entry)
-			if (!messageId) {
+			// 一次提问可能拆成好几张卡片，逐张发出去；一张都没发成功就交回 GUI。
+			let anySent = false
+			for (let cardIndex = 0; cardIndex < entry.groups.length; cardIndex += 1) {
+				const messageId = await render(entry, cardIndex)
+				if (messageId) anySent = true
+			}
+			if (!anySent) {
 				// 卡片没发出去（通道失败）：交回 GUI，别让提问悬着
+				await notifyFallback(entry, '卡片发送失败')
 				await settle(entry, null)
 			}
 		} catch (error) {
 			logger?.warn?.('发送提问卡片失败，交回 dsh GUI', { callId, error: String(error) })
+			await notifyFallback(entry, '卡片发送失败')
 			await settle(entry, null)
 		}
 		return answer
@@ -115,9 +162,7 @@ export function createQuestionBridge({ state, outbox, config, logger, io }) {
 		if (entry.timer) clearTimeout(entry.timer)
 		pending.delete(entry.callId)
 		if (byOpenid.get(entry.openid) === entry.callId) byOpenid.delete(entry.openid)
-		if (result === null && entry.cardMsgId) {
-			await io.recallCard(entry.openid, entry.cardMsgId)
-		}
+		if (result === null) await recallAll(entry)
 		entry.resolve?.(result)
 	}
 
@@ -174,7 +219,8 @@ export function createQuestionBridge({ state, outbox, config, logger, io }) {
 				return { code: 1, handled: false }
 			}
 
-			await render(entry)
+			// 重发**被点的那张卡片**（多卡时其余卡片原地不动）。
+			await render(entry, cardIndexOfQuestion(entry, parsed.questionIndex))
 			return { code: 0, handled: true }
 		} catch (error) {
 			logger?.warn?.('处理提问卡片点击失败', { callId: parsed.callId, error: String(error) })
@@ -183,7 +229,7 @@ export function createQuestionBridge({ state, outbox, config, logger, io }) {
 	}
 
 	async function recallAndSettle(entry) {
-		if (entry.cardMsgId) await io.recallCard(entry.openid, entry.cardMsgId)
+		await recallAll(entry)
 		const answers = finalAnswers(entry)
 		await settle(entry, answers)
 	}
@@ -209,7 +255,7 @@ export function createQuestionBridge({ state, outbox, config, logger, io }) {
 		entry.answers[index] = { ...(entry.answers[index] ?? { selected: [] }), custom: content }
 		entry.customFor = null
 		logger?.info?.('收到提问的「其他」答案', { callId: entry.callId, question: index })
-		await render(entry)
+		await render(entry, cardIndexOfQuestion(entry, index))
 		return true
 	}
 

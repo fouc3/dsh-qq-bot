@@ -24,7 +24,13 @@ import { createSessions } from './lib/sessions.js'
 import { createQuestionBridge } from './lib/questions.js'
 import { createRounds } from './lib/rounds.js'
 import { buildReplyTool } from './lib/reply-tool.js'
-import { buildNewSessionCard, buildSessionCard, data as cardData, parseCallback } from './lib/cards.js'
+import {
+	QUESTION_MAX_BUTTONS,
+	buildNewSessionCard,
+	buildSessionCard,
+	data as cardData,
+	parseCallback,
+} from './lib/cards.js'
 import { createCommandRunner, menuItems, panelItems, parseCommand } from './lib/commands.js'
 import { renderProgress, snapshotProgress } from './lib/progress.js'
 import {
@@ -74,7 +80,8 @@ export function apply(ctx, rawConfig) {
 		idStyle: rawConfig?.idStyle ?? 'full',
 		defaultMarkdown: rawConfig?.defaultMarkdown ?? true,
 		questionTimeoutMs: rawConfig?.questionTimeoutMs ?? 600000,
-		maxQuestionButtons: rawConfig?.maxQuestionButtons ?? 15,
+		// 单张提问卡片的按钮上限（平台 5 行 × 每行 4 个）；超了就由提问桥拆成多张卡片。
+		maxQuestionButtons: rawConfig?.maxQuestionButtons ?? QUESTION_MAX_BUTTONS,
 		replyAckTimeoutMs: rawConfig?.replyAckTimeoutMs ?? 8000,
 		noticeFallbackMs: rawConfig?.noticeFallbackMs ?? 3000,
 		sessionPageSize: rawConfig?.sessionPageSize ?? 8,
@@ -187,11 +194,17 @@ export function apply(ctx, rawConfig) {
 
 	const io = {
 		recallCard,
-		sendCard: async ({ openid, content, keyboard, context }) => {
-			await recallPreviousCard(openid)
+		// keepPrevious：一次提问可能拆成多张卡片，由调用方按下标自己撤回，
+		// 不能让发第二张的时候顺手把第一张撤掉。
+		sendCard: async ({ openid, content, keyboard, context, keepPrevious = false }) => {
+			if (!keepPrevious) await recallPreviousCard(openid)
 			const messageId = await sendCard({ openid, content, keyboard, context })
 			state.setLastCard(openid, messageId)
 			return messageId
+		},
+		// 降级兜底用：纯文本告诉用户"这次提问没发到 QQ"，别无声无息。
+		notify: async ({ openid, content, context }) => {
+			await sendText({ openid, content, markdown: true, context })
 		},
 	}
 

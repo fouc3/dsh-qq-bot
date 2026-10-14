@@ -124,3 +124,30 @@ test('renderProgress：输出是 QQ 能渲染的 markdown（无表格），并�
 	assert.match(idle, /空闲/)
 	assert.match(idle, /没有可读的事件/)
 })
+
+// 补票：线上真踩过——默认参数 `now = Date.now` 是个**函数**，被当成时间戳用，
+// `Date.now - startedAt` 直接算出 NaN，进度里显示「已跑 NaN 分 NaN 秒」。
+// 之前单测全都显式传数字，正好漏掉默认分支。
+test('snapshotProgress：不传 now 时用真实时钟，绝不能算出 NaN', () => {
+	const startedAt = Date.now() - 12_000
+	const agent = makeAgent({ events: [ev(0, 'turn/start', startedAt, { turn: 7 })] })
+
+	const snapshot = snapshotProgress(agent)
+	assert.ok(Number.isFinite(snapshot.elapsedMs), `耗时必须是有限数字，实际 ${snapshot.elapsedMs}`)
+	assert.ok(snapshot.elapsedMs >= 12_000, `至少应有 12 秒，实际 ${snapshot.elapsedMs}`)
+	assert.ok(Number.isFinite(snapshot.lastEventAgoMs))
+
+	const text = renderProgress({ label: '会话', snapshot, sessionId: 's-1' })
+	assert.doesNotMatch(text, /NaN/, `进度里不能出现 NaN：\n${text}`)
+	assert.match(text, /已跑 \d+ 秒/)
+
+	// 默认值和显式传函数是同一种用法，两条路都要能用
+	const viaFn = snapshotProgress(agent, { now: () => Date.now() })
+	assert.ok(Number.isFinite(viaFn.elapsedMs))
+
+	// 时钟给不出有效时间时，宁可空着也不能印 NaN
+	const broken = snapshotProgress(agent, { now: () => Number.NaN })
+	assert.equal(broken.elapsedMs, null)
+	assert.equal(broken.lastEventAgoMs, null)
+	assert.doesNotMatch(renderProgress({ label: '会话', snapshot: broken, sessionId: 's-1' }), /NaN/)
+})

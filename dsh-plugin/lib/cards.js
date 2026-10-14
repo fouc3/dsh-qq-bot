@@ -290,19 +290,42 @@ export function buildNoticeCard({ label, sessionId, interrupted = false, source 
  * 关键设计（用户要求）：**按钮上只写字母**，字母对应的选项与"选项下面的小字"
  * （description）全部写在题干与按钮之间的 markdown 正文里。
  *
- * @param {object} input
- * @param {string} input.callId
- * @param {Array<{id:string, question:string, header?:string, detail?:string, options?:Array<{label:string, description?:string}>, multiSelect?:boolean}>} input.questions
- * @param {object} [input.answers] 题序 → { selected: string[], custom?: string }
- * @param {number|null} [input.customFor] 正在等待"其他"输入的题序
- * @param {number} [input.maxButtons]
- * @returns {{content:string, keyboard:object}|null} 按钮超限时返回 null（调用方降级到 dsh GUI）
+ * 一次提问的按钮（选项 + 每题一个「其他」+ 一个「提交」）放不下一张卡片时，
+ * 拆成多张卡片发（见 buildQuestionCards）。线上真踩过：4 道题 17 个按钮超过
+ * 单卡上限，卡片返回 null、静默降级到 dsh GUI，QQ 侧的用户什么都看不到。
  */
-export function buildQuestionCard({ callId, questions, answers = {}, customFor = null, maxButtons = 15 }) {
+
+/** 提问卡片的排版：每行 4 个（手机上更好点）。 */
+export const QUESTION_BUTTONS_PER_ROW = 4
+/** 单张提问卡片的按钮数上限（平台 5 行 × 每行 4 个）。 */
+export const QUESTION_MAX_BUTTONS = KEYBOARD_MAX_ROWS * QUESTION_BUTTONS_PER_ROW
+
+/** 一个问题除了选项之外固定要占的按钮数（「其他」）。 */
+function questionButtonCost(question) {
+	return (question?.options ?? []).length + 1
+}
+
+/** 一张卡片正文里与题目无关的固定提示。 */
+function questionHints({ cardIndex, cardTotal }) {
+	const hints = [
+		'> 不选任何字母直接点「提交」= 跳过本题。',
+		'> 命令（如 进度 / 停止 / 切换会话）照常生效，不会被当成答案。',
+	]
+	if (cardTotal > 1) {
+		hints.unshift(
+			`> 本卡是第 ${cardIndex}/${cardTotal} 张，其余题目在别的卡片上；随便在哪张点「提交」都算交卷（没答的题按跳过）。`,
+		)
+	}
+	return hints
+}
+
+/** 生成一张只包含 indices 这些题的卡片。 */
+function renderQuestionCard({ callId, questions, indices, answers, customFor, cardIndex = 1, cardTotal = 1 }) {
 	const buttons = []
 	const blocks = []
 
-	questions.forEach((question, qIndex) => {
+	indices.forEach((qIndex) => {
+		const question = questions[qIndex]
 		const answer = answers[qIndex] ?? {}
 		const selected = new Set(answer.selected ?? [])
 		const head = `**提问 ${qIndex + 1}/${questions.length}**${question.header ? ` · \`${question.header}\`` : ''}`
@@ -346,14 +369,72 @@ export function buildQuestionCard({ callId, questions, answers = {}, customFor =
 		blocks.push(lines.join('\n'))
 	})
 
-	const submit = callbackButton('提交', data.question(callId, 0, 'submit'))
-	const allButtons = [...buttons, submit]
-	if (allButtons.length > maxButtons) return null
+	buttons.push(callbackButton('提交', data.question(callId, indices[0] ?? 0, 'submit')))
+	const content = [...blocks, ...questionHints({ cardIndex, cardTotal })].join('\n---\n')
+	return { content, keyboard: keyboardOf(rowsOf(buttons, QUESTION_BUTTONS_PER_ROW)), buttons }
+}
 
-	const content = [
-		...blocks,
-		'> 不选任何字母直接点「提交」= 跳过本题。',
-		'> 命令（如 进度 / 停止 / 切换会话）照常生效，不会被当成答案。',
-	].join('\n---\n')
-	return { content, keyboard: keyboardOf(rowsOf(allButtons, 4)) }
+/**
+ * 把一次提问拆成若干张卡片：一张放不下就顺延到下一张，**每张卡片都带「提交」**。
+ *
+ * 分组的依据只有题目本身（与已答状态无关），所以同一 callId 反复渲染时，
+ * 卡片数、每张卡里的题序都是稳定的——调用方可以按下标重发某一张。
+ *
+ * @param {object} input
+ * @param {string} input.callId
+ * @param {Array<{id:string, question:string, header?:string, detail?:string, options?:Array<{label:string, description?:string}>, multiSelect?:boolean}>} input.questions
+ * @param {object} [input.answers] 题序 → { selected: string[], custom?: string }
+ * @param {number|null} [input.customFor] 正在等待"其他"输入的题序
+ * @param {number} [input.maxButtons] 单卡按钮上限
+ * @returns {Array<{indices:number[], content:string, keyboard:object}>|null}
+ *   null = 单道题本身都放不下（**不截断选项**，免得悄悄少给选项），调用方降级到 dsh GUI
+ */
+export function buildQuestionCards({ callId, questions, answers = {}, customFor = null, maxButtons = QUESTION_MAX_BUTTONS }) {
+	const list = Array.isArray(questions) ? questions : []
+	if (list.length === 0) return null
+	const cap = Math.max(
+		3,
+		Math.min(Number(maxButtons) || QUESTION_MAX_BUTTONS, KEYBOARD_MAX_ROWS * KEYBOARD_MAX_BUTTONS_PER_ROW),
+	)
+
+	const groups = []
+	list.forEach((question, qIndex) => {
+		const cost = questionButtonCost(question)
+		const last = groups[groups.length - 1]
+		// 每张卡片固定多占一个「提交」；加上它放不下就开新卡。
+		if (last && last.cost + cost + 1 <= cap) {
+			last.indices.push(qIndex)
+			last.cost += cost
+			return
+		}
+		groups.push({ indices: [qIndex], cost: cost + 1 })
+	})
+
+	const cards = groups.map((group, index) =>
+		renderQuestionCard({
+			callId,
+			questions: list,
+			indices: group.indices,
+			answers,
+			customFor,
+			cardIndex: index + 1,
+			cardTotal: groups.length,
+		}),
+	)
+	if (cards.some((card) => card.buttons.length > cap)) return null
+	return cards.map((card, index) => ({
+		indices: groups[index].indices,
+		content: card.content,
+		keyboard: card.keyboard,
+	}))
+}
+
+/**
+ * 单张提问卡片（向后兼容的入口）：拆出来只有一张时返回它，否则返回 null。
+ * @returns {{content:string, keyboard:object}|null}
+ */
+export function buildQuestionCard(input) {
+	const cards = buildQuestionCards(input)
+	if (!cards || cards.length !== 1) return null
+	return { content: cards[0].content, keyboard: cards[0].keyboard }
 }
