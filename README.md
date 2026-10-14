@@ -74,15 +74,18 @@ dsh plugin --profile web add /home/fouc3/Projects/DSH-QQ-Bot/dsh-plugin
 
 装完确认：插件管理器里出现 `@local/dsh-qq-bot`，状态 `applied`；`dsh web` 重启后仍在。
 
-> **本机实测的安装阻塞（与本插件无关）**：当前 `web` profile 里已有的第三方 bundle
-> `dsh-pause` 是 git 依赖且需要执行 build script，没有被 pnpm 的 `allowBuilds` 放行，
-> 于是任何 `install_bundle` 都会以 `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED` 失败
-> （报错来自 `~/.dsh/profiles/web` 的依赖安装，不是本插件）。两条出路，选一条：
+> **本机已安装并验证（2026-10-14）**：`plugin_manager install_bundle` 返回
+> `application: applied`；profile 里记录为 `link:/home/fouc3/Projects/DSH-QQ-Bot/dsh-plugin`
+> （软链安装——这正是插件必须自包含、不能 import dsh 包的原因）。在**运行中的 dsh web 进程**里实测：
+> 通道 `~/.dsh/dsh-qq-bot/bridge.sock` 为 `srw-------`（目录 700）；直接对该 socket 发 `health`
+> 得到 `{ok:true,version:1,bindings:0,outboxDepth:0,titles:197,whitelist:0}`（197 = 真实会话数）；
+> 发 `panel` 得到 `scope=c2c / target=specific / 5 条命令 / 5 条菜单`。
 >
-> 1. 按提示把 `dsh-pause` 加进 `~/.dsh/profiles/web/pnpm-workspace.yaml` 的 `allowBuilds`
->    （这会允许该第三方包执行安装脚本，由你决定是否接受）；
-> 2. 或者把本插件装到一个干净的 profile 里，例如
->    `dsh rescue --from-default-profile web` 建一个副本 profile 再 `install_bundle`。
+> 装它之前需要先放行 profile 里既有的第三方 git 包（否则 pnpm 会以
+> `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED` 拒绝任何安装）：把
+> `~/.dsh/profiles/web/pnpm-workspace.yaml` 的 `allowBuilds` 里
+> `dsh-pause@https://codeload.github.com/better-er/dsh-pause/tar.gz/14f5fd3...` 从占位符
+> `set this to true or false` 改成 `true`。这是**允许该第三方包执行安装脚本**的安全决定，需你拍板。
 >
 > **不能用 `--patch` 把插件"插"进现有 profile**（已实测）：覆盖式补丁只能按 id 改写
 > **已有**条目，新增条目会报 `patch: entry "<id>" not found`。bundle 自带的
@@ -171,11 +174,13 @@ level=WARN msg="已丢弃非白名单用户的私聊" openid=2A3B4C… text_len=
   —— `lib/socket.test.js` + Go `internal/bridge/socketclient_test.go`
 - ✅ 出站队列 at-least-once（失败不消费、超时重投沿用原 id、撤回不重投、ack 唤醒等待者）
   —— `lib/outbox.test.js` + Go `internal/executor/executor_test.go`
+- ✅ 插件在真 `dsh web` 进程里挂载并可用 —— `application: applied`；通道 0600、目录 700；
+  对通道发 `health` 得到真实会话数（197）、发 `panel` 得到 5 条命令 + `c2c/specific`
 - ✅ `git log` 有提交 —— 见仓库历史
 - ⏳ 普通消息进 dsh 后，AI 调 `qq_reply` 时 QQ 真的收到，且开头是 `【标题(会话id)】`
-- ⏳ 真实 QQ 客户端的按钮点按行为（含单聊 `user_openid` 字段是否如预期）
+- ⏳ 真实 QQ 客户端的按钮点按行为（单聊 `author.user_openid` 字段已对照 SDK 源码确认：
+  `User.UserOpenID` ↔ `json:"user_openid"`）
 - ⏳ 真机上的面板可见性与 `GetMenu`
-- ⏳ 插件在本机 profile 的自动安装（见上面"安装阻塞"）
 
 ## 测试
 
@@ -199,8 +204,8 @@ JSON Schema，用户消息本地构造）。原因：profile 安装本地目录�
 解析依赖，而 `~/Projects/...` 这条链上并没有 `@deepseek-ai/*`（那是 dsh 安装目录和
 `~/.dsh/profiles/node_modules` 提供的）。自包含后无论软链还是拷贝安装都能加载。
 
-**尚未验证**：真 QQ 凭证下的端到端收发（需要你自己的机器人凭据与私聊 openid）；
-插件在本机 profile 的自动安装（见上面"安装阻塞"）。
+**尚未验证**：真 QQ 凭证下的端到端收发（需要你自己的机器人凭据与私聊 openid）。
+插件本体已在运行中的 `dsh web` 里挂载并通过通道自检（见上面"安装"）。
 
 ## 边界与已知约束
 
