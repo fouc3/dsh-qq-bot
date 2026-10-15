@@ -130,7 +130,7 @@ export const data = {
 	rmdirYes: (path) => `${DATA_PREFIX}:rmdir2:${path}`,
 	// 权限卡片：切成某个预设（value 是 dsh 的预设 key，如 danger-full-access）
 	perm: (value) => `${DATA_PREFIX}:perm:${value}`,
-	// 快捷切换卡片：go（切到某条，arg = 编号）/ add（把当前会话加进来）
+	// 快捷卡片：go（切到某条，arg = 编号）/ add（把当前会话加进来）
 	shortcut: (action, arg = '') => `${DATA_PREFIX}:sc:${action}${arg === '' ? '' : `:${arg}`}`,
 	// 模型卡片：page（提供商翻页）/ enter（进提供商看模型）/ mpage（提供商内翻页）/
 	// pick（切到某个模型）/ list（回到提供商列表）；arg 是提供商 id 或 `提供商id:…`。
@@ -448,11 +448,11 @@ export function buttonsPerRowFor(count, { preferred = 2, maxRows = KEYBOARD_MAX_
 	return KEYBOARD_MAX_BUTTONS_PER_ROW
 }
 
-// ── 快捷切换卡片 ─────────────────────────────────────────────────────────
+// ── 快捷卡片 ─────────────────────────────────────────────────────────────
 //
 // 固定末尾留一行「加当前会话」，所以装得下的条数 =（5-1）行 × 每行 2 个 = 8。
-// 超出的条数不翻页、只在正文里说明"用 `快捷切换 #编号` 直达"：
-// 快捷切换本来就是"少点两下"，翻页反而比打字更麻烦。
+// 超出的条数不翻页、只在正文里说明"用 `快捷 #编号` 直达"：
+// 快捷本来就是"少点两下"，翻页反而比打字更麻烦。
 
 /** 快捷按钮每行 2 个（`#编号 + 备注` 比目录名长，挤到 3 个就看不全了）。 */
 export const SHORTCUT_BUTTONS_PER_ROW = 2
@@ -462,7 +462,7 @@ export const SHORTCUT_LABEL_WIDTH_LIMIT = 24
 export const SHORTCUT_MAX_BUTTONS = (KEYBOARD_MAX_ROWS - 1) * SHORTCUT_BUTTONS_PER_ROW
 
 /**
- * 快捷切换卡片：一条一个**回调按钮**（点一下**直接切过去**，不像会话卡片那样只填输入框）。
+ * 快捷卡片：一条一个**回调按钮**（点一下**直接切过去**，不像会话选择卡片那样只填输入框）。
  *
  * @param {object} input
  * @param {Array<{id:number, label:string, current:boolean}>} input.items 已排好序的条目
@@ -470,16 +470,16 @@ export const SHORTCUT_MAX_BUTTONS = (KEYBOARD_MAX_ROWS - 1) * SHORTCUT_BUTTONS_P
  */
 export function buildShortcutCard({ items = [], currentLabel = '' }) {
 	const shown = items.slice(0, SHORTCUT_MAX_BUTTONS)
-	const lines = ['**快捷切换**', `> 当前会话：${currentLabel ? `\`${currentLabel}\`` : '`none`（未绑定）'}`]
+	const lines = ['**快捷**', `> 当前会话：${currentLabel ? `\`${currentLabel}\`` : '`none`（未绑定）'}`]
 	if (items.length === 0) {
-		lines.push('', '还没有快捷会话。发 `快捷切换 加 [备注]` 把当前会话存成 `#1`（点下面的按钮也一样）。')
+		lines.push('', '还没有快捷会话。发 `快捷 加 [备注]` 把当前会话存成 `#1`（点下面的按钮也一样）。')
 	} else {
 		lines.push(`共 ${items.length} 个；编号**只增不重用**（删掉的不补位，\`#3\` 永远指同一个会话）。`)
-		lines.push('', '点按钮**直接切过去**；带消息就发 `快捷切换 #2 <消息>`（切过去并把消息投给 AI，会打断它正在跑的轮次）。')
-		lines.push('加：`快捷切换 加 [备注]` ｜ 删：`快捷切换 删 #2` ｜ 改名：`快捷切换 备注 #2 <新备注>`。')
+		lines.push('', '点按钮**直接切过去**；`快捷 #2 <消息>` 是**只投消息不切换**（会打断它正在跑的轮次）。')
+		lines.push('加：`快捷 加 [备注]` ｜ 删：`快捷 删 #2` ｜ 改名：`快捷 备注 #2 <新备注>`（也认 `add a` / `delete d` / `list l`）。')
 		lines.push('> 备注里不能有 `#`（那是编号专用），而且备注要唯一。')
 		if (items.length > shown.length) {
-			lines.push(`> 按钮只放得下前 ${shown.length} 个，其余的用 \`快捷切换 #编号\` 直达。`)
+			lines.push(`> 按钮只放得下前 ${shown.length} 个，其余的用 \`快捷 #编号\` 直达。`)
 		}
 	}
 

@@ -21,7 +21,7 @@ export const EMPTY_STATE = {
 	createdSessions: {}, // sessionId -> cwd（本桥建出来的会话：用来补登记工作区）
 	createdDirs: [], // 本桥建出来的目录（新建目录）：用来补登记工作区
 	sessionOwners: {}, // sessionId -> openid（最近一次从 QQ 跟这个会话说过话的人）
-	// 快捷切换：openid -> { seq, items: [{ id, sessionId, name, at }] }。
+	// 快捷（命令 `快捷`）：openid -> { seq, items: [{ id, sessionId, name, at }] }。
 	// `id` 是按钮上那个 `#数字编号`：**只增不重用**（删掉 #2 后 #3 仍是原来那个会话），
 	// 否则用户记在脑子里的编号会悄悄指到别的会话。`name` 是自定义备注（空 = 用会话标题）。
 	shortcuts: {},
@@ -297,7 +297,7 @@ export function createState({ file, logger, seed, debounceMs = 200 } = {}) {
 			return typeof owner === 'string' && owner ? owner : null
 		},
 
-		// ── 快捷切换（自带 #编号 + 自定义备注） ───────────────────────────────
+		// ── 快捷（自带 #编号 + 自定义备注） ─────────────────────────────────
 		/** 某人的快捷列表（拷贝，调用方改不坏状态）。 */
 		shortcutsOf(openid) {
 			const book = data.shortcuts?.[openid]

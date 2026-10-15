@@ -459,14 +459,14 @@ test('register → panel：白名单快照 + 十条命令的面板定义（只�
 	assert.deepEqual(panel.value.userOpenIds, ['U1'])
 	assert.deepEqual(
 		panel.value.items.map((item) => item.name),
-		['切换会话', '快捷切换', '新建会话', '进度', '发送', '停止', '归档', '延迟发送', '权限', '模型'],
+		['切换会话', '快捷', '新建会话', '进度', '发送', '停止', '归档', '延迟发送', '权限', '模型'],
 	)
 	// 扁平键 menuItems：与 Go 侧 PanelDefinition.MenuItems 对齐（大小写不敏感匹配）
 	// 顶层 8 项 = 7 个平铺 + 1 个「管理」二级菜单（停止/归档/权限）+ 2 个 dsh 命令二级菜单 = 10（平台上限）。
 	assert.equal(panel.value.menuItems.length, 8)
 	assert.equal(panel.value.menuItems[0].name, '切换会话')
 	assert.equal(panel.value.menuItems[0].sendMessage, '切换会话')
-	assert.equal(panel.value.menuItems[1].sendMessage, '快捷切换')
+	assert.equal(panel.value.menuItems[1].sendMessage, '快捷')
 	const manageGroup = panel.value.menuItems.find((item) => item.type === 'menu')
 	assert.equal(manageGroup.name, '管理')
 	assert.deepEqual(manageGroup.children.map((child) => child.name), ['停止', '归档', '权限'])
@@ -2142,11 +2142,11 @@ test('端到端：`模型` 两级卡片（提供商 2/行 → 模型 1/行）／
 	boot.dispose()
 })
 
-// ── 快捷切换（#编号 + 备注） ────────────────────────────────────────────────
+// ── 快捷（#编号 / 备注 / 会话id） ───────────────────────────────────────────
 
-// 快捷切换和「会话选择卡片」的关键区别：那张卡片的会话按钮是**指令按钮**（只把命令填进
+// 快捷和「会话选择卡片」的关键区别：那张卡片的会话按钮是**指令按钮**（只把命令填进
 // 输入框），这张是**回调按钮**（点一下当场切过去）——"快捷"要的就是少点两下。
-test('端到端：快捷切换 —— 加进列表、点按钮直接切、切过去并投递一条消息', async (t) => {
+test('端到端：快捷 —— 裸发是帮助、列出给卡片、点按钮直接切、带消息只投递不切换', async (t) => {
 	const agent1 = makeAgent('session-1')
 	const agent2 = makeAgent('session-2')
 	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': agent1, 'session-2': agent2 } })
@@ -2157,23 +2157,32 @@ test('端到端：快捷切换 —— 加进列表、点按钮直接切、切过
 		menu: { enabled: true },
 	})
 
+	// 0) **裸发 = 帮助**（用户明确要求）：只回文本，不发卡片
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '快捷', msgId: 'M0' })
+	const help = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 60)
+		return list.find((c) => c.kind === 'send_c2c' && /用法：/.test(String(c.args.content))) ?? null
+	})
+	assert.match(String(help.args.content), /还没有快捷会话/)
+	assert.equal(help.args.keyboard, undefined, '裸发只回帮助文本，不发卡片')
+
 	// 1) 绑到 session-1，加进快捷（带备注）
 	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M1' })
 	await waitFor(async () => (await pumpQueue(boot.socketPath)).some((c) => c.kind === 'send_c2c'))
-	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '快捷切换 加 前端', msgId: 'M2' })
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '快捷 加 前端', msgId: 'M2' })
 	const added = await waitFor(async () => {
 		const list = await drainFor(boot.socketPath, 60)
 		return list.find((c) => c.kind === 'send_c2c' && /已加入快捷/.test(String(c.args.content))) ?? null
 	})
 	assert.match(String(added.args.content), /#1 前端/)
 
-	// 2) 换到 session-2，再发 `快捷切换` 拿卡片
+	// 2) 换到 session-2，再发 `快捷 列出` 拿卡片
 	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-2', msgId: 'M3' })
 	await drainFor(boot.socketPath, 60)
-	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '快捷切换', msgId: 'M4' })
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '快捷 列出', msgId: 'M4' })
 	const card = await waitFor(async () => {
 		const list = await drainFor(boot.socketPath, 60)
-		return list.find((c) => c.kind === 'send_c2c' && c.args.keyboard && /快捷切换/.test(String(c.args.content))) ?? null
+		return list.find((c) => c.kind === 'send_c2c' && c.args.keyboard && /快捷/.test(String(c.args.content))) ?? null
 	})
 	const rows = card.args.keyboard.content.rows
 	assert.ok(rows.length <= 5, '键盘行数不能超平台上限')
@@ -2211,10 +2220,10 @@ test('端到端：快捷切换 —— 加进列表、点按钮直接切、切过
 	assert.equal(refreshedGo.render_data.style, 1, '重发的卡片要把新的"当前"标蓝')
 
 	// 绑定与快捷条目都真的落盘了（不只是内存里对）
+	const readState = () => JSON.parse(readFileSync(boot.stateFile, 'utf8'))
 	const saved = await waitFor(() => {
 		try {
-			const state = JSON.parse(readFileSync(boot.stateFile, 'utf8'))
-			return state.bindings.U1 === 'session-1' ? state : null
+			return readState().bindings.U1 === 'session-1' ? readState() : null
 		} catch {
 			return null
 		}
@@ -2224,24 +2233,32 @@ test('端到端：快捷切换 —— 加进列表、点按钮直接切、切过
 		[[1, 'session-1', '前端']],
 	)
 
-	// 4) `快捷切换 #1 <消息>`：切过去 + 立刻把消息投给那个会话（会打断正在跑的轮次）
-	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '快捷切换 #1 你好', msgId: 'M5' })
+	// 4) `快捷 #1 <消息>` = **只投递、不切换**（用户明确要求）：先回到 session-2 再试
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-2', msgId: 'M5' })
+	await drainFor(boot.socketPath, 60)
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '快捷 #1 你好', msgId: 'M6' })
 	await waitFor(() => agent1.followed.length > 0)
 	assert.equal(agent1.followed.at(-1).content[0].text, '你好')
 	assert.equal(agent1.followed.at(-1).source.kind, 'user', 'QQ 里打的字要标成人类输入')
 	assert.equal(agent2.followed.length, 0, '不能投错会话')
+	assert.ok(
+		(await drainFor(boot.socketPath, 80)).some((c) => c.kind === 'send_c2c' && /没有切换/.test(String(c.args.content))),
+		'回执要说清楚"没有切换"',
+	)
+	await waitFor(() => readState().bindings.U1 === 'session-2')
+	assert.equal(readState().bindings.U1, 'session-2', '带消息的那次绝不能把绑定带走')
 
 	boot.dispose()
 })
 
-test('端到端：快捷切换的备注不能带 #（含 # 的备注必须被拒，列表不能变）', async (t) => {
+test('端到端：快捷的备注不能带 #（含 # 的备注必须被拒，列表不能变）', async (t) => {
 	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': makeAgent('session-1') } })
 	await waitFor(() => existsSync(boot.socketPath))
 	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
 	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M1' })
 	await drainFor(boot.socketPath, 60)
 
-	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '快捷切换 加 前端#1', msgId: 'M2' })
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '快捷 加 前端#1', msgId: 'M2' })
 	const refused = await waitFor(async () => {
 		const list = await drainFor(boot.socketPath, 80)
 		return list.find((c) => c.kind === 'send_c2c' && /备注里不能有/.test(String(c.args.content))) ?? null

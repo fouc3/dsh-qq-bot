@@ -766,9 +766,9 @@ test('模型卡片回调 data 能原样解析回来（端到端契约）', () =>
 	assert.equal(parseCallback('qqb:mod'), null, '不是本插件的回调前缀')
 })
 
-// ── 快捷切换卡片 ────────────────────────────────────────────────────────────
+// ── 快捷卡片 ────────────────────────────────────────────────────────────────
 
-test('快捷切换卡片：一条一个回调按钮（点一下直接切），末行固定「加当前会话」', () => {
+test('快捷卡片：一条一个回调按钮（点一下直接切），末行固定「加当前会话」', () => {
 	const card = buildShortcutCard({
 		items: [
 			{ id: 1, label: 'K-Vault-Next', current: false },
@@ -779,9 +779,11 @@ test('快捷切换卡片：一条一个回调按钮（点一下直接切），�
 	})
 	assert.match(card.content, /当前会话：`我的 前端\(session-2\)`/)
 	assert.match(card.content, /只增不重用/, '正文要写明编号不补位（用户是记着编号用的）')
-	assert.match(card.content, /快捷切换 加 \[备注\]/)
-	assert.match(card.content, /快捷切换 备注 #2 <新备注>/)
+	assert.match(card.content, /快捷 加 \[备注\]/)
+	assert.match(card.content, /快捷 备注 #2 <新备注>/)
 	assert.match(card.content, /备注里不能有 `#`/)
+	assert.match(card.content, /只投消息不切换/, '带消息的那种不切换绑定，正文要说清楚')
+	assert.match(card.content, /add a/, '英文缩写也写在卡片上（`add a` / `delete d` / `list l`）')
 
 	const rows = card.keyboard.content.rows.map((row) => row.buttons.map((b) => b.render_data.label))
 	assert.deepEqual(rows, [
@@ -804,7 +806,7 @@ test('快捷切换卡片：一条一个回调按钮（点一下直接切），�
 	for (const row of card.keyboard.content.rows) assert.ok(row.buttons.length <= 5)
 })
 
-test('快捷切换卡片：空列表只给「加当前会话」+ 引导；超上限只列前 N 条并说明用编号直达', () => {
+test('快捷卡片：空列表只给「加当前会话」+ 引导；超上限只列前 N 条并说明用编号直达', () => {
 	const empty = buildShortcutCard({ items: [], currentLabel: '' })
 	assert.match(empty.content, /还没有快捷会话/)
 	assert.deepEqual(

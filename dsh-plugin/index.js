@@ -524,7 +524,7 @@ export function apply(ctx, rawConfig) {
 	}
 
 	/**
-	 * 快捷切换卡片：一条一个回调按钮（点一下**直接切过去**），末行是「加当前会话」。
+	 * 快捷卡片：一条一个回调按钮（点一下**直接切过去**），末行是「加当前会话」。
 	 *
 	 * 和会话选择卡片的关键区别：那张卡片的会话按钮是**指令按钮**（只把命令填进输入框），
 	 * 这张是**回调按钮**（当场切）——"快捷"要的就是少点两下，再让用户自己发一次就白快捷了。
@@ -542,7 +542,7 @@ export function apply(ctx, rawConfig) {
 			currentLabel: bound && bound !== 'none' ? sessions.label(bound) : '',
 		})
 		await io.sendCard({ openid, content: card.content, keyboard: card.keyboard, context: replyContext })
-		logger.info?.('已发快捷切换卡片', { count: items.length })
+		logger.info?.('已发快捷卡片', { count: items.length })
 	}
 
 	/**
@@ -1502,14 +1502,14 @@ export function apply(ctx, rawConfig) {
 				code = 1
 			}
 		} else if (parsed.kind === 'shortcut') {
-			// 快捷切换卡片：go（点某条 = 直接切过去）/ add（把当前会话加进来）。
+			// 快捷卡片：go（点某条 = 直接切过去）/ add（把当前会话加进来）。
 			// 语义全在 commands.js 里，这里只把按钮翻译成等价的命令文本，避免两套实现。
 			// `fromCard: true` 让命令侧做完把卡片重发一遍（标出新的「当前」）。
 			const ctxReply = { eventId: event.eventId, msgId: event.msgId ?? '' }
 			const tokens = parsed.action === 'add' ? ['加'] : [`#${parsed.arg}`]
 			await commands.run(
 				{ openid, replyContext: ctxReply, quote: '', fromCard: true },
-				{ name: '快捷切换', tokens, rest: tokens.join(' ') },
+				{ name: '快捷', tokens, rest: tokens.join(' ') },
 			)
 			code = 0
 		} else if (parsed.kind === 'perm') {

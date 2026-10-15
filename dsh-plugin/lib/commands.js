@@ -16,15 +16,16 @@ export const COMMANDS = [
 		argHint: '<会话id> | <目录> <会话id> | none',
 	},
 	{
-		name: '快捷切换',
-		desc: '快捷入口：直接切到目标会话',
+		name: '快捷',
+		desc: '快捷入口：编号/备注/会话id 直达',
 		purpose:
 			'把常用会话存成**快捷入口**：每条自带一个 `#编号`（只增不重用），可以配一个**自定义备注**（备注里不能有 `#`）。' +
-			'`快捷切换 #2` 直接切过去（不经过会话选择卡片）；`快捷切换 #2 <消息>` 切过去并把这条消息一起投给 AI' +
-			'（和 `发送` 一样**会打断**它正在跑的轮次）。',
-		selection: true,
-		selectionText: '列出全部快捷会话，点按钮直接切过去',
-		argHint: '#编号 <消息> | 备注 | 加 [备注] | 删 #编号 | 备注 #编号 <新备注>',
+			'`快捷 #2` **直接切过去**（不经过会话选择卡片，也认备注或会话id）；' +
+			'`快捷 #2 <消息>` 只把消息**投给**那个会话、**不切换**当前绑定（和 `发送 <会话id> <内容>` 一样会打断它正在跑的轮次）。' +
+			'子命令也能写英文：`加`＝`add`/`a`、`删`＝`delete`/`d`、`列出`＝`list`/`l`、`备注`＝`rename`/`r`；不带参数就是这份帮助。',
+		usage: '快捷 #编号 [<消息>]',
+		usageAlt: '快捷 <会话id|备注> [<消息>]',
+		usageAlt2: '快捷 加 [备注] | 删 #编号 | 备注 #编号 <新备注> | 列出',
 	},
 	{
 		name: '新建会话',
@@ -153,7 +154,7 @@ export function panelItems() {
  */
 const MENU_LAYOUT = [
 	'切换会话',
-	'快捷切换',
+	'快捷',
 	'新建会话',
 	'发送',
 	'延迟发送',
@@ -197,10 +198,10 @@ export function menuItems() {
  * deps 由 index.js 注入，全部是"动作"而不是"实现"，因此这里可以被单测直接驱动：
  *   @param {object} deps
  *   @param {object} deps.sessions  会话索引（resolveRef/describe/currentDir/listDirs/sessionsInDir）
- *   @param {object} deps.state     状态容器（绑定、待发消息、快捷切换）
+ *   @param {object} deps.state     状态容器（绑定、待发消息、快捷）
  *   @param {(req:object)=>Promise<void>} deps.reply 回一条 QQ 文本
  *   @param {(req:object)=>Promise<void>} deps.showSessionCard 发/刷新会话选择卡片
- *   @param {(req:object)=>Promise<void>} deps.showShortcutCard 发/刷新快捷切换卡片
+ *   @param {(req:object)=>Promise<void>} deps.showShortcutCard 发/刷新快捷卡片
  *   @param {(req:object)=>Promise<void>} deps.deliver 向会话投递消息（不打断）
  *   @param {(sessionId:string)=>Promise<{ok:boolean, reason?:string}>} deps.stopSession
  *   @param {(sessionId:string)=>Promise<{ok:boolean, reason?:string}>} deps.archiveSession
@@ -225,7 +226,7 @@ export function createCommandRunner(deps) {
 		switch (parsed.name) {
 			case '切换会话':
 				return switchSession(context, parsed)
-			case '快捷切换':
+			case '快捷':
 				return shortcuts(context, parsed)
 			case '新建会话':
 				return newSession(context, parsed)
@@ -360,21 +361,28 @@ export function createCommandRunner(deps) {
 		return { handled: true }
 	}
 
-	// ── 快捷切换 ────────────────────────────────────────────────────────────
+	// ── 快捷（#编号 / 备注 / 会话id） ─────────────────────────────────────────
 	//
-	// 三条设计约束，都来自"用户把编号/名字记在脑子里"这件事：
+	// 四条设计约束，都来自"用户把编号/名字记在脑子里"这件事：
 	//   1. **编号只增不重用**（`state.addShortcut` 的 seq）：删掉 `#2` 不会让 `#3` 变成别的会话。
 	//   2. **备注不能含 `#`**：`#` 是编号专用前缀，掺进备注就分不清 `#3` 是编号还是名字；
-	//      同理**备注不能是纯数字**（否则 `快捷切换 3` 到底指名字还是 `#3` 说不清）。
-	//   3. **备注必须唯一**：`快捷切换 <名字>` 要能唯一定位；重名就只认编号。
+	//      同理**备注不能是纯数字**（否则 `快捷 3` 到底指名字还是 `#3` 说不清）。
+	//   3. **备注必须唯一**：`快捷 <名字>` 要能唯一定位；重名就只认编号。
+	//   4. **带消息 ≠ 切换**：`快捷 #2 <消息>` 只把消息投给那个会话，**不动当前绑定**
+	//      （你正在别的会话里干活时，顺手丢一条任务过去不该把自己带走）。
 	//
 	// 目标解析顺序：`#编号`（显式）→ 备注（**最长前缀**匹配，所以备注可以带空格）
-	// → 纯数字（当编号）。`快捷切换 <目标> <剩下的都是消息>`。
+	// → `<会话id>` / `<目录> <会话id>`（走 sessions.resolveRef，与 `切换会话` 同规则）
+	// → 纯数字（当编号）。剩下的都是消息。
+	//
+	// 子命令认中英文：加/add/a、删/delete/del/d、备注/rename/r、列出/list/l/ls；
+	// 认不出来或**裸发**都回作用 + 用法（帮助）。
 
-	const SHORTCUT_ADD = new Set(['加', '添加', '新增', 'add'])
-	const SHORTCUT_DEL = new Set(['删', '删除', '移除', 'del'])
-	const SHORTCUT_RENAME = new Set(['备注', '改名', '重命名', 'rename'])
-	const SHORTCUT_LIST = new Set(['列表', 'list'])
+	const SHORTCUT_ADD = new Set(['加', '添加', '新增', 'add', 'a'])
+	const SHORTCUT_DEL = new Set(['删', '删除', '移除', 'delete', 'del', 'd'])
+	const SHORTCUT_RENAME = new Set(['备注', '改名', '重命名', 'rename', 'r'])
+	const SHORTCUT_LIST = new Set(['列表', '列出', 'list', 'l', 'ls'])
+	const SHORTCUT_HELP = new Set(['帮助', '用法', 'help', 'h', '?'])
 
 	/** `#12` → 12；不是编号写法返回 null。 */
 	function shortcutIdOf(ref) {
@@ -403,10 +411,10 @@ export function createCommandRunner(deps) {
 	}
 
 	/**
-	 * 解析快捷目标。
+	 * 解析快捷目标（编号 / 备注）。
 	 *
 	 * @returns {{item:object, rest:string}|{error:'no-such-id', id:number}|null}
-	 *   null = 认不出（调用方回用法）；error = 看着像编号但没这条。
+	 *   null = 认不出（调用方再试会话id，或回帮助）；error = 看着像编号但没这条。
 	 */
 	function resolveShortcut(openid, tokens, { headOnly = false } = {}) {
 		const items = state.shortcutsOf(openid)
@@ -440,26 +448,52 @@ export function createCommandRunner(deps) {
 
 	async function shortcuts(context, parsed) {
 		const tokens = parsed.tokens
-		if (tokens.length === 0 || SHORTCUT_LIST.has(tokens[0])) {
+		// 裸发 = 帮助（用户明确要求）：记不住 `#编号/加/删/列出` 的写法时，发两个字就有说明。
+		if (tokens.length === 0 || SHORTCUT_HELP.has(shortcutWord(tokens[0]))) return shortcutHelp(context)
+		const word = shortcutWord(tokens[0])
+		if (SHORTCUT_LIST.has(word)) {
 			await deps.showShortcutCard?.({ openid: context.openid, replyContext: context.replyContext })
 			return { handled: true }
 		}
-		const head = tokens[0]
-		if (SHORTCUT_ADD.has(head)) return addShortcut(context, tokens.slice(1).join(' ').trim())
-		if (SHORTCUT_DEL.has(head)) return dropShortcut(context, tokens.slice(1))
-		if (SHORTCUT_RENAME.has(head)) return renameShortcut(context, tokens.slice(1))
+		if (SHORTCUT_ADD.has(word)) return addShortcut(context, tokens.slice(1).join(' ').trim())
+		if (SHORTCUT_DEL.has(word)) return dropShortcut(context, tokens.slice(1))
+		if (SHORTCUT_RENAME.has(word)) return renameShortcut(context, tokens.slice(1))
 		return goShortcut(context, parsed)
 	}
 
+	/** 子命令词归一化：英文缩写不分大小写（`A`/`Add` 都认）。 */
+	function shortcutWord(token) {
+		const raw = String(token ?? '').trim()
+		if (!raw) return ''
+		return /^[\x00-\x7f]+$/.test(raw) ? raw.toLowerCase() : raw
+	}
+
+	/** 回作用 + 用法（裸发、认不出、或需要看清楚写法时都走这里）。 */
+	async function shortcutHelp({ openid, replyContext, fromCard }) {
+		const items = state.shortcutsOf(openid)
+		const hint =
+			items.length === 0
+				? '还没有快捷会话：`快捷 加 [备注]` 把当前会话存成 `#1`（也可以点卡片上的「加当前会话」）。'
+				: `现有：${shortcutListText(items)}\n> 发 \`快捷 列出\` 看卡片（点按钮直接切）。`
+		await deps.reply({ openid, content: `${hint}\n\n${usageText('快捷')}`, markdown: true, replyContext })
+		await refreshShortcutCard({ openid, replyContext, fromCard })
+		return { handled: true }
+	}
+
+	/** 「#1 名字、#2 名字」这段纯文本（错误提示里列现有条目用）。 */
+	function shortcutListText(items) {
+		return items.map((entry) => `#${entry.id} ${shortcutLabel(entry)}`).join('、')
+	}
+
 	/**
-	 * `快捷切换 加 [备注]`：把**当前绑定会话**存进来。
+	 * `快捷 加 [备注]`（`add`/`a`）：把**当前绑定会话**存进来。
 	 *
 	 * 同一个会话只留一条：已经在列表里就只更新备注（不会攒出两条指向同一会话）。
 	 */
 	async function addShortcut({ openid, replyContext, fromCard }, name) {
 		const bad = shortcutNameError(name)
 		if (bad) {
-			await deps.reply({ openid, content: `${bad}\n\n${usageText('快捷切换')}`, replyContext })
+			await deps.reply({ openid, content: `${bad}\n\n${usageText('快捷')}`, replyContext })
 			await refreshShortcutCard({ openid, replyContext, fromCard })
 			return { handled: true }
 		}
@@ -469,7 +503,7 @@ export function createCommandRunner(deps) {
 				openid,
 				content:
 					'当前没有绑定会话，没法加。先 `切换会话 <会话id>`（或发 `切换会话` 选一个），' +
-					'再发 `快捷切换 加 [备注]`。',
+					'再发 `快捷 加 [备注]`。',
 				markdown: true,
 				replyContext,
 			})
@@ -501,7 +535,7 @@ export function createCommandRunner(deps) {
 		const result = state.addShortcut(openid, { sessionId, name })
 		state.flush()
 		const item = result?.item
-		logger?.info?.('快捷切换：已加入/更新', { sessionId, id: item?.id, existed: Boolean(result?.existed) })
+		logger?.info?.('快捷：已加入/更新', { sessionId, id: item?.id, existed: Boolean(result?.existed) })
 		if (!item) {
 			await deps.reply({ openid, content: '加不进去（状态异常），再试一次。', markdown: true, replyContext })
 			return { handled: true }
@@ -511,9 +545,9 @@ export function createCommandRunner(deps) {
 			openid,
 			content: result.existed
 				? name
-					? `这个会话已经在快捷里：**${shown}**，备注已更新。\n> 直接发 \`快捷切换 #${item.id}\` 切过去。`
-					: `这个会话已经在快捷里：**${shown}**（想改备注：\`快捷切换 备注 #${item.id} <新备注>\`）。`
-				: `已加入快捷：**${shown}**\n> 发 \`快捷切换 #${item.id}\` 直接切过去；\`快捷切换 #${item.id} <消息>\` 切过去并把消息投给 AI。`,
+					? `这个会话已经在快捷里：**${shown}**，备注已更新。\n> 直接发 \`快捷 #${item.id}\` 切过去。`
+					: `这个会话已经在快捷里：**${shown}**（想改备注：\`快捷 备注 #${item.id} <新备注>\`）。`
+				: `已加入快捷：**${shown}**\n> 发 \`快捷 #${item.id}\` 直接切过去；\`快捷 #${item.id} <消息>\` 只把消息投给那个会话（不切换当前会话）。`,
 			markdown: true,
 			replyContext,
 		})
@@ -521,10 +555,10 @@ export function createCommandRunner(deps) {
 		return { handled: true }
 	}
 
-	/** `快捷切换 删 #3`（也认名字）：只删快捷条目，不动绑定，也不动会话本身。 */
+	/** `快捷 删 #3`（`delete`/`d`，也认名字）：只删快捷条目，不动绑定，也不动会话本身。 */
 	async function dropShortcut({ openid, replyContext, fromCard }, tokens) {
 		if (tokens.length === 0) {
-			await deps.reply({ openid, content: usageText('快捷切换'), replyContext })
+			await deps.reply({ openid, content: usageText('快捷'), replyContext })
 			return { handled: true }
 		}
 		const resolved = resolveShortcut(openid, tokens, { headOnly: true })
@@ -535,7 +569,7 @@ export function createCommandRunner(deps) {
 		}
 		const removed = state.removeShortcut(openid, resolved.item.id)
 		state.flush()
-		logger?.info?.('快捷切换：已删除', { id: resolved.item.id, sessionId: resolved.item.sessionId })
+		logger?.info?.('快捷：已删除', { id: resolved.item.id, sessionId: resolved.item.sessionId })
 		await deps.reply({
 			openid,
 			content: `已删除快捷 **#${resolved.item.id} ${shortcutLabel(resolved.item)}**（编号不补位，其它条目的编号不变）。`,
@@ -546,10 +580,10 @@ export function createCommandRunner(deps) {
 		return { handled: true }
 	}
 
-	/** `快捷切换 备注 #3 <新备注>`：改备注（备注留空 = 清掉，按钮上改回显示会话标题）。 */
+	/** `快捷 备注 #3 <新备注>`（`rename`/`r`）：改备注（留空 = 清掉，改回显示会话标题）。 */
 	async function renameShortcut({ openid, replyContext, fromCard }, tokens) {
 		if (tokens.length < 2) {
-			await deps.reply({ openid, content: usageText('快捷切换'), replyContext })
+			await deps.reply({ openid, content: usageText('快捷'), replyContext })
 			return { handled: true }
 		}
 		const resolved = resolveShortcut(openid, tokens, { headOnly: true })
@@ -561,7 +595,7 @@ export function createCommandRunner(deps) {
 		const name = tokens.slice(1).join(' ').trim()
 		const bad = shortcutNameError(name)
 		if (bad) {
-			await deps.reply({ openid, content: `${bad}\n\n${usageText('快捷切换')}`, replyContext })
+			await deps.reply({ openid, content: `${bad}\n\n${usageText('快捷')}`, replyContext })
 			await refreshShortcutCard({ openid, replyContext, fromCard })
 			return { handled: true }
 		}
@@ -593,45 +627,60 @@ export function createCommandRunner(deps) {
 	}
 
 	/**
-	 * `快捷切换 <目标> [消息]`：**直接切**到目标会话（不走会话选择卡片）；
-	 * 带了消息就顺手投给 AI（与 `发送 <会话id> <内容>` 同义：**会打断**正在跑的轮次）。
+	 * `快捷 <目标> [消息]`：
+	 *   - 只给目标 → **直接切**到目标会话（不走会话选择卡片）；
+	 *   - 带消息 → **只把消息投给**目标会话，**不动当前绑定**（与 `发送 <会话id> <内容>` 同义：
+	 *     **会打断**它正在跑的轮次）。
+	 * 目标可以是 `#编号`、备注、或**会话id**（`<目录> <会话id>` 也认）。
 	 */
 	async function goShortcut({ openid, replyContext, quote = '', fromCard }, parsed) {
 		const resolved = resolveShortcut(openid, parsed.tokens)
-		if (!resolved) {
-			const hasItems = state.shortcutsOf(openid).length > 0
-			await deps.reply({
-				openid,
-				content: hasItems
-					? usageText('快捷切换')
-					: `还没有快捷会话。发 \`快捷切换 加 [备注]\` 把当前会话存成 \`#1\`（也可以 \`切换会话\` 后点卡片上的「加当前会话」）。\n\n${usageText('快捷切换')}`,
-				replyContext,
-			})
-			return { handled: true }
-		}
-		if (resolved.error === 'no-such-id') {
+		if (resolved?.error === 'no-such-id') {
 			await deps.reply({ openid, content: shortcutMissText(openid, `#${resolved.id}`), markdown: true, replyContext })
 			await refreshShortcutCard({ openid, replyContext, fromCard })
 			return { handled: true }
 		}
+		if (resolved) return aimAtSession({ openid, replyContext, quote, fromCard }, {
+			sessionId: resolved.item.sessionId,
+			rest: resolved.rest,
+			tag: `**#${resolved.item.id} ${shortcutLabel(resolved.item)}**`,
+			cleanup: `发 \`快捷 删 #${resolved.item.id}\` 清掉它。`,
+		})
 
-		const { item, rest } = resolved
-		const tag = `**#${item.id} ${shortcutLabel(item)}**`
-		const session = sessions.get(item.sessionId)
+		// 不是编号也不是备注：再按 `切换会话` 那套规则试 `<会话id>` / `<目录> <会话id>`。
+		const ref = sessions.resolveRef(parsed.tokens)
+		if (ref?.error) {
+			await deps.reply({ openid, content: `${ref.error}\n\n${usageText('快捷')}`, replyContext })
+			await refreshShortcutCard({ openid, replyContext, fromCard })
+			return { handled: true }
+		}
+		if (ref?.sessionId && ref.sessionId !== 'none') {
+			return aimAtSession({ openid, replyContext, quote, fromCard }, {
+				sessionId: ref.sessionId,
+				rest: String(ref.content ?? '').trim(),
+				tag: `**${sessions.label(ref.sessionId)}**`,
+			})
+		}
+		return shortcutHelp({ openid, replyContext, fromCard })
+	}
+
+	/** 切过去 or 只投递：`rest` 为空就切换绑定，否则只投递（不切换）。 */
+	async function aimAtSession({ openid, replyContext, quote = '', fromCard }, { sessionId, rest, tag, cleanup = '' }) {
+		const session = sessions.get(sessionId)
 		if (!session) {
 			await deps.reply({
 				openid,
-				content: `快捷 ${tag} 指向的会话 \`${item.sessionId}\` 已经不在了；发 \`快捷切换 删 #${item.id}\` 清掉它。`,
+				content: `会话 \`${sessionId}\` 已经不在了。${cleanup}`,
 				markdown: true,
 				replyContext,
 			})
 			await refreshShortcutCard({ openid, replyContext, fromCard })
 			return { handled: true }
 		}
-		if (sessions.isArchived(item.sessionId)) {
+		if (sessions.isArchived(sessionId)) {
 			await deps.reply({
 				openid,
-				content: `快捷 ${tag} 指向的会话已归档，接不进来；发 \`快捷切换 删 #${item.id}\` 清掉它。`,
+				content: `会话 ${tag} 已归档，接不进来。${cleanup}`,
 				markdown: true,
 				replyContext,
 			})
@@ -639,30 +688,32 @@ export function createCommandRunner(deps) {
 			return { handled: true }
 		}
 
-		state.setBinding(openid, item.sessionId)
-		state.setLastCard(openid, null)
 		if (!rest) {
+			state.setBinding(openid, sessionId)
+			state.setLastCard(openid, null)
 			await deps.reply({
 				openid,
-				content: `已接入 **${sessions.describe(item.sessionId)}**（快捷 ${tag}）\n> 直接发消息就会进这个会话；会话在跑时会先打断。`,
+				content: `已接入 **${sessions.describe(sessionId)}**（快捷 ${tag}）\n> 直接发消息就会进这个会话；会话在跑时会先打断。`,
 				markdown: true,
 				replyContext,
 			})
-		} else {
-			await deps.deliver({
-				sessionId: item.sessionId,
-				openid,
-				text: withQuote(rest, quote),
-				interrupt: true,
-				origin: 'qq',
-			})
-			await deps.reply({
-				openid,
-				content: `已接入 **${sessions.describe(item.sessionId)}**（快捷 ${tag}），并把这条消息投给了它（**会打断**正在跑的轮次；不想打断就用 \`延迟发送\`）。`,
-				markdown: true,
-				replyContext,
-			})
+			await refreshShortcutCard({ openid, replyContext, fromCard })
+			return { handled: true }
 		}
+
+		// 带消息：**只投递、不切换**（用户明确要求）——正在别的会话里干活时顺手丢一条任务过去，
+		// 不该把自己带走。所以这里连 setBinding 都不碰。
+		await deps.deliver({ sessionId, openid, text: withQuote(rest, quote), interrupt: true, origin: 'qq' })
+		const bound = currentSessionId(openid)
+		await deps.reply({
+			openid,
+			content:
+				`已把这条消息投给 ${sessions.describe(sessionId)}（快捷 ${tag}），**没有切换**当前会话` +
+				`${bound && bound !== 'none' ? `（还是 **${sessions.describe(bound)}**）` : '（当前没有绑定会话）'}。` +
+				'\n> 会打断它正在跑的轮次；不想打断就用 `延迟发送 <会话id> <内容>`。',
+			markdown: true,
+			replyContext,
+		})
 		await refreshShortcutCard({ openid, replyContext, fromCard })
 		return { handled: true }
 	}
@@ -670,9 +721,8 @@ export function createCommandRunner(deps) {
 	/** 找不到某条快捷时的文案（区分"没有这条编号"和"整个列表是空的"）。 */
 	function shortcutMissText(openid, ref) {
 		const items = state.shortcutsOf(openid)
-		if (items.length === 0) return `还没有快捷会话。发 \`快捷切换 加 [备注]\` 把当前会话存成 \`#1\`。`
-		const shown = items.map((entry) => `#${entry.id} ${shortcutLabel(entry)}`).join('、')
-		return `没找到快捷 \`${ref}\`。现有：${shown}\n> 发 \`快捷切换\` 看卡片，或 \`快捷切换 加 [备注]\` 再加一个。`
+		if (items.length === 0) return `还没有快捷会话。发 \`快捷 加 [备注]\` 把当前会话存成 \`#1\`。`
+		return `没找到快捷 \`${ref}\`。现有：${shortcutListText(items)}\n> 发 \`快捷 列出\` 看卡片，或 \`快捷 加 [备注]\` 再加一个。`
 	}
 
 	/**
