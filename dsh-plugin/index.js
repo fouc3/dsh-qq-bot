@@ -424,6 +424,10 @@ export function apply(ctx, rawConfig) {
 	 *   - 预设没组合 → **标准模式的工具全都不在**（bash/文件工具全没）。
 	 * 现场症状就是"报错 + 工具全没"一起出现，而且只有**冷会话**（重启之后、或当前没有活 agent
 	 * 的会话）第一次被 QQ 唤起时中招；显式切一次模型或重启 dsh 才会消失。
+	 *
+	 * **补充（2026-10-16）**：即使走控制器，只要它**抛错**就绝不能回退到裸恢复 —— 那次失败的
+	 * 恢复会被 dsh 当成"活 agent"缓存住，于是**每一条**后续消息都继续报同一个错。
+	 * 现在只在控制器**没有**这个方法（老部署）时才回退。
 	 */
 	async function agentFor(sessionId) {
 		const live = ctx.agents.get(sessionId)
@@ -434,9 +438,19 @@ export function apply(ctx, rawConfig) {
 				const agent = await controller.resume(sessionId)
 				if (agent) return agent
 			} catch (error) {
-				logger.warn?.('会话控制器恢复失败，回退到裸恢复', { sessionId, error: String(error) })
+				// 控制器**有** resume、这次却失败：**绝不退回裸 `ctx.agents.resume`** —— 那条路造出来的
+				// agent 没有模型/没有预设（症状：`prompt variable "{{model}}" has no value for this
+				// assembly (section "deployment:persona-prefix")`、标准模式工具全没），而且**会被当成
+				// 活 agent 缓存起来**，之后每条消息都继续失败（2026-10-15、2026-10-16 各踩一次：
+				// 上次是插件直接裸调，这次是控制器恢复抛错后回退）。宁可这一条消息如实失败
+				// （调用方回一句"会话打不开"），也不要造一个坏 agent。
+				state.note(`冷会话恢复失败（不回退裸恢复）：${String(sessionId).slice(0, 8)} :: ${String(error?.message ?? error)}`)
+				logger.warn?.('会话控制器恢复失败（不回退裸恢复）', { sessionId, error: String(error) })
+				return null
 			}
+			return null
 		}
+		// 控制器**没有** resume（老部署）：只能裸恢复，至少别让桥整个瘫掉。
 		try {
 			const handle = await ctx.agents.resume({ resumeSessionId: sessionId })
 			return handle?.agent ?? null

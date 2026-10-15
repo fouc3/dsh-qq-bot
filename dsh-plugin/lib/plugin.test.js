@@ -427,9 +427,13 @@ async function drainFor(path, ms = 150) {
 	return collected
 }
 
-function bootPlugin(t, { sessions: summaries, live, token = '', commands = null, config = {}, stateSeed = null } = {}) {
-	const dir = mkdtempSync(join(tmpdir(), 'dsh-qq-bot-'))
-	const socketPath = join(dir, 'bridge.sock')
+function bootPlugin(
+	t,
+	{ sessions: summaries, live, token = '', commands = null, config = {}, stateSeed = null, dir: reuseDir = null, socket = 'bridge.sock' } = {},
+) {
+	// `dir` 用来**同一个状态文件启第二次**（模拟重启后的持久化验证）；`socket` 换个名字免得两次抢同一个路径。
+	const dir = reuseDir ?? mkdtempSync(join(tmpdir(), 'dsh-qq-bot-'))
+	const socketPath = join(dir, socket)
 	const stateFile = join(dir, 'state.json')
 	if (stateSeed) writeFileSync(stateFile, JSON.stringify(stateSeed))
 	const fake = makeCtx({ sessionSummaries: summaries, live, commands })
@@ -688,6 +692,44 @@ test('冷会话恢复必须走 sessionController（带上模型与预设），�
 	assert.deepEqual(boot.ctx.agents.rawResumeCalls, [], '绝不能退回裸 agents.resume（会造出没模型/没工具的 agent）')
 	assert.equal(agent.followed.at(-1).content[0].text, '冷会话消息', '恢复出来的 agent 要真的收到消息')
 	assert.equal(agent.followed.at(-1).source.kind, 'user')
+
+	boot.dispose()
+})
+
+// 线上事故（2026-10-16，第二次踩）：控制器的 `resume` **抛错**时，老代码会回退到裸
+// `ctx.agents.resume` —— 造出的坏 agent 被当成活 agent 缓存，于是**每条**后续消息都继续
+// 报 `{{model}}` 那个错，直到用户手动切一次模型。现在：控制器**有** resume 却失败 → 不回退，
+// 如实回一句"打不开"，并把失败写进小日志。
+test('冷会话恢复：控制器 resume 抛错时**不许**回退裸恢复（那会造出没模型的坏 agent）', async (t) => {
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: {} })
+	boot.ctx.sessionController.resume = async () => {
+		throw new Error('boom: resume failed')
+	}
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', {
+		openids: [{ openid: 'U1' }],
+		panel: { enabled: true, users: ['U1'] },
+		menu: { enabled: true },
+	})
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-2', msgId: 'M1' })
+	await drainFor(boot.socketPath, 60)
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '冷会话消息', msgId: 'M2' })
+
+	const reply = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /打不开/.test(String(c.args.content))) ?? null
+	})
+	assert.match(String(reply.args.content), /打不开/, '如实告诉用户这个会话现在打不开')
+	assert.deepEqual(boot.ctx.agents.rawResumeCalls, [], '控制器抛错时**绝不能**裸恢复')
+	assert.equal(boot.ctx.agents.get('session-2'), undefined, '也不该留下一个半死的 agent')
+	const notes = await waitFor(() => {
+		try {
+			return JSON.parse(readFileSync(boot.stateFile, 'utf8')).notes.find((line) => /不回退裸恢复/.test(line)) ?? null
+		} catch {
+			return null
+		}
+	})
+	assert.match(notes, /session-2|session2|sessio/i, '小日志要记一笔（插件日志进不了 journald）')
 
 	boot.dispose()
 })
@@ -2111,6 +2153,97 @@ test('端到端：打断"运行中的目标"后自动重新武装；没目标/�
 	await drainFor(boot.socketPath, 80)
 	assert.equal(goals.resumeCalls.length, 0, '`停止` 是人主动按的，不该把目标又启动起来')
 
+	boot.dispose()
+})
+
+// 用户要求（2026-10-16）：确认「快捷」是**持久化**的 —— 插件/宿主重启后条目还在。
+// 存储就是状态文件 `state.json` 的 `shortcuts`（openid → { seq, items:[{id,sessionId,name,at}] }）：
+// 快捷的增/删/改每次都**立刻 flush**（不是只等 200ms 防抖），写入是 tmp+rename 原子写 0600，
+// 启动时 `normalize()` 把它读回来。这条用例**用同一个状态文件启两次插件**（= 模拟重启）。
+test('端到端：快捷条目持久化（同一状态文件"重启"插件后 #编号与备注都还在）', async (t) => {
+	// ── 第一次启动：加两条（不同会话）+ 改一次备注 ──
+	const live1 = { 'session-1': makeAgent('session-1'), 'session-2': makeAgent('session-2') }
+	const boot1 = bootPlugin(t, { sessions: SUMMARIES, live: live1 })
+	await waitFor(() => existsSync(boot1.socketPath))
+	await rpc(boot1.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	const say = async (text, msgId) => {
+		await rpc(boot1.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text, msgId })
+		await drainFor(boot1.socketPath, 60)
+	}
+	await say('切换会话 session-1', 'M0')
+	await say('快捷 加 前端', 'M1')
+	await say('切换会话 session-2', 'M2')
+	await say('快捷 加 后端', 'M3')
+	await say('快捷 备注 #1 前端主控', 'M4')
+
+	// 落盘是同步 flush 的：直接读文件确认两条 + 备注 + 编号
+	const saved = await waitFor(() => {
+		try {
+			const book = JSON.parse(readFileSync(boot1.stateFile, 'utf8')).shortcuts?.U1
+			return book?.items?.length === 2 ? book : null
+		} catch {
+			return null
+		}
+	})
+	assert.deepEqual(
+		saved.items.map((i) => [i.id, i.sessionId, i.name]),
+		[
+			[1, 'session-1', '前端主控'],
+			[2, 'session-2', '后端'],
+		],
+		'状态文件里应有 #1/#2 与备注（编号只增不重用的 seq 也在）',
+	)
+	assert.equal(saved.seq, 2)
+	const { dir, stateFile } = boot1
+	boot1.dispose() // 模拟宿主退出（卸载钩子也会再 flush 一次）
+
+	// ── 第二次启动：同一个状态文件、换个 socket 名 ──
+	const boot2 = bootPlugin(t, {
+		sessions: [...SUMMARIES, { sessionId: 'session-3', cwd: '/home/u/proj-c', updatedAt: 1, running: false }],
+		live: {},
+		dir,
+		socket: 'bridge2.sock',
+	})
+	await waitFor(() => existsSync(boot2.socketPath))
+	await rpc(boot2.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	await rpc(boot2.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '快捷', msgId: 'N0' })
+	const help = await waitFor(async () => {
+		const list = await drainFor(boot2.socketPath, 60)
+		return list.find((c) => c.kind === 'send_c2c' && /切过去/.test(String(c.args.content))) ?? null
+	})
+	const text = String(help.args.content)
+	assert.match(text, /> 现有：#1 前端主控、#2 后端/, '"重启"后 #编号与备注原样还在')
+	assert.equal(readFileSync(stateFile, 'utf8').includes('前端主控'), true)
+
+	// 编号继续往后走（seq 是持久化的，不会从 1 重来）
+	await rpc(boot2.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-3', msgId: 'N1' })
+	await drainFor(boot2.socketPath, 60)
+	await rpc(boot2.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '快捷 加 第三个', msgId: 'N2' })
+	const added = await waitFor(async () => {
+		const list = await drainFor(boot2.socketPath, 60)
+		return list.find((c) => c.kind === 'send_c2c' && /#3/.test(String(c.args.content))) ?? null
+	})
+	assert.match(String(added.args.content), /#3/, '重启后新加的是 #3（seq 持久化，不重用编号）')
+
+	boot2.dispose()
+})
+
+// 同一个持久化面还有一条：状态文件里**预置**的快捷（比如上个进程留下的）要能被读回来，
+// `#编号` 与 `seq` 都原样（编号只增不重用的前提）。
+test('端到端：快捷持久化（stateSeed：直接给一份含 shortcuts 的状态文件）', async (t) => {
+	const boot = bootPlugin(t, {
+		sessions: SUMMARIES,
+		live: {},
+		stateSeed: { shortcuts: { U1: { seq: 5, items: [{ id: 4, sessionId: 'session-1', name: '预置' }] } } },
+	})
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '快捷', msgId: 'Y0' })
+	const help = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 60)
+		return list.find((c) => c.kind === 'send_c2c' && /切过去/.test(String(c.args.content))) ?? null
+	})
+	assert.match(String(help.args.content), /#4 预置/, '从状态文件读回预置条目（编号也保留）')
 	boot.dispose()
 })
 
