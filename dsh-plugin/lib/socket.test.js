@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { connect } from 'node:net'
-import { mkdtempSync, statSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, statSync, unlinkSync, writeFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -130,6 +130,65 @@ test('残留 socket 会被清理后重新监听', async (t) => {
 	assert.ok(existsSync(path), '应重新建立了 socket')
 	const lines = await exchange(path, [{ id: '1', op: 'health' }])
 	assert.equal(lines[0].ok, true)
+})
+
+// 线上事故（2026-10-16 03:53）：改 `cordis.patch.yml` 触发 profile 热重载 ——
+// 「先 dispose 旧实例、再 apply 新实例」中间有个窗口：旧 server 已经不理新连接（所以探测像"残留"），
+// 但它的 uv_close 还没跑完；Node/libuv 关闭 UNIX server 时会**按路径名 unlink**。
+// 旧实现这时会立刻 unlink 再 listen，抢到的名字随后被旧实例那一下 unlink 删掉：
+// `ss` 里监听还在，路径却没了 → 网关从 03:53:15 起一直 "no such file"，桥永久断。
+test('热重载竞态：新实例绝不抢在老实例的 close 之前 listen（否则路径会被它删掉）', async (t) => {
+	const path = tmpSocketPath()
+	const old = await createSocketServer({ path, logger: {}, handlers: handlers() })
+
+	// 新实例此刻来接管：老实例还在 listen → 它必须等，而不是"清掉路径就抢名字"。
+	const pending = createSocketServer({ path, logger: {}, handlers: handlers(), waitMs: 2000 })
+	await new Promise((resolve) => setTimeout(resolve, 50))
+	const closing = old.close()
+	const fresh = await pending
+	t.after(async () => fresh.close())
+	await closing
+	// 老实例的 uv_close 是"先断连接、再 unlink 名字"：这里给它跑完的机会。
+	await new Promise((resolve) => setTimeout(resolve, 50))
+
+	assert.ok(existsSync(path), '新实例的 socket 路径必须还在（被老实例按名字删掉 = 桥永久断）')
+	const lines = await exchange(path, [{ id: '1', op: 'health' }])
+	assert.equal(lines[0].ok, true, '新实例必须真的在服务（网关要能连上）')
+})
+
+test('热重载：老实例还活着时新实例会等它退出，而不是直接抛"已被占用"', async (t) => {
+	const path = tmpSocketPath()
+	const old = await createSocketServer({ path, logger: {}, handlers: handlers() })
+
+	const pending = createSocketServer({ path, logger: {}, handlers: handlers() })
+	await new Promise((resolve) => setTimeout(resolve, 150))
+	await old.close()
+
+	const fresh = await pending
+	t.after(async () => fresh.close())
+	assert.ok(existsSync(path), '等老实例退出后应成功接管并重建 socket')
+	const lines = await exchange(path, [{ id: '1', op: 'health' }])
+	assert.equal(lines[0].ok, true)
+})
+
+test('真的两个实例并存（老实例不退出）才抛"已被占用"', async (t) => {
+	const path = tmpSocketPath()
+	const first = await createSocketServer({ path, logger: {}, handlers: handlers() })
+	t.after(async () => first.close())
+
+	await assert.rejects(
+		() => createSocketServer({ path, logger: {}, handlers: handlers(), waitMs: 200 }),
+		/已被占用/,
+	)
+})
+
+test('关掉服务端后路径由 Node/libuv 清掉（我们不再自己 unlink，避免误删新实例的路径）', async (t) => {
+	const path = tmpSocketPath()
+	const server = await createSocketServer({ path, logger: {}, handlers: handlers() })
+	assert.ok(existsSync(path))
+	await server.close()
+	await new Promise((resolve) => setTimeout(resolve, 20))
+	assert.equal(existsSync(path), false, '关完不该留下残留路径（否则下次启动要多等 settleMs）')
 })
 
 test('MAX_FRAME_BYTES 与 Go 侧约定一致（1 MiB）', () => {

@@ -28,10 +28,9 @@ function safeEqual(a, b) {
 	return timingSafeEqual(left, right)
 }
 
-/** 探测并清理上一次留下的 socket 文件。 */
-async function clearStaleSocket(path, logger) {
-	if (!existsSync(path)) return
-	const alive = await new Promise((resolve) => {
+/** 探测某个 socket 路径后面还有没有活着的服务端。 */
+function probeSocket(path) {
+	return new Promise((resolve) => {
 		const socket = connect(path)
 		const done = (value) => {
 			socket.removeAllListeners()
@@ -41,11 +40,50 @@ async function clearStaleSocket(path, logger) {
 		socket.once('connect', () => done(true))
 		socket.once('error', () => done(false))
 	})
-	if (alive) {
-		throw new Error(`本地通道 socket 已被占用：${path}（是否起了两个 dsh 实例？）`)
+}
+
+/**
+ * 探测并清理上一次留下的 socket 文件。
+ *
+ * **为什么不能"看到没人应答就立刻 unlink 再 listen"**：Node/libuv 在关闭一个 UNIX server
+ * 时是**按路径名 unlink** 的（不是按 inode）。profile 热重载（改 `cordis.patch.yml`）是
+ * "先 dispose 旧实例、再 apply 新实例"，旧实例的 `server.close()` 是异步的：它把连接断掉后，
+ * 还要等 uv_close 真正完成才会 unlink。如果新实例在这中间探到"没人应答"就抢先 listen 同名路径，
+ * 旧实例随后那一下 unlink 会把**新实例刚建好的 socket** 删掉 —— 表现为 `ss` 里监听还在、
+ * 但路径没了，所有客户端 lstat 直接 `no such file`，桥永久断掉（线上事故 2026-10-16 03:53）。
+ *
+ * 所以这里的顺序是：老实例还活着 → 等它退出（`waitMs`）；老实例已经不响应但路径还在 →
+ * 再等一小会儿看它自己消失（`settleMs`，那就是它 uv_close 的 unlink）；真·残留文件
+ * （进程崩了，没人会再删它）等不到，就由我们清掉。两个等待都是"宁可慢一点，绝不抢名字"。
+ */
+async function clearStaleSocket(path, logger, { waitMs = 3000, pollMs = 20, settleMs = 200 } = {}) {
+	if (!existsSync(path)) return
+	const deadline = Date.now() + waitMs
+	let waited = false
+	while (await probeSocket(path)) {
+		if (Date.now() >= deadline) {
+			throw new Error(`本地通道 socket 已被占用：${path}（是否起了两个 dsh 实例？）`)
+		}
+		if (!waited) {
+			logger?.warn?.('通道 socket 仍被占用，等老实例退出后接管', { path })
+			waited = true
+		}
+		await new Promise((resolve) => setTimeout(resolve, pollMs))
 	}
+
+	// 没人应答了，但路径还在：给它一点时间自己消失（老实例 uv_close 的 unlink 就在这一刻）。
+	const settleDeadline = Date.now() + settleMs
+	while (existsSync(path) && Date.now() < settleDeadline) {
+		await new Promise((resolve) => setTimeout(resolve, pollMs))
+	}
+	if (!existsSync(path)) return
+
 	logger?.warn?.('清理残留的通道 socket', { path })
-	unlinkSync(path)
+	try {
+		unlinkSync(path)
+	} catch {
+		// 理论上到不了这里；真到了也不致命（listen 会再报错）
+	}
 }
 
 /**
@@ -57,9 +95,17 @@ async function clearStaleSocket(path, logger) {
  * @param {object} options.logger
  * @param {Record<string, (args:any)=>any>} options.handlers op → 处理函数（可异步，可 throw FrameError）
  * @param {number} [options.maxFrameBytes]
+ * @param {number} [options.waitMs] 接管前等老实例退出的上限（默认 3000ms；测试里会调小）
  * @returns {Promise<{close: () => Promise<void>, path: string}>}
  */
-export async function createSocketServer({ path, token = '', logger, handlers, maxFrameBytes = MAX_FRAME_BYTES }) {
+export async function createSocketServer({
+	path,
+	token = '',
+	logger,
+	handlers,
+	maxFrameBytes = MAX_FRAME_BYTES,
+	waitMs,
+}) {
 	if (!path) throw new Error('通道 socketPath 不能为空')
 	mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
 	try {
@@ -67,7 +113,7 @@ export async function createSocketServer({ path, token = '', logger, handlers, m
 	} catch {
 		// 某些文件系统不支持，忽略
 	}
-	await clearStaleSocket(path, logger)
+	await clearStaleSocket(path, logger, waitMs === undefined ? undefined : { waitMs })
 
 	const server = createServer({ allowHalfOpen: false })
 	/** 让所有在途连接随关闭一起断开。 */
@@ -179,12 +225,9 @@ export async function createSocketServer({ path, token = '', logger, handlers, m
 		async close() {
 			for (const socket of sockets) socket.destroy()
 			sockets.clear()
+			// 路径的清理**交给 Node/libuv**（关 UNIX server 时它自己会按绑定的名字 unlink）。
+			// 我们自己再 unlink 一次没有收益，却会参与"按名字删掉新实例路径"的竞态。
 			await new Promise((resolve) => server.close(() => resolve()))
-			try {
-				if (existsSync(path)) unlinkSync(path)
-			} catch {
-				// 忽略
-			}
 		},
 	}
 }

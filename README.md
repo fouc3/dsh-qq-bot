@@ -266,6 +266,43 @@ if (this.phase.kind !== "idle") {
 
 ---
 
+## 热重载：UNIX socket 会被旧实例"按名字"删掉（别再踩）
+
+改 `cordis.patch.yml`（或在插件管理器里动任何一行）会让 dsh 在**运行中**重组合 profile，
+顺序是**先 dispose 旧实例、再 apply 新实例**。我们的通道 socket 就在这一步踩过线上事故
+（2026-10-16 03:53，QQ 桥断了半个多小时）：
+
+- 旧实例 `server.close()` 是**异步**的：它先把在途连接断掉（网关那边就是 `读取通道应答失败：EOF`），
+  但 `uv_close` 还没跑完；
+- 此刻新实例来接管，探测到"路径在、但没人应答"（旧 handle 已不收新连接）→ 旧代码**立刻**
+  `unlink` 旧路径再 `listen` 同名路径 → 新 socket 建好了；
+- 旧实例的 `uv_close` 随后完成，而 **Node/libuv 关 UNIX server 时是按路径名 unlink 的**
+  （不是按 inode）→ 它把**新实例刚建好的 socket** 删掉了。
+
+现场症状非常反直觉：`ss -xl` 里**监听还在**（fd 指着那个路径），但 `lstat` / `connect`
+全部 `no such file`，网关从那一刻起每 30 秒报一次 `register 失败：本地通道不可用`，
+并且用户后续消息只在网关侧重试 90 秒后丢弃 —— 而我们**没有任何自愈**，只能重启。
+
+修法（`lib/socket.js`）：
+
+1. **绝不抢名字**：接管前先等老实例退出（`waitMs`，默认 3s；期间一直探测，真起两个实例才抛错）；
+2. 没人应答但路径还在时，**再等一小会儿**（`settleMs`，默认 200ms）看旧实例把它自己删掉；
+   真·残留文件（进程崩了）等不到，才由我们清理；
+3. `close()` **不再自己 unlink**：路径交给 Node/libuv 处理，少一次"按名字删别人"的机会。
+
+**推论（值得记住）**：任何"同名字/同路径的自有资源"在热重载下都有这类竞态，
+凡是靠**路径/名字**取用的东西（socket、锁文件、单例端口），都要在接管前等旧主人真正退场，
+而不是探到"暂时不响应"就当它是死的。
+
+回归测试（`lib/socket.test.js`，旧实现在前两条上会失败）：
+
+- 「新实例绝不抢在老实例的 close 之前 listen（否则路径会被它删掉）」
+- 「老实例还活着时新实例会等它退出，而不是直接抛『已被占用』」
+- 「真的两个实例并存（老实例不退出）才抛『已被占用』」
+- 「关掉服务端后路径由 Node/libuv 清掉（我们不再自己 unlink）」
+
+---
+
 ## 验收清单
 
 `✅` = 已有自动化证据（跑下面两条命令即可复现），`⏳` = 必须真 QQ 环境（凭据 + 私聊 openid），只能你本地验。
@@ -314,6 +351,11 @@ if (this.phase.kind !== "idle") {
   —— `lib/plugin.test.js`「输入态」
 - ✅ UNIX socket 通道：目录 0700 / socket 0600 / 可选 token / 帧上限 1 MiB / 残留 socket 清理 / health 诊断
   —— `lib/socket.test.js` + Go `internal/bridge/socketclient_test.go`
+- ✅ **热重载不掐桥**（线上事故 2026-10-16 03:53）：改 `cordis.patch.yml` 触发的 profile 重组合里，
+  旧实例的 `uv_close` 会**按路径名** unlink，新实例若抢先 `listen` 同名路径，路径随后被旧实例删掉
+  （`ss` 里监听还在、路径没了 → 网关永久 `no such file`）。现在接管前先等老实例退出（3s 上限）、
+  再等路径自己消失（200ms），`close()` 不再自己 unlink；真起两个实例才抛「已被占用」
+  —— `lib/socket.test.js`「热重载竞态」「老实例还活着时等它退出」「两个实例并存才抛错」「关掉后路径由 libuv 清掉」
 - ✅ 出站队列 at-least-once（失败不消费、超时重投沿用原 id、撤回不重投、ack 唤醒等待者）
   —— `lib/outbox.test.js` + Go `internal/executor/executor_test.go`
 - ✅ dsh 内置命令：QQ 侧 `/compact` 等直接执行（不经模型）、结果回给 QQ；不兼容的「反馈」
@@ -337,7 +379,7 @@ if (this.phase.kind !== "idle") {
 # Go 侧（含假 QQ 平台 + 真 UNIX socket 桩）
 go vet ./... && gofmt -l . && go test -race ./...
 
-# 插件侧：语法 + 176 项（含"装配级端到端"）
+# 插件侧：语法 + 180 项（含"装配级端到端"）
 node --check dsh-plugin/index.js dsh-plugin/lib/*.js
 node --test dsh-plugin/lib/*.test.js
 ```
