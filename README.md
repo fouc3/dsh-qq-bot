@@ -50,6 +50,7 @@ QQ 用户 ──私聊──▶ QQ 开放平台 ──WebSocket──▶ Go: dsh
 | 排查用的小日志 | `~/.dsh/dsh-qq-bot/state.json` 的 `notes`（最近 40 条）：轮次开始/认领、收尾的 reason 与各门槛、通知入队或跳过、agent 挂载/重挂、收到过几类会话事件。**为什么放状态里**：插件日志进不了 journald（`dsh web` 只在启动时写几行），线上排查"结束通知怎么不发了"这类问题此前完全没有可观测性 |
 | 卡片键盘限额 | 内联键盘最多 5 行、每行最多 5 按钮（平台硬限制）：目录与会话共用一页预算、装不下就翻页，导航按钮永远并进一行 |
 | 打断后恢复目标 | QQ 消息打断正在跑的轮次时，dsh 的 `goal-round-driver` 会把**运行中的目标**关掉（`turn/end reason=aborted` → `ctx.goals.disarm`：phase 仍是 active 但**不再自动续跑**；若被取消的恰好是目标自己那一轮，它走的是 `pause`）。桥在**打断 + 投递之后**自动把它重新武装（`ctx.goals.resume`，用**当前** revision —— 打断会让 revision 变），否则目标就一直躺着、只能人工 `/goal resume`（K-Vault 线上就是这么断在半路的）。**只恢复打断前处于运行中（`active` + `armed`）的目标**：没有目标、已暂停（`paused`/`blocked`/`complete`）、以及 active 但已 `disarmed` 的都不动；用户显式 `停止` 也不恢复（那是人主动按的） |
+| 出站换行 | markdown 出站正文发送前自动**补空行**（网关 `qq.HardenMarkdown`）：QQ 的 markdown 把**单个换行渲染成空格**（官方文档《Markdown 消息》→「换多行」），不处理的话命令帮助/状态卡片/AI 回复在 QQ 里会挤成一行（用户线上反馈"dsh 发送的消息没有换行只有空格"）。列表项之间与围栏代码块内**不补**，引用块里的空行写成 `>`（否则空行会结束引用）；纯文本（`msg_type=0`）不改写 |
 | 失败退避 | 出站命令按失败类型处理：限速类（40034100/50002 等）指数退避重试（2s→4s→8s，最多 4 次），参数类硬错直接丢弃——避免无限重投把自己打成风暴 |
 | dsh 内置命令 | QQ 里发 `/compact`、`/model`、`/goal`… 直接走 `ctx.commands.execute` 执行（不经模型）；这些命令在菜单里**收进二级菜单**（顶层留给桥命令）；技能不在内，「反馈」不兼容。**认不出的斜杠命令明确回绝、不进模型**：回一句「没有 `/xxx` 这个命令（**这一条没有发给 AI**）」+ 列出这台会话真正可用的命令；没绑定会话时同样回绝。想把以 `/` 开头的话当消息发（如绝对路径）改用**全角 `／`**。**`/plan <文本>` 特殊处理**：只把 `/plan` 交给 dsh 切模式，文本走本桥正常投递（否则 dsh 会把它 `steer` 进会话、绕过本桥的轮次跟踪，QQ 侧看不到思考与结束通知）；plan 模式下模型提交的计划也会转发到 QQ |
 
@@ -362,6 +363,10 @@ if (this.phase.kind !== "idle") {
   （`ss` 里监听还在、路径没了 → 网关永久 `no such file`）。现在接管前先等老实例退出（3s 上限）、
   再等路径自己消失（200ms），`close()` 不再自己 unlink；真起两个实例才抛「已被占用」
   —— `lib/socket.test.js`「热重载竞态」「老实例还活着时等它退出」「两个实例并存才抛错」「关掉后路径由 libuv 清掉」
+- ✅ **出站 markdown 换行**：发送前补空行（列表项之间与围栏代码块内不补、引用块用 `>` 空行、
+  CRLF/行尾空白归一、处理过的正文再过一遍不变=幂等）；纯文本不改写
+  —— `internal/qq/markdown_test.go`（14 个用例 + 幂等 + 状态卡片真实形状）
+  + `internal/qq/messaging_test.go`「出站 markdown 的换行要过 HardenMarkdown」
 - ✅ 出站队列 at-least-once（失败不消费、超时重投沿用原 id、撤回不重投、ack 唤醒等待者）
   —— `lib/outbox.test.js` + Go `internal/executor/executor_test.go`
 - ✅ dsh 内置命令：QQ 侧 `/compact` 等直接执行（不经模型）、结果回给 QQ；**认不出的斜杠命令
@@ -440,6 +445,10 @@ JSON Schema，用户消息本地构造）。原因：profile 安装本地目录�
 - 媒体消息不能带键盘（平台限制：键盘只能挂 markdown）。
 - `ask_user_question` 走 dsh 默认的 legacy 模式（会一直阻塞），QQ 侧的唯一时间界是插件配置的 `questionTimeoutMs`；超时后交回 dsh GUI（`next()`），不吞掉提问。
 - 富媒体语音需 silk 格式；图片只接受 png/jpg，其他格式会被平台降级成文件。
+- **QQ markdown 的换行**：正文里**单个换行符会被渲染成空格**，需要空行才换行（见「功能」表里的
+  「出站换行」）；反过来，**QQ 发来的消息里的换行我们原样保留**（`events.go` 只 TrimSpace 两端），
+  所以"粘贴进来的多行文本变成一行"若是发生，就发生在 QQ 客户端/平台侧，不在本桥
+  （`internal/qq/events_test.go` 有断言；线上也见过带 54 个换行的用户消息正常进来）。
 - dsh `web` 必须常驻（插件在它的进程里）。
 
 ## 目录

@@ -38,6 +38,43 @@ func TestSendMarkdownFlagUsesMarkdownType(t *testing.T) {
 	}
 }
 
+// 出站 markdown 的换行要过 HardenMarkdown（QQ 把单换行渲染成空格，见 markdown.go）：
+// markdown 消息补空行，纯文本消息原样不动。
+func TestSendHardensMarkdownLineBreaks(t *testing.T) {
+	api := &stubAPI{}
+	c := newTestClient(api)
+
+	if _, err := c.Send(context.Background(), Message{
+		OpenID: "U1", Markdown: true,
+		Content: "作用：把常用会话存成快捷入口\n用法：快捷 加 / 快捷 #2",
+	}); err != nil {
+		t.Fatalf("发送失败：%v", err)
+	}
+	got := api.calls[0]
+	want := "作用：把常用会话存成快捷入口\n\n用法：快捷 加 / 快捷 #2"
+	if got.Markdown == nil || got.Markdown.Content != want {
+		t.Errorf("markdown 正文应补空行：\n得到 %q\n期望 %q", got.Markdown.Content, want)
+	}
+
+	// 纯文本（msg_type=0）不动：那边的换行行为没有文档保证，不能乱补空行
+	if _, err := c.Send(context.Background(), Message{OpenID: "U1", Content: "第一行\n第二行"}); err != nil {
+		t.Fatalf("发送失败：%v", err)
+	}
+	if text := api.calls[1].Content; text != "第一行\n第二行" {
+		t.Errorf("纯文本不该被改写：%q", text)
+	}
+
+	// 带键盘的卡片会被强制 markdown：同样要补空行
+	if _, err := c.Send(context.Background(), Message{
+		OpenID: "U1", Content: "选一个\n> 第 1 页", Keyboard: MarkdownKeyboard("加当前会话", "", "qqb:sc:add"),
+	}); err != nil {
+		t.Fatalf("发送失败：%v", err)
+	}
+	if md := api.calls[2].Markdown; md == nil || md.Content != "选一个\n\n> 第 1 页" {
+		t.Errorf("带键盘的卡片也要补空行：%+v", api.calls[2].Markdown)
+	}
+}
+
 func TestSendKeyboardForcesMarkdown(t *testing.T) {
 	api := &stubAPI{}
 	c := newTestClient(api)

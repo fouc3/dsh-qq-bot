@@ -61,7 +61,8 @@ func (c *Client) Send(ctx context.Context, m Message) (*qqbotsdk.MessageResponse
 	}
 	if m.Markdown || m.Keyboard != nil {
 		msg.MsgType = qqbotsdk.MsgTypeMarkdown
-		msg.Markdown = &qqbotsdk.MessageMarkdown{Content: m.Content}
+		// QQ 的 markdown 把"单个换行"渲染成空格：出站正文统一补空行（见 HardenMarkdown）。
+		msg.Markdown = &qqbotsdk.MessageMarkdown{Content: HardenMarkdown(m.Content)}
 	} else {
 		msg.MsgType = qqbotsdk.MsgTypeText
 		msg.Content = m.Content
