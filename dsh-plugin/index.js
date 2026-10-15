@@ -398,10 +398,32 @@ export function apply(ctx, rawConfig) {
 		return live[0] ?? null
 	}
 
-	/** 拉一个活 agent：先查在册，冷会话再 resume（会话不存在则返回 null）。 */
+	/**
+	 * 拉一个活 agent：先查在册，冷会话再恢复（会话不存在则返回 null）。
+	 *
+	 * **冷会话必须优先走 `ctx.sessionController.resume`**（线上事故，2026-10-15）：
+	 * dsh 的会话控制器恢复时会带上 `agentOptions`（模型选择）与 `setup`（预设组合，工具从这里来）：
+	 *   `this.ctx.agents.resume({ resumeSessionId, agentOptions: this.agentOptions(), setup: composition.setup })`
+	 * 而我们以前直接 `ctx.agents.resume({ resumeSessionId })` —— 那会造出一个**没有模型、没有预设/工具**
+	 * 的"裸 agent"：
+	 *   - `agent.options.model` 是空的 → 系统提示词里 `{{model}}` 取不到值 → 本轮直接
+	 *     `prompt variable "{{model}}" has no value for this assembly (section "deployment:persona-prefix")`；
+	 *   - 预设没组合 → **标准模式的工具全都不在**（bash/文件工具全没）。
+	 * 现场症状就是"报错 + 工具全没"一起出现，而且只有**冷会话**（重启之后、或当前没有活 agent
+	 * 的会话）第一次被 QQ 唤起时中招；显式切一次模型或重启 dsh 才会消失。
+	 */
 	async function agentFor(sessionId) {
 		const live = ctx.agents.get(sessionId)
 		if (live) return live
+		const controller = ctx.get?.('sessionController') ?? ctx.sessionController ?? null
+		if (typeof controller?.resume === 'function') {
+			try {
+				const agent = await controller.resume(sessionId)
+				if (agent) return agent
+			} catch (error) {
+				logger.warn?.('会话控制器恢复失败，回退到裸恢复', { sessionId, error: String(error) })
+			}
+		}
 		try {
 			const handle = await ctx.agents.resume({ resumeSessionId: sessionId })
 			return handle?.agent ?? null

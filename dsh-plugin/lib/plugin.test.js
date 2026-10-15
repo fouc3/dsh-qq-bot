@@ -109,10 +109,13 @@ function makeCtx({ sessionSummaries = [], live = {}, commands = null } = {}) {
 				liveAgents.set(agent.id, agent)
 			},
 			async resume({ resumeSessionId }) {
+				ctx.agents.rawResumeCalls.push(resumeSessionId)
 				const agent = liveAgents.get(resumeSessionId) ?? makeAgent(resumeSessionId)
 				liveAgents.set(resumeSessionId, agent)
 				return { agent }
 			},
+			/** 记录裸 resume 次数：断言"冷会话不该走这条路"。 */
+			rawResumeCalls: [],
 		},
 		sessions: { get: () => undefined },
 		// dsh 内置命令服务（ctx.commands）：默认"没有命令"，测试可覆盖。
@@ -132,6 +135,15 @@ function makeCtx({ sessionSummaries = [], live = {}, commands = null } = {}) {
 				const sessionId = `session-created-${sessionSummaries.length + 1}`
 				sessionSummaries.push({ sessionId, cwd, updatedAt: Date.now(), running: false })
 				return { sessionId }
+			},
+			// 冷会话恢复：dsh 的控制器版本会带上 agentOptions（模型）与 setup（预设=工具），
+			// 所以插件必须走这条路（裸 agents.resume 会造出没有模型/工具的 agent）。
+			resumedVia: [],
+			async resume(sessionId) {
+				ctx.sessionController.resumedVia.push(sessionId)
+				const agent = liveAgents.get(sessionId) ?? makeAgent(sessionId)
+				liveAgents.set(sessionId, agent)
+				return agent
 			},
 			// 模型：与 dsh 的 SessionController 同形（modelCatalog / selectModel / projections）。
 			selectedModels: [],
@@ -598,6 +610,56 @@ test('端到端：命令 → 会话卡片；绑定后普通消息进会话；一
 	assert.equal(noticeButtons[1].render_data.label, '发送消息')
 	assert.equal(noticeButtons[1].action.type, 2)
 	assert.equal(noticeButtons[1].action.data, '发送 session-1')
+
+	boot.dispose()
+})
+
+// 线上事故（2026-10-15）：插件自己 `ctx.agents.resume({resumeSessionId})` 唤醒冷会话，
+// 造出的 agent **没有模型、没有预设/工具** → 系统提示词里 `{{model}}` 取不到值
+// （`prompt variable "{{model}}" has no value for this assembly (section "deployment:persona-prefix")`）
+// 且"标准模式的工具全没了"。dsh 自己的控制器恢复时会带上 agentOptions 与 setup：
+//   ctx.agents.resume({ resumeSessionId, agentOptions, setup: composition.setup })
+// 所以插件必须走 `sessionController.resume`。
+test('冷会话恢复必须走 sessionController（带上模型与预设），不能裸 agents.resume', async (t) => {
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: {} })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', {
+		openids: [{ openid: 'U1' }],
+		panel: { enabled: true, users: ['U1'] },
+		menu: { enabled: true },
+	})
+	// session-2 不在 live 里 = 冷会话
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-2', msgId: 'M1' })
+	await drainFor(boot.socketPath, 60)
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '冷会话消息', msgId: 'M2' })
+
+	const agent = await waitFor(() => boot.ctx.agents.get('session-2') ?? null)
+	await waitFor(() => agent.followed.length > 0)
+	assert.ok(boot.ctx.sessionController.resumedVia.includes('session-2'), '冷会话要走控制器的 resume')
+	assert.deepEqual(boot.ctx.agents.rawResumeCalls, [], '绝不能退回裸 agents.resume（会造出没模型/没工具的 agent）')
+	assert.equal(agent.followed.at(-1).content[0].text, '冷会话消息', '恢复出来的 agent 要真的收到消息')
+	assert.equal(agent.followed.at(-1).source.kind, 'user')
+
+	boot.dispose()
+})
+
+test('冷会话恢复：控制器没有 resume 时可回退到裸 agents.resume（保底不瘫）', async (t) => {
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: {} })
+	boot.ctx.sessionController.resume = undefined
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', {
+		openids: [{ openid: 'U1' }],
+		panel: { enabled: true, users: ['U1'] },
+		menu: { enabled: true },
+	})
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-2', msgId: 'M1' })
+	await drainFor(boot.socketPath, 60)
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '保底消息', msgId: 'M2' })
+
+	const agent = await waitFor(() => boot.ctx.agents.get('session-2') ?? null)
+	await waitFor(() => agent.followed.length > 0)
+	assert.deepEqual(boot.ctx.agents.rawResumeCalls, ['session-2'], '没有控制器 resume 时才回退')
+	assert.equal(agent.followed.at(-1).content[0].text, '保底消息')
 
 	boot.dispose()
 })

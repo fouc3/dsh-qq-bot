@@ -181,6 +181,29 @@ level=WARN msg="已丢弃非白名单用户的私聊" openid=2A3B4C… text_len=
 
 ---
 
+## 冷会话恢复：必须走会话控制器（别再踩）
+
+QQ 消息要投给一个**没有活 agent** 的会话时，插件会先"唤起"它。这一步**必须**用
+`ctx.sessionController.resume(sessionId)`：dsh 的控制器恢复时会带上 `agentOptions`（模型选择）
+与 `setup`（预设组合 —— **工具就是从预设组合来的**）：
+
+```js
+this.ctx.agents.resume({ resumeSessionId, agentOptions: this.agentOptions(), setup: composition.setup })
+```
+
+**踩过的坑（2026-10-15 线上事故）**：插件以前直接裸调 `ctx.agents.resume({ resumeSessionId })`，
+造出来的 agent **没有模型、没有预设/工具**，于是：
+
+- `agent.options.model` 为空 → 系统提示词里 `{{model}}` 取不到值 → 本轮直接失败：
+  `prompt variable "{{model}}" has no value for this assembly (section "deployment:persona-prefix")`；
+- 预设没组合 → **标准模式的工具全都不在**（bash/文件工具全没了，AI 只剩"嘴"）。
+
+症状是"报错 + 工具全没"一起出现，只有**冷会话**第一次被 QQ 唤起时中招（重启之后、或当时没有
+活 agent 的会话），重启 dsh 或显式切一次模型才会消失。现在 `agentFor()` 优先走控制器，
+控制器不可用时才回退到裸 `agents.resume`（并记 WARN）。
+
+---
+
 ## 验收清单
 
 `✅` = 已有自动化证据（跑下面两条命令即可复现），`⏳` = 必须真 QQ 环境（凭据 + 私聊 openid），只能你本地验。
@@ -250,7 +273,7 @@ level=WARN msg="已丢弃非白名单用户的私聊" openid=2A3B4C… text_len=
 # Go 侧（含假 QQ 平台 + 真 UNIX socket 桩）
 go vet ./... && gofmt -l . && go test -race ./...
 
-# 插件侧：语法 + 150 项（含"装配级端到端"）
+# 插件侧：语法 + 157 项（含"装配级端到端"）
 node --check dsh-plugin/index.js dsh-plugin/lib/*.js
 node --test dsh-plugin/lib/*.test.js
 ```
