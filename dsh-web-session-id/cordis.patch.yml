@@ -1,0 +1,5 @@
+# 本地 bundle：给 dsh web 的会话标题栏右上角加一个「ID」按钮。
+# Host 半边是空壳（index.js），真正的界面全在 client.js（浏览器模块）。
+- insert:
+    - id: dsh-web-session-id
+      name: '@local/dsh-web-session-id'

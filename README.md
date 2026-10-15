@@ -130,7 +130,20 @@ dsh web                                   # 3000+；插件与它同进程
 ls -ld ~/.dsh/dsh-qq-bot ~/.dsh/dsh-qq-bot/bridge.sock   # 应为 drwx------ 与 srw-------
 ```
 
+### 4. （可选）dsh web 的「ID」按钮
+
+仓库里还有一个**与 QQ 无关**的小 bundle：给 dsh web 的**会话标题栏右上角**加一个「**ID**」
+按钮，点开悬浮窗看**当前会话 id** 并一键复制；**不在会话里不显示**；**设置里能关掉**。
+
+```bash
+plugin_manager action=install_bundle target=/home/fouc3/Projects/DSH-QQ-Bot/dsh-web-session-id
+```
+
+装完刷新页面即可。细节（挂在哪个槽位、设置存哪、为什么这么选）见
+[dsh-web-session-id/README.md](dsh-web-session-id/README.md)。
+
 ---
+
 
 ## 配置
 
@@ -389,5 +402,6 @@ internal/qq/          SDK 客户端、事件、统一发送收口、撤回、富
 internal/bridge/      unix socket 客户端（NDJSON + 权限校验 + 长轮询）
 internal/executor/    出站命令执行（去重 + ack）
 dsh-plugin/           dsh Host 插件 bundle（socket 服务、会话/标题、命令与卡片、工具、轮次、提问）
+dsh-web-session-id/   dsh web 的「ID」按钮 bundle（Host 空壳 + 浏览器半边：标题栏按钮、悬浮窗、设置开关）
 docs/protocol.md      两侧协议（帧、op、出站命令、队列语义）
 ```

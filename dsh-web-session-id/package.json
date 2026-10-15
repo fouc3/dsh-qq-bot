@@ -1,0 +1,24 @@
+{
+	"name": "@local/dsh-web-session-id",
+	"version": "1.0.0",
+	"private": true,
+	"type": "module",
+	"description": "dsh web 会话标题栏右上角的「ID」按钮：点开悬浮窗看当前会话 id 并复制；设置里可关掉这个按钮",
+	"exports": {
+		".": "./index.js",
+		"./client": "./client.js"
+	},
+	"dsh": {
+		"bundle": {
+			"patch": "./cordis.patch.yml"
+		},
+		"client": {
+			"platform": "web",
+			"immediately": true,
+			"inject": [
+				"@deepseek-ai/dsh-client-ui-conversation",
+				"@deepseek-ai/dsh-client-ui-settings"
+			]
+		}
+	}
+}
