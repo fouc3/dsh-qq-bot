@@ -390,31 +390,57 @@ function oneLine(text, limit = 60) {
 }
 
 /**
- * 一轮结束的通知卡。
+ * 一轮结束/开始的**通知卡**（开头那行 + 一个按钮行，两种形态同一套按钮）。
  *
- * 用户要求区分两种收尾：
+ * 形态（用户要求逐个加的）：
  *   - 正常结束：`标题(id)已结束`
- *   - 被打断：`标题(id)被打断`，并尽量带上"打断来自哪条消息"（`> 打断来自：…`）；
- *     拿不到那条消息时照样报被打断，只是不带引用行。
- *
- * 用户补充（2026-10-16）：`reason=error` 不能再混进"被打断" —— 改成
- * `标题(id)出现错误` + `> 错误：<具体报错>`，否则用户只看到"被打断"，不知道出了什么事
- * （线上踩过：`{{model}}` 那个错全被渲染成"被打断"，看不出是配置/模型问题）。
+ *   - 被打断：`标题(id)被打断` + `> 打断来自：<那条消息>`（拿不到来源就不带引用行）；
+ *     **并进"新一轮已开始"**：QQ 消息打断时会同时起一轮新的，为了不刷屏就**不另发开始卡**，
+ *     而是在这张卡里加一行 `> 已按这条消息开了新一轮` —— 但 `发送`/`快捷` 这两个命令自己的
+ *     回执已经写了"会打断…"，那就不重复了（用户要求）。
+ *   - **开始**（用户要求 2026-10-16）：`标题(id)已开始`；目标/计划续跑的轮次带一行说明
+ *     （`> 目标/计划续跑（沿用你从 QQ 起的那条链）`）。
+ *   - **出错**（`reason=error`）：`标题(id)出现错误` + `> 错误：<具体报错>` ——
+ *     以前 error 也写成"被打断"，用户只看到"被打断"却不知道出了什么事。
  *
  * @param {{label:string, sessionId:string, interrupted?:boolean, error?:string,
- *   source?:string, sendCommand?:Function}} input
+ *   started?:boolean, chain?:boolean, nextRound?:boolean, source?:string,
+ *   sendCommand?:Function}} input
  */
-export function buildNoticeCard({ label, sessionId, interrupted = false, error = '', source = '', sendCommand }) {
+export function buildNoticeCard({
+	label,
+	sessionId,
+	interrupted = false,
+	error = '',
+	started = false,
+	chain = false,
+	nextRound = false,
+	source = '',
+	sendCommand,
+}) {
 	const failed = typeof error === 'string' && error.trim() !== ''
-	const lines = [failed ? `${label}出现错误` : interrupted ? `${label}被打断` : `${label}已结束`]
+	const lines = [
+		started
+			? `${label}已开始`
+			: failed
+				? `${label}出现错误`
+				: interrupted
+					? `${label}被打断`
+					: `${label}已结束`,
+	]
 	let quoted = ''
-	if (failed) {
+	if (started) {
+		if (chain) quoted = '目标/计划续跑（沿用你从 QQ 起的那条链）'
+	} else if (failed) {
 		quoted = `错误：${oneLine(error, 160)}`
 	} else if (interrupted) {
 		const from = oneLine(source)
 		if (from) quoted = `打断来自：${from}`
 	}
 	if (quoted) lines.push(`> ${quoted}`)
+	// 打断卡顺手把"新一轮已开始"并进来（省一张开始卡）；命令自己已经提示过打断时不重复，
+	// 出错卡也不并（那张卡的重点是报错）。
+	if (interrupted && nextRound && !failed && !started) lines.push('> 已按这条消息开了新一轮')
 	const buttons = [callbackButton('我需要回复', data.needReply(sessionId), { visited: '已触发' })]
 	if (typeof sendCommand === 'function') {
 		// 「发送消息」是指令按钮：只把 `发送 <会话id>` 填进 QQ 输入框（由用户自己按发送）。

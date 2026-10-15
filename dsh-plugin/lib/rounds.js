@@ -129,15 +129,27 @@ export function createRounds({
 			`计划轮次开始：${sessionId.slice(-8)} turn=${turn} openid=${openid ? '有' : '无'}` +
 				'（唤醒链追到 QQ 用户，结束照发通知）',
 		)
+		// 计划唤醒的只要判定为 QQ 来源**就发开始通知**（用户要求）。
+		enqueueNotice(round, { phase: 'start', started: true, chain: true })
 		return round
 	}
 
-	function beginRound({ sessionId, openid, origin = 'qq', context = {}, pendingContext = null, interruptSource = '' }) {
+	function beginRound({
+		sessionId,
+		openid,
+		origin = 'qq',
+		context = {},
+		pendingContext = null,
+		interruptSource = '',
+		interruptHinted = false,
+		startHinted = false,
+	}) {
 		const previous = rounds.get(sessionId)
 		if (previous) {
 			previous.superseded = true
 			if (previous.fallbackTimer) clearTimeout(previous.fallbackTimer)
-			notifyInterrupted(previous, interruptSource)
+			// 打断卡顺手并进"新一轮已开始"；但 `发送`/`快捷` 自己的回执已经提示过会打断 → 不重复。
+			notifyInterrupted(previous, interruptSource, { nextRound: !interruptHinted })
 		}
 		const round = {
 			sessionId,
@@ -159,6 +171,10 @@ export function createRounds({
 		// 这一条链是从 QQ 用户起的（延迟投递也算：那是用户自己排队要发的话）。
 		state.setChainWake(sessionId, 'qq')
 		journal(`轮次开始：${sessionId.slice(-8)} origin=${origin} openid=${openid ? '有' : '无'}`)
+		// 开始通知（用户要求）：**打断场景不单独发**（已经并进上面那张「被打断」卡，防止刷屏）；
+		// 另外 `发送`/`快捷`/「我需要回复」这些**自己的回执已经说明"开跑了"**的投递也不另发
+		// （用户要求：已经有提示的不加）。
+		if (!previous && !startHinted) enqueueNotice(round, { phase: 'start', started: true })
 		return round
 	}
 
@@ -284,13 +300,22 @@ export function createRounds({
 		return typeof text === 'string' ? text.trim() : ''
 	}
 
-	/** 发一条结束/被打断通知（按 会话+轮次 去重）。 */
-	function enqueueNotice(round, { interrupted = false, source = '', error = '' } = {}) {
+	/**
+	 * 发一条通知（按 会话+轮次+阶段 去重）。
+	 *
+	 * `phase`：`'end'`（默认：已结束/被打断/出现错误）/ `'start'`（已开始）——
+	 * 两者去重键不同（同一个 turn 的"开始"和"结束"各发各的）。
+	 */
+	function enqueueNotice(
+		round,
+		{ phase = 'end', interrupted = false, source = '', error = '', started = false, chain = false, nextRound = false } = {},
+	) {
 		if (!round || !fromQqUser(round) || !round.openid) {
 			journal(`通知跳过：不是 QQ 用户发起的一轮或没 openid（${round?.sessionId ?? '?'}）`)
 			return
 		}
-		const key = `${round.sessionId}:${round.turn ?? round.startedAt}`
+		const stamp = round.turn ?? round.startedAt
+		const key = phase === 'start' ? `${round.sessionId}:start:${stamp}` : `${round.sessionId}:${stamp}`
 		if (state.noticeSeen(key)) {
 			journal(`通知跳过：这个轮次已发过（${key.slice(-12)}）`)
 			return
@@ -300,6 +325,9 @@ export function createRounds({
 			sessionId: round.sessionId,
 			interrupted,
 			error,
+			started,
+			chain,
+			nextRound,
 			source,
 			sendCommand,
 		})
@@ -313,7 +341,7 @@ export function createRounds({
 			msgSeq: nextSeq(round.sessionId),
 		})
 		state.markNotice(key)
-		const kind = error ? '出现错误' : interrupted ? '被打断' : '已结束'
+		const kind = started ? '已开始' : error ? '出现错误' : interrupted ? '被打断' : '已结束'
 		journal(`通知已入队：${kind} turn=${round.turn ?? '?'}（${key.slice(-12)}）${error ? ` :: ${error.slice(0, 120)}` : ''}`)
 		logger?.info?.(`已发通知：${kind}`, {
 			sessionId: round.sessionId,
@@ -322,15 +350,20 @@ export function createRounds({
 		})
 	}
 
-	/** 被打断（被新消息顶替 / 用户显式停止）：立刻通知，并尽量带上打断来源。 */
-	function notifyInterrupted(round, source = '') {
+	/**
+	 * 被打断（被新消息顶替 / 用户显式停止）：立刻通知，并尽量带上打断来源。
+	 *
+	 * `nextRound`：这次打断之后紧接着就起了新一轮（QQ 消息顶替的情况）—— 把"新一轮已开始"
+	 * **并进这张卡**（`> 已按这条消息开了新一轮`），就**不再另发开始卡**，免得刷屏（用户要求）。
+	 */
+	function notifyInterrupted(round, source = '', { nextRound = false } = {}) {
 		if (!round || round.ended) return
 		round.ended = true
 		if (round.fallbackTimer) {
 			clearTimeout(round.fallbackTimer)
 			round.fallbackTimer = null
 		}
-		enqueueNotice(round, { interrupted: true, source })
+		enqueueNotice(round, { interrupted: true, source, nextRound })
 	}
 
 	const currentContext = (sessionId) => currentRound(sessionId)?.context ?? { msgId: '', eventId: '' }
@@ -666,6 +699,8 @@ export function createRounds({
 			openid,
 			origin: 'qq',
 			context: { eventId: interactionId, msgId: messageId ?? '' },
+			// 紧接着的「已触发，正在请求回复…」回执已经说明"开跑了" → 不再另发开始卡。
+			startHinted: true,
 		})
 		round.pendingContext = roundContextText(round)
 		agent.followup(userMessage(String(config.needReplyText ?? '请把上一条消息对应的结果回复给用户。')))

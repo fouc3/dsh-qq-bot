@@ -733,7 +733,8 @@ export function createCommandRunner(deps) {
 
 		// 带消息：**只投递、不切换**（用户明确要求）——正在别的会话里干活时顺手丢一条任务过去，
 		// 不该把自己带走。所以这里连 setBinding 都不碰。
-		await deps.deliver({ sessionId, openid, text: withQuote(rest, quote), interrupt: true, origin: 'qq' })
+		// `interruptHinted`：下面那条回执已经写了"会打断它正在跑的轮次" → 被打断卡不再重复。
+		await deps.deliver({ sessionId, openid, text: withQuote(rest, quote), interrupt: true, origin: 'qq', interruptHinted: true, startHinted: true })
 		const bound = currentSessionId(openid)
 		await deps.reply({
 			openid,
@@ -813,6 +814,9 @@ export function createCommandRunner(deps) {
 			text: withQuote(target.content, quote),
 			interrupt: true,
 			origin: 'qq',
+			// 下面的回执已写"会打断正在跑的轮次"（也没有开始卡）→ 不再重复提示。
+			interruptHinted: true,
+			startHinted: true,
 		})
 		await deps.reply({
 			openid,

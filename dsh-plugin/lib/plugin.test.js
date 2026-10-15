@@ -796,6 +796,76 @@ test('端到端：计划/目标续跑的轮次沿用用户唤醒（也发通知�
 	boot.dispose()
 })
 
+// 用户要求（2026-10-16）：新增「已开始」通知。两个例外：
+//   ① 一条 QQ 消息**打断**上一轮时不另发开始卡，而是把那句并进「被打断」卡（防刷屏）；
+//   ② `发送`/`快捷 <目标> <消息>`/「我需要回复」**自己的回执已经说明"开跑了"** → 也不另发
+//      （用户要求："对于这个发送和快捷命令已经有提示的就不加了"）。
+test('端到端：开始通知（普通消息发；打断时并进被打断卡；命令已提示的不发）', async (t) => {
+	const agent = makeAgent('session-1')
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': agent } })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M0' })
+	await drainFor(boot.socketPath, 60)
+	const emit = (event) => agent.handlers['session/event'](null, event)
+	const drainAll = async (ms = 80) => drainFor(boot.socketPath, ms)
+
+	// ① 空闲时发一条普通消息 → 有「已开始」卡（和结束卡同一套按钮）
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '第一件事', msgId: 'M1' })
+	const start = await waitFor(async () => {
+		const list = await drainAll()
+		return list.find((c) => c.kind === 'send_c2c' && /已开始/.test(String(c.args.content))) ?? null
+	})
+	assert.equal(String(start.args.content), 'proj-a(session-1)已开始')
+	assert.equal(start.args.keyboard.content.rows[0].buttons[0].render_data.label, '我需要回复')
+	emit({ type: 'turn/start', data: { turn: 1 } })
+
+	// ② 运行中再发一条**普通消息** → 不另发开始卡；「被打断」卡里并进"已按这条消息开了新一轮"
+	agent.status = 'running'
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '改个方向', msgId: 'M2' })
+	const interrupted = await waitFor(async () => {
+		const list = await drainAll()
+		return list.find((c) => c.kind === 'send_c2c' && /被打断/.test(String(c.args.content))) ?? null
+	})
+	assert.equal(
+		String(interrupted.args.content),
+		'proj-a(session-1)被打断\n> 打断来自：改个方向\n> 已按这条消息开了新一轮',
+	)
+	const window1 = await drainAll()
+	assert.equal(window1.filter((c) => /已开始/.test(String(c.args.content))).length, 0, '打断时不另发开始卡')
+	emit({ type: 'turn/start', data: { turn: 2 } })
+
+	// ③ `发送 <目标> <内容>`：回执已经写了"会打断…" → 被打断卡里**不**再并那句话（也不发开始卡）
+	let said = []
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '发送 session-1 插一条', msgId: 'M3' })
+	const hinted = await waitFor(async () => {
+		const list = await drainAll()
+		said = said.concat(list)
+		return list.find((c) => c.kind === 'send_c2c' && /被打断/.test(String(c.args.content))) ?? null
+	})
+	assert.equal(String(hinted.args.content), 'proj-a(session-1)被打断\n> 打断来自：插一条')
+	said = said.concat(await drainAll())
+	assert.equal(said.filter((c) => /已开始/.test(String(c.args.content))).length, 0, '命令已提示过 → 不发开始卡')
+	assert.ok(
+		said.some((c) => c.kind === 'send_c2c' && /会打断正在跑的轮次/.test(String(c.args.content))),
+		'`发送` 自己的回执里带着"会打断"的提示',
+	)
+
+	// ④ 计划/目标续跑（唤醒链追到 QQ 用户）→ **发**开始卡，并说明是续跑
+	emit({ type: 'turn/start', data: { turn: 3 } })
+	emit({ type: 'turn/end', data: { turn: 3, reason: { kind: 'completed' } } })
+	await drainAll()
+	emit({ type: 'turn/start', data: { turn: 4 } })
+	emit({ type: 'user/message', data: { source: { kind: 'goal' }, content: [{ type: 'text', text: '继续切片' }] } })
+	const chainStart = await waitFor(async () => {
+		const list = await drainAll()
+		return list.find((c) => c.kind === 'send_c2c' && /已开始/.test(String(c.args.content))) ?? null
+	})
+	assert.equal(String(chainStart.args.content), 'proj-a(session-1)已开始\n> 目标/计划续跑（沿用你从 QQ 起的那条链）')
+
+	boot.dispose()
+})
+
 // 线上事故（2026-10-15）：插件自己 `ctx.agents.resume({resumeSessionId})` 唤醒冷会话，
 // 造出的 agent **没有模型、没有预设/工具** → 系统提示词里 `{{model}}` 取不到值
 // （`prompt variable "{{model}}" has no value for this assembly (section "deployment:persona-prefix")`）

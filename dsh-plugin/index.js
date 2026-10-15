@@ -772,7 +772,21 @@ export function apply(ctx, rawConfig) {
 	}
 
 	// ── 消息投递（打断 + 用户级上下文注入 + 唤醒） ───────────────────────────
-	async function deliver({ sessionId, openid, text, interrupt = true, origin = 'qq', context = {}, images = [], sections = [] }) {
+	async function deliver({
+		sessionId,
+		openid,
+		text,
+		interrupt = true,
+		origin = 'qq',
+		context = {},
+		images = [],
+		sections = [],
+		// `发送`/`快捷 <目标> <消息>`/「我需要回复」自己的回执里已经写了"会打断它正在跑的轮次"/
+		// "正在请求回复…" → 被打断卡不再并"已按这条消息开了新一轮"，也不再另发开始卡
+		// （用户要求：已经有提示的不重复，防止刷屏）。
+		interruptHinted = false,
+		startHinted = false,
+	}) {
 		// 记下"谁在跟这个会话说话"：非绑定会话（`发送 <会话id> …` / 输入态）也要能回 QQ。
 		if (openid) state.rememberSessionOwner(sessionId, openid)
 		const agent = await agentFor(sessionId)
@@ -794,7 +808,15 @@ export function apply(ctx, rawConfig) {
 		}
 		ensureAgentSetup(agent, sessionId)
 		// 被打断时把「这条消息」当作打断来源：通知里会带一行「> 打断来自：…」。
-		const round = rounds.beginRound({ sessionId, openid, origin, context, interruptSource: interrupt ? text : '' })
+		const round = rounds.beginRound({
+			sessionId,
+			openid,
+			origin,
+			context,
+			interruptSource: interrupt ? text : '',
+			interruptHinted,
+			startHinted,
+		})
 		round.pendingContext = rounds.roundContextText(round)
 		// plan 模式下补一句：计划正文也要发到 QQ（否则坐在这边只看得见"已结束"）。
 		if (isPlanModeActive(agent)) {
@@ -1044,7 +1066,7 @@ export function apply(ctx, rawConfig) {
 			state.flush()
 			logger.info?.('输入态已登记延迟消息', { sessionId, items: items.length })
 		} else {
-			await deliver({ sessionId, openid, text: body, interrupt: true, origin: 'qq', context, images, sections })
+			await deliver({ sessionId, openid, text: body, interrupt: true, origin: 'qq', context, images, sections, startHinted: true })
 		}
 		// 卡片撤回后留一条**最终预览**：把真正发出去的内容复述一遍（用户要求）。
 		await sendText({
@@ -1168,8 +1190,8 @@ export function apply(ctx, rawConfig) {
 			const snapshot = agent ? snapshotProgress(agent) : null
 			return { content: renderProgress({ label, snapshot, sessionId, model, permission, stats }) }
 		},
-		deliver: ({ sessionId, openid, text, interrupt }) =>
-			deliver({ sessionId, openid, text, interrupt, origin: 'qq', context: {} }),
+		deliver: ({ sessionId, openid, text, interrupt, interruptHinted = false, startHinted = false }) =>
+			deliver({ sessionId, openid, text, interrupt, interruptHinted, startHinted, origin: 'qq', context: {} }),
 		stopSession: async (sessionId) => {
 			const agent = ctx.agents.get(sessionId)
 			if (!agent) return { ok: false, reason: '当前没有在运行的轮次' }

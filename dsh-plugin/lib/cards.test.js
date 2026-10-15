@@ -504,6 +504,40 @@ test('结束通知：出错时说「出现错误」并带上具体报错（不�
 	)
 })
 
+// 用户要求（2026-10-16）：新增「已开始」通知；QQ 消息打断时不另发开始卡、并进「被打断」卡；
+// 命令（`发送`/`快捷`）自己的回执已提示过打断 → 不并这句。
+test('开始通知：`已开始` / 续跑带说明 / 打断卡并进"新一轮已开始"', () => {
+	const plain = buildNoticeCard({ label: '项目甲(session-1)', sessionId: 'session-1', started: true })
+	assert.equal(plain.content, '项目甲(session-1)已开始')
+	assert.equal(plain.keyboard.content.rows[0].buttons[0].render_data.label, '我需要回复', '开始卡也带"我需要回复"')
+
+	const chain = buildNoticeCard({ label: '项目甲(session-1)', sessionId: 'session-1', started: true, chain: true })
+	assert.equal(chain.content, '项目甲(session-1)已开始\n> 目标/计划续跑（沿用你从 QQ 起的那条链）')
+
+	// 打断 + 紧接着起了新一轮 → 并进这张卡（省一张开始卡，防刷屏）
+	const folded = buildNoticeCard({
+		label: '项目甲(session-1)',
+		sessionId: 'session-1',
+		interrupted: true,
+		source: '改个方向',
+		nextRound: true,
+	})
+	assert.equal(folded.content, '项目甲(session-1)被打断\n> 打断来自：改个方向\n> 已按这条消息开了新一轮')
+
+	// 命令自己的回执已经写过"会打断…" → nextRound 传 false，不并
+	const hinted = buildNoticeCard({ label: '项目甲(session-1)', sessionId: 'session-1', interrupted: true, source: '插一条' })
+	assert.equal(hinted.content, '项目甲(session-1)被打断\n> 打断来自：插一条')
+
+	// 出错 / 正常结束都不该出现"新一轮已开始"那句
+	const failed = buildNoticeCard({ label: 'x(s1)', sessionId: 's1', interrupted: true, error: 'boom', nextRound: true })
+	assert.equal(failed.content, 'x(s1)出现错误\n> 错误：boom')
+	assert.equal(
+		buildNoticeCard({ label: 'x(s1)', sessionId: 's1', nextRound: true }).content,
+		'x(s1)已结束',
+		'开始/结束互斥：没传 started 就是结束卡',
+	)
+})
+
 test('权限卡片：每行两个按钮（放不下就加宽），当前项标记出来', () => {
 	const options = [
 		{ value: 'read-only', name: '仅可查看', description: '只能看' },
