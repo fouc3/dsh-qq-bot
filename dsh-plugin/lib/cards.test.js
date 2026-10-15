@@ -19,6 +19,8 @@ import {
 	buildQuestionCards,
 	buildQuestionResult,
 	buildSessionCard,
+	SHORTCUT_MAX_BUTTONS,
+	buildShortcutCard,
 	buttonsPerRowFor,
 	callbackButton,
 	clipLabel,
@@ -762,4 +764,63 @@ test('模型卡片回调 data 能原样解析回来（端到端契约）', () =>
 	assert.deepEqual(parseCallback(data.model('list')), { kind: 'model', action: 'list', arg: '' })
 	assert.equal(parseCallback(data.model('')), null)
 	assert.equal(parseCallback('qqb:mod'), null, '不是本插件的回调前缀')
+})
+
+// ── 快捷切换卡片 ────────────────────────────────────────────────────────────
+
+test('快捷切换卡片：一条一个回调按钮（点一下直接切），末行固定「加当前会话」', () => {
+	const card = buildShortcutCard({
+		items: [
+			{ id: 1, label: 'K-Vault-Next', current: false },
+			{ id: 2, label: '我的 前端', current: true },
+			{ id: 3, label: '另一个项目', current: false },
+		],
+		currentLabel: '我的 前端(session-2)',
+	})
+	assert.match(card.content, /当前会话：`我的 前端\(session-2\)`/)
+	assert.match(card.content, /只增不重用/, '正文要写明编号不补位（用户是记着编号用的）')
+	assert.match(card.content, /快捷切换 加 \[备注\]/)
+	assert.match(card.content, /快捷切换 备注 #2 <新备注>/)
+	assert.match(card.content, /备注里不能有 `#`/)
+
+	const rows = card.keyboard.content.rows.map((row) => row.buttons.map((b) => b.render_data.label))
+	assert.deepEqual(rows, [
+		['#1 K-Vault-Next', '#2 我的 前端'],
+		['#3 另一个项目'],
+		['加当前会话'],
+	])
+	const flat = card.keyboard.content.rows.flatMap((row) => row.buttons)
+	assert.equal(flat[0].render_data.style, 0, '非当前灰')
+	assert.equal(flat[1].render_data.style, 1, '当前那条标蓝')
+	assert.equal(flat[3].action.type, 1, '「加当前会话」也是回调按钮')
+	assert.deepEqual(parseCallback(flat[0].action.data), { kind: 'shortcut', action: 'go', arg: '1' })
+	assert.deepEqual(parseCallback(flat[1].action.data), { kind: 'shortcut', action: 'go', arg: '2' })
+	assert.deepEqual(parseCallback(flat[3].action.data), { kind: 'shortcut', action: 'add', arg: '' })
+	// 同一张键盘里按钮 id 必须唯一（label 截断后可能撞车，编号才是真身份）
+	assert.equal(new Set(flat.map((b) => b.id)).size, flat.length)
+
+	// 整卡必须合法（平台硬限制：≤5 行、每行 ≤5）
+	assert.ok(card.keyboard.content.rows.length <= 5)
+	for (const row of card.keyboard.content.rows) assert.ok(row.buttons.length <= 5)
+})
+
+test('快捷切换卡片：空列表只给「加当前会话」+ 引导；超上限只列前 N 条并说明用编号直达', () => {
+	const empty = buildShortcutCard({ items: [], currentLabel: '' })
+	assert.match(empty.content, /还没有快捷会话/)
+	assert.deepEqual(
+		empty.keyboard.content.rows.map((row) => row.buttons.map((b) => b.render_data.label)),
+		[['加当前会话']],
+	)
+	assert.match(empty.content, /`none`（未绑定）/)
+
+	const many = buildShortcutCard({
+		items: Array.from({ length: SHORTCUT_MAX_BUTTONS + 4 }, (_, i) => ({ id: i + 1, label: `项目 ${i + 1}`, current: false })),
+		currentLabel: '',
+	})
+	const buttons = many.keyboard.content.rows.flatMap((row) => row.buttons)
+	assert.equal(buttons.length, SHORTCUT_MAX_BUTTONS + 1, `${SHORTCUT_MAX_BUTTONS} 条 + 加按钮`)
+	assert.match(many.content, new RegExp(`按钮只放得下前 ${SHORTCUT_MAX_BUTTONS} 个`))
+	assert.ok(many.keyboard.content.rows.length <= 5)
+	assert.deepEqual(parseCallback(buttons.at(-1).action.data), { kind: 'shortcut', action: 'add', arg: '' })
+	assert.equal(parseCallback('qqb:sc'), null, '缺动作的回调要当成坏数据')
 })

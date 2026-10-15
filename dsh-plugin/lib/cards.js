@@ -130,6 +130,8 @@ export const data = {
 	rmdirYes: (path) => `${DATA_PREFIX}:rmdir2:${path}`,
 	// 权限卡片：切成某个预设（value 是 dsh 的预设 key，如 danger-full-access）
 	perm: (value) => `${DATA_PREFIX}:perm:${value}`,
+	// 快捷切换卡片：go（切到某条，arg = 编号）/ add（把当前会话加进来）
+	shortcut: (action, arg = '') => `${DATA_PREFIX}:sc:${action}${arg === '' ? '' : `:${arg}`}`,
 	// 模型卡片：page（提供商翻页）/ enter（进提供商看模型）/ mpage（提供商内翻页）/
 	// pick（切到某个模型）/ list（回到提供商列表）；arg 是提供商 id 或 `提供商id:…`。
 	model: (action, arg = '') => `${DATA_PREFIX}:mod:${action}${arg === '' ? '' : `:${arg}`}`,
@@ -161,6 +163,14 @@ export function parseCallback(raw) {
 	}
 	if (raw.startsWith(`${DATA_PREFIX}:perm:`)) {
 		return { kind: 'perm', value: raw.slice(`${DATA_PREFIX}:perm:`.length) }
+	}
+	if (raw.startsWith(`${DATA_PREFIX}:sc:`)) {
+		const rest = raw.slice(`${DATA_PREFIX}:sc:`.length)
+		const first = rest.indexOf(':')
+		const action = first < 0 ? rest : rest.slice(0, first)
+		const arg = first < 0 ? '' : rest.slice(first + 1)
+		if (!action) return null
+		return { kind: 'shortcut', action, arg }
 	}
 	if (raw.startsWith(`${DATA_PREFIX}:mod:`)) {
 		const rest = raw.slice(`${DATA_PREFIX}:mod:`.length)
@@ -436,6 +446,63 @@ export function buttonsPerRowFor(count, { preferred = 2, maxRows = KEYBOARD_MAX_
 		if (Math.ceil(count / perRow) <= maxRows) return perRow
 	}
 	return KEYBOARD_MAX_BUTTONS_PER_ROW
+}
+
+// ── 快捷切换卡片 ─────────────────────────────────────────────────────────
+//
+// 固定末尾留一行「加当前会话」，所以装得下的条数 =（5-1）行 × 每行 2 个 = 8。
+// 超出的条数不翻页、只在正文里说明"用 `快捷切换 #编号` 直达"：
+// 快捷切换本来就是"少点两下"，翻页反而比打字更麻烦。
+
+/** 快捷按钮每行 2 个（`#编号 + 备注` 比目录名长，挤到 3 个就看不全了）。 */
+export const SHORTCUT_BUTTONS_PER_ROW = 2
+/** 快捷按钮 label 宽度上限（比默认宽：要让 `#3 K-Vault-Next` 这种完整显示）。 */
+export const SHORTCUT_LABEL_WIDTH_LIMIT = 24
+/** 卡片上最多列几个（剩下的用命令直达）。 */
+export const SHORTCUT_MAX_BUTTONS = (KEYBOARD_MAX_ROWS - 1) * SHORTCUT_BUTTONS_PER_ROW
+
+/**
+ * 快捷切换卡片：一条一个**回调按钮**（点一下**直接切过去**，不像会话卡片那样只填输入框）。
+ *
+ * @param {object} input
+ * @param {Array<{id:number, label:string, current:boolean}>} input.items 已排好序的条目
+ * @param {string} [input.currentLabel] 当前绑定会话的显示名（没有就空）
+ */
+export function buildShortcutCard({ items = [], currentLabel = '' }) {
+	const shown = items.slice(0, SHORTCUT_MAX_BUTTONS)
+	const lines = ['**快捷切换**', `> 当前会话：${currentLabel ? `\`${currentLabel}\`` : '`none`（未绑定）'}`]
+	if (items.length === 0) {
+		lines.push('', '还没有快捷会话。发 `快捷切换 加 [备注]` 把当前会话存成 `#1`（点下面的按钮也一样）。')
+	} else {
+		lines.push(`共 ${items.length} 个；编号**只增不重用**（删掉的不补位，\`#3\` 永远指同一个会话）。`)
+		lines.push('', '点按钮**直接切过去**；带消息就发 `快捷切换 #2 <消息>`（切过去并把消息投给 AI，会打断它正在跑的轮次）。')
+		lines.push('加：`快捷切换 加 [备注]` ｜ 删：`快捷切换 删 #2` ｜ 改名：`快捷切换 备注 #2 <新备注>`。')
+		lines.push('> 备注里不能有 `#`（那是编号专用），而且备注要唯一。')
+		if (items.length > shown.length) {
+			lines.push(`> 按钮只放得下前 ${shown.length} 个，其余的用 \`快捷切换 #编号\` 直达。`)
+		}
+	}
+
+	const buttons = shown.map((item) =>
+		callbackButton(`#${item.id} ${item.label}`, data.shortcut('go', item.id), {
+			// 当前会话那条用蓝色，其余灰色；label 里已经带 `#编号`，按钮 id 只能靠编号区分。
+			style: item.current ? BUTTON_STYLE.primary : BUTTON_STYLE.neutral,
+			visited: item.current ? '当前' : `#${item.id}`,
+			labelLimit: SHORTCUT_LABEL_WIDTH_LIMIT,
+			id: `sc_${item.id}`,
+		}),
+	)
+	const rows = rowsOf(buttons, SHORTCUT_BUTTONS_PER_ROW)
+	rows.push({
+		buttons: [
+			callbackButton('加当前会话', data.shortcut('add'), {
+				style: BUTTON_STYLE.neutral,
+				visited: '已加入',
+				id: 'sc_add',
+			}),
+		],
+	})
+	return { content: lines.join('\n'), keyboard: keyboardOf(clampRows(rows)) }
 }
 
 // ── 模型（提供商 → 模型）两级选择卡片 ─────────────────────────────────────

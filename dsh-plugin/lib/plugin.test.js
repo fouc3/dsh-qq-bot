@@ -439,7 +439,7 @@ test('插件导出形态正确，且 apply() 会建出 0600 的 socket', async (
 	boot.dispose()
 })
 
-test('register → panel：白名单快照 + 九个命令的面板定义（只绑定配置指定的私聊）', async (t) => {
+test('register → panel：白名单快照 + 十条命令的面板定义（只绑定配置指定的私聊）', async (t) => {
 	const boot = bootPlugin(t, { sessions: SUMMARIES })
 	await waitFor(() => existsSync(boot.socketPath))
 
@@ -459,13 +459,14 @@ test('register → panel：白名单快照 + 九个命令的面板定义（只�
 	assert.deepEqual(panel.value.userOpenIds, ['U1'])
 	assert.deepEqual(
 		panel.value.items.map((item) => item.name),
-		['切换会话', '新建会话', '进度', '发送', '停止', '归档', '延迟发送', '权限', '模型'],
+		['切换会话', '快捷切换', '新建会话', '进度', '发送', '停止', '归档', '延迟发送', '权限', '模型'],
 	)
 	// 扁平键 menuItems：与 Go 侧 PanelDefinition.MenuItems 对齐（大小写不敏感匹配）
-	// 顶层 7 项 = 6 个平铺 + 1 个「管理」二级菜单（停止/归档/权限），给「模型」腾出顶层位。
-	assert.equal(panel.value.menuItems.length, 7)
+	// 顶层 8 项 = 7 个平铺 + 1 个「管理」二级菜单（停止/归档/权限）+ 2 个 dsh 命令二级菜单 = 10（平台上限）。
+	assert.equal(panel.value.menuItems.length, 8)
 	assert.equal(panel.value.menuItems[0].name, '切换会话')
 	assert.equal(panel.value.menuItems[0].sendMessage, '切换会话')
+	assert.equal(panel.value.menuItems[1].sendMessage, '快捷切换')
 	const manageGroup = panel.value.menuItems.find((item) => item.type === 'menu')
 	assert.equal(manageGroup.name, '管理')
 	assert.deepEqual(manageGroup.children.map((child) => child.name), ['停止', '归档', '权限'])
@@ -1099,7 +1100,7 @@ test('端到端：dsh 内置命令从 QQ 直接执行（不进模型）；技能
 		'feedback 不收纳；技能本来就不在命令表里',
 	)
 	assert.equal(dshGroup.children[0].sendMessage, '/compact', '点击把 /命令 填进输入框')
-	assert.equal(panel.value.menuItems.filter((i) => i.type !== 'menu').length, 6, '顶层 6 条平铺桥命令')
+	assert.equal(panel.value.menuItems.filter((i) => i.type !== 'menu').length, 7, '顶层 7 条平铺桥命令')
 
 	// 绑定会话
 	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M1' })
@@ -2137,6 +2138,116 @@ test('端到端：`模型` 两级卡片（提供商 2/行 → 模型 1/行）／
 		return list.find((c) => c.kind === 'send_c2c' && /没找到会话/.test(String(c.args.content))) ?? null
 	})
 	assert.match(String(badSession.args.content), /用法：/)
+
+	boot.dispose()
+})
+
+// ── 快捷切换（#编号 + 备注） ────────────────────────────────────────────────
+
+// 快捷切换和「会话选择卡片」的关键区别：那张卡片的会话按钮是**指令按钮**（只把命令填进
+// 输入框），这张是**回调按钮**（点一下当场切过去）——"快捷"要的就是少点两下。
+test('端到端：快捷切换 —— 加进列表、点按钮直接切、切过去并投递一条消息', async (t) => {
+	const agent1 = makeAgent('session-1')
+	const agent2 = makeAgent('session-2')
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': agent1, 'session-2': agent2 } })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', {
+		openids: [{ openid: 'U1' }],
+		panel: { enabled: true, users: ['U1'] },
+		menu: { enabled: true },
+	})
+
+	// 1) 绑到 session-1，加进快捷（带备注）
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M1' })
+	await waitFor(async () => (await pumpQueue(boot.socketPath)).some((c) => c.kind === 'send_c2c'))
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '快捷切换 加 前端', msgId: 'M2' })
+	const added = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 60)
+		return list.find((c) => c.kind === 'send_c2c' && /已加入快捷/.test(String(c.args.content))) ?? null
+	})
+	assert.match(String(added.args.content), /#1 前端/)
+
+	// 2) 换到 session-2，再发 `快捷切换` 拿卡片
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-2', msgId: 'M3' })
+	await drainFor(boot.socketPath, 60)
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '快捷切换', msgId: 'M4' })
+	const card = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 60)
+		return list.find((c) => c.kind === 'send_c2c' && c.args.keyboard && /快捷切换/.test(String(c.args.content))) ?? null
+	})
+	const rows = card.args.keyboard.content.rows
+	assert.ok(rows.length <= 5, '键盘行数不能超平台上限')
+	for (const row of rows) assert.ok(row.buttons.length <= 5, '每行按钮数不能超平台上限')
+	const buttons = rows.flatMap((row) => row.buttons)
+	const go = buttons.find((b) => b.action.data === cardData.shortcut('go', 1))
+	assert.ok(go, '每条快捷一个回调按钮')
+	assert.equal(go.action.type, 1, '快捷按钮是回调按钮（点一下当场切，不是填输入框）')
+	assert.equal(go.render_data.label, '#1 前端', '按钮上就是 `#编号 备注`')
+	assert.equal(go.render_data.style, 0, '当前绑的是 session-2，所以 #1 不是"当前"')
+	assert.ok(buttons.some((b) => b.action.data === cardData.shortcut('add')), '要有「加当前会话」')
+
+	// 3) 点 #1 → **当场切过去**，并把卡片重发一遍标出新的"当前"
+	await rpc(boot.socketPath, 'event', {
+		kind: 'interaction',
+		openid: 'U1',
+		buttonData: go.action.data,
+		eventId: 'INT-SC',
+		msgId: 'CARD-SC',
+	})
+	const afterClick = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.some((c) => c.kind === 'respond_interaction') ? list : null
+	})
+	assert.ok(afterClick.some((c) => c.kind === 'respond_interaction' && c.args.code === 0), '按钮要回 code 0')
+	assert.ok(
+		afterClick.some((c) => c.kind === 'send_c2c' && /已接入/.test(String(c.args.content))),
+		'点快捷要回执"已接入"',
+	)
+	const refreshed = afterClick.filter((c) => c.kind === 'send_c2c' && c.args.keyboard).at(-1)
+	assert.ok(refreshed, '点完要重发卡片')
+	const refreshedGo = refreshed.args.keyboard.content.rows
+		.flatMap((row) => row.buttons)
+		.find((b) => b.action.data === cardData.shortcut('go', 1))
+	assert.equal(refreshedGo.render_data.style, 1, '重发的卡片要把新的"当前"标蓝')
+
+	// 绑定与快捷条目都真的落盘了（不只是内存里对）
+	const saved = await waitFor(() => {
+		try {
+			const state = JSON.parse(readFileSync(boot.stateFile, 'utf8'))
+			return state.bindings.U1 === 'session-1' ? state : null
+		} catch {
+			return null
+		}
+	})
+	assert.deepEqual(
+		saved.shortcuts.U1.items.map((item) => [item.id, item.sessionId, item.name]),
+		[[1, 'session-1', '前端']],
+	)
+
+	// 4) `快捷切换 #1 <消息>`：切过去 + 立刻把消息投给那个会话（会打断正在跑的轮次）
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '快捷切换 #1 你好', msgId: 'M5' })
+	await waitFor(() => agent1.followed.length > 0)
+	assert.equal(agent1.followed.at(-1).content[0].text, '你好')
+	assert.equal(agent1.followed.at(-1).source.kind, 'user', 'QQ 里打的字要标成人类输入')
+	assert.equal(agent2.followed.length, 0, '不能投错会话')
+
+	boot.dispose()
+})
+
+test('端到端：快捷切换的备注不能带 #（含 # 的备注必须被拒，列表不能变）', async (t) => {
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': makeAgent('session-1') } })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M1' })
+	await drainFor(boot.socketPath, 60)
+
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '快捷切换 加 前端#1', msgId: 'M2' })
+	const refused = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /备注里不能有/.test(String(c.args.content))) ?? null
+	})
+	assert.match(String(refused.args.content), /用法：/, '被拒时要带上用法')
+	assert.equal(JSON.parse(readFileSync(boot.stateFile, 'utf8')).shortcuts?.U1?.items?.length ?? 0, 0)
 
 	boot.dispose()
 })

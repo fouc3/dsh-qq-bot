@@ -134,6 +134,12 @@ export function createSessions({ ctx, logger, idStyle = 'full' }) {
 		return `${title}(${displayId(sessionId)})`
 	}
 
+	/** 只取标题（按钮 label 用：那里不该出现会话id，太占宽度）。 */
+	function titleOf(sessionId) {
+		const entry = byId.get(sessionId)
+		return titles.get(sessionId) || (entry?.cwd ? basename(entry.cwd) : '') || ''
+	}
+
 	/** 所有会话 cwd 的最长公共前缀：作为选择卡片的默认根目录。 */
 	function defaultRoot() {
 		const dirs = visible()
@@ -231,6 +237,7 @@ export function createSessions({ ctx, logger, idStyle = 'full' }) {
 		get,
 		describe,
 		label,
+		titleOf,
 		displayId,
 		defaultRoot,
 		listDirs,

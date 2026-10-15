@@ -21,6 +21,10 @@ export const EMPTY_STATE = {
 	createdSessions: {}, // sessionId -> cwd（本桥建出来的会话：用来补登记工作区）
 	createdDirs: [], // 本桥建出来的目录（新建目录）：用来补登记工作区
 	sessionOwners: {}, // sessionId -> openid（最近一次从 QQ 跟这个会话说过话的人）
+	// 快捷切换：openid -> { seq, items: [{ id, sessionId, name, at }] }。
+	// `id` 是按钮上那个 `#数字编号`：**只增不重用**（删掉 #2 后 #3 仍是原来那个会话），
+	// 否则用户记在脑子里的编号会悄悄指到别的会话。`name` 是自定义备注（空 = 用会话标题）。
+	shortcuts: {},
 	// 插件自己的"小日志"：最近 40 条关键决策（轮次认领/结束、通知入队或跳过、agent 挂载）。
 	// 为什么放状态里：**插件日志进不了 journald**（dsh-web 只把启动几行写进 journal），
 	// 线上排查"结束通知怎么不发了"这种问题，只有这里能看见插件当时是怎么判断的。
@@ -42,9 +46,10 @@ function normalize(raw) {
 		createdSessions: {},
 		createdDirs: [],
 		sessionOwners: {},
+		shortcuts: {},
 	}
 	if (!raw || typeof raw !== 'object') return base
-	for (const key of ['bindings', 'lastCard', 'delayed', 'inbox', 'attachSeq', 'pendingDir', 'pendingModel', 'createdSessions', 'sessionOwners']) {
+	for (const key of ['bindings', 'lastCard', 'delayed', 'inbox', 'attachSeq', 'pendingDir', 'pendingModel', 'createdSessions', 'sessionOwners', 'shortcuts']) {
 		if (raw[key] && typeof raw[key] === 'object') base[key] = { ...raw[key] }
 	}
 	if (Array.isArray(raw.createdDirs)) base.createdDirs = raw.createdDirs.filter((item) => typeof item === 'string' && item)
@@ -290,6 +295,67 @@ export function createState({ file, logger, seed, debounceMs = 200 } = {}) {
 		sessionOwnerOf(sessionId) {
 			const owner = data.sessionOwners?.[sessionId]
 			return typeof owner === 'string' && owner ? owner : null
+		},
+
+		// ── 快捷切换（自带 #编号 + 自定义备注） ───────────────────────────────
+		/** 某人的快捷列表（拷贝，调用方改不坏状态）。 */
+		shortcutsOf(openid) {
+			const book = data.shortcuts?.[openid]
+			if (!book || !Array.isArray(book.items)) return []
+			return book.items
+				.filter((item) => item && typeof item === 'object' && item.sessionId)
+				.map((item) => ({ ...item }))
+		},
+		/**
+		 * 加一条（同一个会话只留一条：已在列表里就更新备注）。
+		 * @returns {{item:object, existed:boolean}}
+		 */
+		addShortcut(openid, { sessionId, name = '' } = {}) {
+			if (!openid || !sessionId) return null
+			let result = null
+			this.update((s) => {
+				// 读坏的状态文件（shortcuts 不是对象/items 不是数组）在这里自愈，不抛错。
+				const book = s.shortcuts?.[openid]
+				const items = Array.isArray(book?.items) ? book.items : []
+				const seq = Number(book?.seq) || 0
+				const existing = items.find((item) => item?.sessionId === sessionId)
+				if (existing) {
+					if (name) existing.name = name
+					result = { item: { ...existing }, existed: true }
+				} else {
+					const item = { id: seq + 1, sessionId, name: name || '', at: new Date().toISOString() }
+					items.push(item)
+					result = { item: { ...item }, existed: false }
+				}
+				s.shortcuts[openid] = { seq: Math.max(seq, result.item.id), items }
+			})
+			return result
+		},
+		/** 改备注。找不到返回 null。 */
+		renameShortcut(openid, id, name) {
+			let found = null
+			this.update((s) => {
+				const items = s.shortcuts?.[openid]?.items
+				if (!Array.isArray(items)) return
+				const item = items.find((entry) => Number(entry?.id) === Number(id))
+				if (!item) return
+				item.name = name || ''
+				found = { ...item }
+			})
+			return found
+		},
+		/** 删一条。找不到返回 null（**不补位**：编号只增不重用）。 */
+		removeShortcut(openid, id) {
+			let found = null
+			this.update((s) => {
+				const book = s.shortcuts?.[openid]
+				if (!book || !Array.isArray(book.items)) return
+				const index = book.items.findIndex((entry) => Number(entry?.id) === Number(id))
+				if (index < 0) return
+				found = { ...book.items[index] }
+				book.items.splice(index, 1)
+			})
+			return found
 		},
 		/** 分配下一个附件 id（`A1`、`A2`…，跨输入态单调递增，绝不重用）。 */
 		nextAttachmentId(openid) {

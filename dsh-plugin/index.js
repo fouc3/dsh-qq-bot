@@ -41,6 +41,7 @@ import {
 	buildMkdirPromptCard,
 	buildNewSessionCard,
 	buildSessionCard,
+	buildShortcutCard,
 	data as cardData,
 	parseCallback,
 } from './lib/cards.js'
@@ -520,6 +521,28 @@ export function apply(ctx, rawConfig) {
 		})
 		await io.sendCard({ openid, content: card.content, keyboard: card.keyboard, context: replyContext })
 		logger.info?.('已发会话选择卡片', { dir: start, sessions: sessions.sessionsInDir(start).length })
+	}
+
+	/**
+	 * 快捷切换卡片：一条一个回调按钮（点一下**直接切过去**），末行是「加当前会话」。
+	 *
+	 * 和会话选择卡片的关键区别：那张卡片的会话按钮是**指令按钮**（只把命令填进输入框），
+	 * 这张是**回调按钮**（当场切）——"快捷"要的就是少点两下，再让用户自己发一次就白快捷了。
+	 */
+	async function showShortcutCard({ openid, replyContext = {} }) {
+		const bound = state.bindingOf(openid)
+		const items = state.shortcutsOf(openid).map((item) => ({
+			id: item.id,
+			// 按钮 label 只放标题：会话id 会把 label 吃掉一半宽度（`#2 K-Vault-Next` 才是能认的）
+			label: String(item.name ?? '').trim() || sessions.titleOf(item.sessionId) || sessions.displayId(item.sessionId),
+			current: item.sessionId === bound,
+		}))
+		const card = buildShortcutCard({
+			items,
+			currentLabel: bound && bound !== 'none' ? sessions.label(bound) : '',
+		})
+		await io.sendCard({ openid, content: card.content, keyboard: card.keyboard, context: replyContext })
+		logger.info?.('已发快捷切换卡片', { count: items.length })
 	}
 
 	/**
@@ -1013,6 +1036,7 @@ export function apply(ctx, rawConfig) {
 			sendText({ openid, content, markdown, context: replyContext }),
 		showSessionCard: ({ openid, replyContext }) => showSessionCard({ openid, replyContext }),
 		showNewSessionCard: ({ openid, replyContext }) => showNewSessionCard({ openid, replyContext }),
+		showShortcutCard: ({ openid, replyContext }) => showShortcutCard({ openid, replyContext }),
 		createSession: ({ openid, cwd }) => createSessionHere({ openid, cwd }),
 		// 权限卡片 / 直接设定（dsh 的权限预设是 per-session 的，见 lib/permissions.js）。
 		showPermissionCard: ({ openid, sessionId, replyContext }) =>
@@ -1477,6 +1501,17 @@ export function apply(ctx, rawConfig) {
 				logger.debug?.('收到未知的模型卡片动作', { action: parsed.action })
 				code = 1
 			}
+		} else if (parsed.kind === 'shortcut') {
+			// 快捷切换卡片：go（点某条 = 直接切过去）/ add（把当前会话加进来）。
+			// 语义全在 commands.js 里，这里只把按钮翻译成等价的命令文本，避免两套实现。
+			// `fromCard: true` 让命令侧做完把卡片重发一遍（标出新的「当前」）。
+			const ctxReply = { eventId: event.eventId, msgId: event.msgId ?? '' }
+			const tokens = parsed.action === 'add' ? ['加'] : [`#${parsed.arg}`]
+			await commands.run(
+				{ openid, replyContext: ctxReply, quote: '', fromCard: true },
+				{ name: '快捷切换', tokens, rest: tokens.join(' ') },
+			)
+			code = 0
 		} else if (parsed.kind === 'perm') {
 			// 权限卡片上的级别按钮：切成这个预设，并把卡片重发一遍（标出新的"当前"）。
 			const ctxReply = { eventId: event.eventId, msgId: event.msgId ?? '' }

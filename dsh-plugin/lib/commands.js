@@ -16,6 +16,17 @@ export const COMMANDS = [
 		argHint: '<会话id> | <目录> <会话id> | none',
 	},
 	{
+		name: '快捷切换',
+		desc: '快捷入口：直接切到目标会话',
+		purpose:
+			'把常用会话存成**快捷入口**：每条自带一个 `#编号`（只增不重用），可以配一个**自定义备注**（备注里不能有 `#`）。' +
+			'`快捷切换 #2` 直接切过去（不经过会话选择卡片）；`快捷切换 #2 <消息>` 切过去并把这条消息一起投给 AI' +
+			'（和 `发送` 一样**会打断**它正在跑的轮次）。',
+		selection: true,
+		selectionText: '列出全部快捷会话，点按钮直接切过去',
+		argHint: '#编号 <消息> | 备注 | 加 [备注] | 删 #编号 | 备注 #编号 <新备注>',
+	},
+	{
 		name: '新建会话',
 		desc: '在指定目录新建会话并切换',
 		purpose: '在指定目录新建一个 dsh 会话，并默认切换到它；不带参数时用卡片逐层选目录。',
@@ -119,7 +130,9 @@ export function usageText(name) {
 	// usage / usageAlt / usageAlt2 是同一份数据里的几种写法，统一渲染成"用法：A 或 B 或 C"。
 	const usages = [cmd.usage, cmd.usageAlt, cmd.usageAlt2].filter(Boolean)
 	if (usages.length > 0) lines.push(`用法：${usages.map((item) => `\`${item}\``).join(' 或 ')}`)
-	if (cmd.selection) lines.push(`用法：\`${cmd.name}\`（不带参数进入会话选择）或 \`${cmd.name} ${cmd.argHint}\``)
+	if (cmd.selection) {
+		lines.push(`用法：\`${cmd.name}\`（不带参数${cmd.selectionText ?? '进入会话选择'}）或 \`${cmd.name} ${cmd.argHint}\``)
+	}
 	return lines.join('\n')
 }
 
@@ -132,15 +145,15 @@ export function panelItems() {
  * 自定义菜单的版式（顶层顺序 + 哪些命令收进二级菜单）。
  *
  * 为什么要有这份版式：QQ 平台**顶层最多 10 项**（二级每组 ≤5），而顶层还要留给
- * dsh 内置命令的二级菜单。命令表长到 9 条时，8 个平铺顶层 + 2 个 dsh 二级菜单
- * 就是 10 项上限——再加一条会挤掉 dsh 命令。所以把不常点的
- * 「停止 / 归档 / 权限」收进一个「管理」二级菜单：顶层 6 平铺 + 1 个二级菜单 = 7，
- * 给 dsh 命令留出 3 个顶层位（实际 2 个：「dsh 命令1」「dsh 命令2」）。
+ * dsh 内置命令的二级菜单。命令表长到 10 条时，7 个平铺顶层 + 1 个「管理」二级菜单
+ * + 2 个 dsh 二级菜单正好 10 项；再多一条平铺就会把 dsh 命令挤掉。所以把不常点的
+ * 「停止 / 归档 / 权限」收进一个「管理」二级菜单。
  *
- * 只影响**自定义菜单**：指令面板（panelItems）仍是完整平铺的 9 条命令。
+ * 只影响**自定义菜单**：指令面板（panelItems）仍是完整平铺的 10 条命令。
  */
 const MENU_LAYOUT = [
 	'切换会话',
+	'快捷切换',
 	'新建会话',
 	'发送',
 	'延迟发送',
@@ -184,9 +197,10 @@ export function menuItems() {
  * deps 由 index.js 注入，全部是"动作"而不是"实现"，因此这里可以被单测直接驱动：
  *   @param {object} deps
  *   @param {object} deps.sessions  会话索引（resolveRef/describe/currentDir/listDirs/sessionsInDir）
- *   @param {object} deps.state     状态容器（绑定、待发消息）
+ *   @param {object} deps.state     状态容器（绑定、待发消息、快捷切换）
  *   @param {(req:object)=>Promise<void>} deps.reply 回一条 QQ 文本
  *   @param {(req:object)=>Promise<void>} deps.showSessionCard 发/刷新会话选择卡片
+ *   @param {(req:object)=>Promise<void>} deps.showShortcutCard 发/刷新快捷切换卡片
  *   @param {(req:object)=>Promise<void>} deps.deliver 向会话投递消息（不打断）
  *   @param {(sessionId:string)=>Promise<{ok:boolean, reason?:string}>} deps.stopSession
  *   @param {(sessionId:string)=>Promise<{ok:boolean, reason?:string}>} deps.archiveSession
@@ -211,6 +225,8 @@ export function createCommandRunner(deps) {
 		switch (parsed.name) {
 			case '切换会话':
 				return switchSession(context, parsed)
+			case '快捷切换':
+				return shortcuts(context, parsed)
 			case '新建会话':
 				return newSession(context, parsed)
 			case '进度':
@@ -342,6 +358,321 @@ export function createCommandRunner(deps) {
 			replyContext,
 		})
 		return { handled: true }
+	}
+
+	// ── 快捷切换 ────────────────────────────────────────────────────────────
+	//
+	// 三条设计约束，都来自"用户把编号/名字记在脑子里"这件事：
+	//   1. **编号只增不重用**（`state.addShortcut` 的 seq）：删掉 `#2` 不会让 `#3` 变成别的会话。
+	//   2. **备注不能含 `#`**：`#` 是编号专用前缀，掺进备注就分不清 `#3` 是编号还是名字；
+	//      同理**备注不能是纯数字**（否则 `快捷切换 3` 到底指名字还是 `#3` 说不清）。
+	//   3. **备注必须唯一**：`快捷切换 <名字>` 要能唯一定位；重名就只认编号。
+	//
+	// 目标解析顺序：`#编号`（显式）→ 备注（**最长前缀**匹配，所以备注可以带空格）
+	// → 纯数字（当编号）。`快捷切换 <目标> <剩下的都是消息>`。
+
+	const SHORTCUT_ADD = new Set(['加', '添加', '新增', 'add'])
+	const SHORTCUT_DEL = new Set(['删', '删除', '移除', 'del'])
+	const SHORTCUT_RENAME = new Set(['备注', '改名', '重命名', 'rename'])
+	const SHORTCUT_LIST = new Set(['列表', 'list'])
+
+	/** `#12` → 12；不是编号写法返回 null。 */
+	function shortcutIdOf(ref) {
+		const match = /^#(\d+)$/.exec(String(ref ?? '').trim())
+		return match ? Number(match[1]) : null
+	}
+
+	/** 按钮/回复里那条的短名字：自定义备注优先，否则用会话标题（不带给会话id）。 */
+	function shortcutLabel(item) {
+		const custom = String(item?.name ?? '').trim()
+		if (custom) return custom
+		return sessions.titleOf?.(item.sessionId) || sessions.displayId?.(item.sessionId) || String(item?.sessionId ?? '')
+	}
+
+	/** 备注的合法性（返回错误文案；空备注合法 = 用会话标题）。 */
+	function shortcutNameError(name) {
+		const value = String(name ?? '').trim()
+		if (!value) return ''
+		if (value.includes('#')) {
+			return `备注里不能有 \`#\`：\`${value}\`\n> \`#\` 是编号专用的（\`#1\`、\`#2\`…），掺进备注就分不清是编号还是名字了。`
+		}
+		if (/^\d+$/.test(value)) {
+			return `备注不能只用数字：\`${value}\`\n> 纯数字会被当成编号（\`#${value}\`），认不出到底指哪一个。`
+		}
+		return ''
+	}
+
+	/**
+	 * 解析快捷目标。
+	 *
+	 * @returns {{item:object, rest:string}|{error:'no-such-id', id:number}|null}
+	 *   null = 认不出（调用方回用法）；error = 看着像编号但没这条。
+	 */
+	function resolveShortcut(openid, tokens, { headOnly = false } = {}) {
+		const items = state.shortcutsOf(openid)
+		if (items.length === 0) return null
+		const head = String(tokens[0] ?? '')
+		const explicit = shortcutIdOf(head)
+		if (explicit !== null) {
+			const item = items.find((entry) => Number(entry.id) === explicit)
+			return item ? { item, rest: tokens.slice(1).join(' ') } : { error: 'no-such-id', id: explicit }
+		}
+		// 备注：默认按**最长前缀**匹配，这样带空格的备注也能直接写（后面的算消息）。
+		const depth = headOnly ? 1 : tokens.length
+		for (let len = depth; len >= 1; len -= 1) {
+			const name = tokens.slice(0, len).join(' ').trim()
+			if (!name) continue
+			const hit = items.find((entry) => String(entry.name ?? '').trim() === name)
+			if (hit) return { item: hit, rest: tokens.slice(len).join(' ') }
+		}
+		if (/^\d+$/.test(head)) {
+			const item = items.find((entry) => Number(entry.id) === Number(head))
+			return item ? { item, rest: tokens.slice(1).join(' ') } : { error: 'no-such-id', id: Number(head) }
+		}
+		return null
+	}
+
+	/** 从卡片点进来的动作（切换/加）做完要把卡片重发一遍，标出新的"当前"。 */
+	async function refreshShortcutCard({ openid, replyContext, fromCard }) {
+		if (!fromCard) return
+		await deps.showShortcutCard?.({ openid, replyContext })
+	}
+
+	async function shortcuts(context, parsed) {
+		const tokens = parsed.tokens
+		if (tokens.length === 0 || SHORTCUT_LIST.has(tokens[0])) {
+			await deps.showShortcutCard?.({ openid: context.openid, replyContext: context.replyContext })
+			return { handled: true }
+		}
+		const head = tokens[0]
+		if (SHORTCUT_ADD.has(head)) return addShortcut(context, tokens.slice(1).join(' ').trim())
+		if (SHORTCUT_DEL.has(head)) return dropShortcut(context, tokens.slice(1))
+		if (SHORTCUT_RENAME.has(head)) return renameShortcut(context, tokens.slice(1))
+		return goShortcut(context, parsed)
+	}
+
+	/**
+	 * `快捷切换 加 [备注]`：把**当前绑定会话**存进来。
+	 *
+	 * 同一个会话只留一条：已经在列表里就只更新备注（不会攒出两条指向同一会话）。
+	 */
+	async function addShortcut({ openid, replyContext, fromCard }, name) {
+		const bad = shortcutNameError(name)
+		if (bad) {
+			await deps.reply({ openid, content: `${bad}\n\n${usageText('快捷切换')}`, replyContext })
+			await refreshShortcutCard({ openid, replyContext, fromCard })
+			return { handled: true }
+		}
+		const sessionId = currentSessionId(openid)
+		if (!sessionId || sessionId === 'none') {
+			await deps.reply({
+				openid,
+				content:
+					'当前没有绑定会话，没法加。先 `切换会话 <会话id>`（或发 `切换会话` 选一个），' +
+					'再发 `快捷切换 加 [备注]`。',
+				markdown: true,
+				replyContext,
+			})
+			await refreshShortcutCard({ openid, replyContext, fromCard })
+			return { handled: true }
+		}
+		const session = sessions.get(sessionId)
+		if (!session || sessions.isArchived(sessionId)) {
+			await deps.reply({ openid, content: `会话 \`${sessionId}\` 不在了或已归档，加不进去。`, markdown: true, replyContext })
+			await refreshShortcutCard({ openid, replyContext, fromCard })
+			return { handled: true }
+		}
+
+		const items = state.shortcutsOf(openid)
+		if (name) {
+			const clash = items.find((entry) => entry.sessionId !== sessionId && String(entry.name ?? '').trim() === name)
+			if (clash) {
+				await deps.reply({
+					openid,
+					content: `备注 \`${name}\` 已经用在 **#${clash.id}** 上了。备注要唯一，不然按名字找不到是哪一条。`,
+					markdown: true,
+					replyContext,
+				})
+				await refreshShortcutCard({ openid, replyContext, fromCard })
+				return { handled: true }
+			}
+		}
+
+		const result = state.addShortcut(openid, { sessionId, name })
+		state.flush()
+		const item = result?.item
+		logger?.info?.('快捷切换：已加入/更新', { sessionId, id: item?.id, existed: Boolean(result?.existed) })
+		if (!item) {
+			await deps.reply({ openid, content: '加不进去（状态异常），再试一次。', markdown: true, replyContext })
+			return { handled: true }
+		}
+		const shown = `#${item.id} ${shortcutLabel(item)}`
+		await deps.reply({
+			openid,
+			content: result.existed
+				? name
+					? `这个会话已经在快捷里：**${shown}**，备注已更新。\n> 直接发 \`快捷切换 #${item.id}\` 切过去。`
+					: `这个会话已经在快捷里：**${shown}**（想改备注：\`快捷切换 备注 #${item.id} <新备注>\`）。`
+				: `已加入快捷：**${shown}**\n> 发 \`快捷切换 #${item.id}\` 直接切过去；\`快捷切换 #${item.id} <消息>\` 切过去并把消息投给 AI。`,
+			markdown: true,
+			replyContext,
+		})
+		await refreshShortcutCard({ openid, replyContext, fromCard })
+		return { handled: true }
+	}
+
+	/** `快捷切换 删 #3`（也认名字）：只删快捷条目，不动绑定，也不动会话本身。 */
+	async function dropShortcut({ openid, replyContext, fromCard }, tokens) {
+		if (tokens.length === 0) {
+			await deps.reply({ openid, content: usageText('快捷切换'), replyContext })
+			return { handled: true }
+		}
+		const resolved = resolveShortcut(openid, tokens, { headOnly: true })
+		if (!resolved || resolved.error) {
+			await deps.reply({ openid, content: shortcutMissText(openid, tokens[0]), markdown: true, replyContext })
+			await refreshShortcutCard({ openid, replyContext, fromCard })
+			return { handled: true }
+		}
+		const removed = state.removeShortcut(openid, resolved.item.id)
+		state.flush()
+		logger?.info?.('快捷切换：已删除', { id: resolved.item.id, sessionId: resolved.item.sessionId })
+		await deps.reply({
+			openid,
+			content: `已删除快捷 **#${resolved.item.id} ${shortcutLabel(resolved.item)}**（编号不补位，其它条目的编号不变）。`,
+			markdown: true,
+			replyContext,
+		})
+		await refreshShortcutCard({ openid, replyContext, fromCard })
+		return { handled: true }
+	}
+
+	/** `快捷切换 备注 #3 <新备注>`：改备注（备注留空 = 清掉，按钮上改回显示会话标题）。 */
+	async function renameShortcut({ openid, replyContext, fromCard }, tokens) {
+		if (tokens.length < 2) {
+			await deps.reply({ openid, content: usageText('快捷切换'), replyContext })
+			return { handled: true }
+		}
+		const resolved = resolveShortcut(openid, tokens, { headOnly: true })
+		if (!resolved || resolved.error) {
+			await deps.reply({ openid, content: shortcutMissText(openid, tokens[0]), markdown: true, replyContext })
+			await refreshShortcutCard({ openid, replyContext, fromCard })
+			return { handled: true }
+		}
+		const name = tokens.slice(1).join(' ').trim()
+		const bad = shortcutNameError(name)
+		if (bad) {
+			await deps.reply({ openid, content: `${bad}\n\n${usageText('快捷切换')}`, replyContext })
+			await refreshShortcutCard({ openid, replyContext, fromCard })
+			return { handled: true }
+		}
+		const clash = state
+			.shortcutsOf(openid)
+			.find((entry) => entry.id !== resolved.item.id && String(entry.name ?? '').trim() === name && name)
+		if (clash) {
+			await deps.reply({
+				openid,
+				content: `备注 \`${name}\` 已经用在 **#${clash.id}** 上了。备注要唯一，不然按名字找不到是哪一条。`,
+				markdown: true,
+				replyContext,
+			})
+			await refreshShortcutCard({ openid, replyContext, fromCard })
+			return { handled: true }
+		}
+		const updated = state.renameShortcut(openid, resolved.item.id, name)
+		state.flush()
+		await deps.reply({
+			openid,
+			content: name
+				? `快捷 **#${resolved.item.id}** 的备注已改成 \`${name}\`。`
+				: `快捷 **#${resolved.item.id}** 的备注已清掉（按钮上改回显示会话标题）。`,
+			markdown: true,
+			replyContext,
+		})
+		await refreshShortcutCard({ openid, replyContext, fromCard })
+		return { handled: true }
+	}
+
+	/**
+	 * `快捷切换 <目标> [消息]`：**直接切**到目标会话（不走会话选择卡片）；
+	 * 带了消息就顺手投给 AI（与 `发送 <会话id> <内容>` 同义：**会打断**正在跑的轮次）。
+	 */
+	async function goShortcut({ openid, replyContext, quote = '', fromCard }, parsed) {
+		const resolved = resolveShortcut(openid, parsed.tokens)
+		if (!resolved) {
+			const hasItems = state.shortcutsOf(openid).length > 0
+			await deps.reply({
+				openid,
+				content: hasItems
+					? usageText('快捷切换')
+					: `还没有快捷会话。发 \`快捷切换 加 [备注]\` 把当前会话存成 \`#1\`（也可以 \`切换会话\` 后点卡片上的「加当前会话」）。\n\n${usageText('快捷切换')}`,
+				replyContext,
+			})
+			return { handled: true }
+		}
+		if (resolved.error === 'no-such-id') {
+			await deps.reply({ openid, content: shortcutMissText(openid, `#${resolved.id}`), markdown: true, replyContext })
+			await refreshShortcutCard({ openid, replyContext, fromCard })
+			return { handled: true }
+		}
+
+		const { item, rest } = resolved
+		const tag = `**#${item.id} ${shortcutLabel(item)}**`
+		const session = sessions.get(item.sessionId)
+		if (!session) {
+			await deps.reply({
+				openid,
+				content: `快捷 ${tag} 指向的会话 \`${item.sessionId}\` 已经不在了；发 \`快捷切换 删 #${item.id}\` 清掉它。`,
+				markdown: true,
+				replyContext,
+			})
+			await refreshShortcutCard({ openid, replyContext, fromCard })
+			return { handled: true }
+		}
+		if (sessions.isArchived(item.sessionId)) {
+			await deps.reply({
+				openid,
+				content: `快捷 ${tag} 指向的会话已归档，接不进来；发 \`快捷切换 删 #${item.id}\` 清掉它。`,
+				markdown: true,
+				replyContext,
+			})
+			await refreshShortcutCard({ openid, replyContext, fromCard })
+			return { handled: true }
+		}
+
+		state.setBinding(openid, item.sessionId)
+		state.setLastCard(openid, null)
+		if (!rest) {
+			await deps.reply({
+				openid,
+				content: `已接入 **${sessions.describe(item.sessionId)}**（快捷 ${tag}）\n> 直接发消息就会进这个会话；会话在跑时会先打断。`,
+				markdown: true,
+				replyContext,
+			})
+		} else {
+			await deps.deliver({
+				sessionId: item.sessionId,
+				openid,
+				text: withQuote(rest, quote),
+				interrupt: true,
+				origin: 'qq',
+			})
+			await deps.reply({
+				openid,
+				content: `已接入 **${sessions.describe(item.sessionId)}**（快捷 ${tag}），并把这条消息投给了它（**会打断**正在跑的轮次；不想打断就用 \`延迟发送\`）。`,
+				markdown: true,
+				replyContext,
+			})
+		}
+		await refreshShortcutCard({ openid, replyContext, fromCard })
+		return { handled: true }
+	}
+
+	/** 找不到某条快捷时的文案（区分"没有这条编号"和"整个列表是空的"）。 */
+	function shortcutMissText(openid, ref) {
+		const items = state.shortcutsOf(openid)
+		if (items.length === 0) return `还没有快捷会话。发 \`快捷切换 加 [备注]\` 把当前会话存成 \`#1\`。`
+		const shown = items.map((entry) => `#${entry.id} ${shortcutLabel(entry)}`).join('、')
+		return `没找到快捷 \`${ref}\`。现有：${shown}\n> 发 \`快捷切换\` 看卡片，或 \`快捷切换 加 [备注]\` 再加一个。`
 	}
 
 	/**
