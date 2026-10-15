@@ -351,8 +351,14 @@ test('快捷：裸发=帮助（不是卡片）；`列出`/`list`/`l` 才发卡�
 	// 裸发 = 帮助（用户要求）
 	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷'))
 	assert.equal(calls.shortcutCards.length, 0, '裸发不该发卡片')
-	assert.match(calls.replies.at(-1).content, /用法：/)
-	assert.match(calls.replies.at(-1).content, /还没有快捷会话/)
+	const help = calls.replies.at(-1).content
+	assert.match(help, /^\*\*快捷\*\* —— 常用会话的快捷入口/, '开头一句话说清这是什么')
+	assert.match(help, /\*\*切过去\*\*/, '分节：切过去')
+	assert.match(help, /\*\*管条目\*\*/, '分节：管条目')
+	assert.match(help, /快捷 加 \[备注\]/)
+	assert.match(help, /英文缩写/, '英文缩写写在末尾的引用块里')
+	assert.match(help, /还没有快捷会话/, '空列表：末尾要带上"现在有几条"')
+	assert.ok(help.indexOf('还没有快捷会话') > help.indexOf('管条目'), '状态写在帮助后面（先给读法）')
 
 	// 中英文都认：列表
 	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 列出'))
@@ -517,12 +523,12 @@ test('快捷：删 / 改名 / 认不出的目标回帮助 / 认不出的编号�
 	// 列表空着时的认不出：给引导
 	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 随便什么'))
 	assert.match(calls.replies.at(-1).content, /还没有快捷会话/)
-	assert.match(calls.replies.at(-1).content, /用法/)
+	assert.match(calls.replies.at(-1).content, /切过去/, '认不出时给的是分节帮助')
 
 	// 列表非空但认不出：回帮助（带现有条目）
 	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 加 前端'))
 	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 随便什么'))
-	assert.match(calls.replies.at(-1).content, /用法/)
+	assert.match(calls.replies.at(-1).content, /切过去/)
 	assert.match(calls.replies.at(-1).content, /现有：/)
 })
 

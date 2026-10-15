@@ -18,14 +18,29 @@ export const COMMANDS = [
 	{
 		name: '快捷',
 		desc: '快捷入口：编号/备注/会话id 直达',
-		purpose:
-			'把常用会话存成**快捷入口**：每条自带一个 `#编号`（只增不重用），可以配一个**自定义备注**（备注里不能有 `#`）。' +
-			'`快捷 #2` **直接切过去**（不经过会话选择卡片，也认备注或会话id）；' +
-			'`快捷 #2 <消息>` 只把消息**投给**那个会话、**不切换**当前绑定（和 `发送 <会话id> <内容>` 一样会打断它正在跑的轮次）。' +
-			'子命令也能写英文：`加`＝`add`/`a`、`删`＝`delete`/`d`、`列出`＝`list`/`l`、`备注`＝`rename`/`r`；不带参数就是这份帮助。',
+		purpose: '把常用会话存成快捷入口（每条自带 `#编号`，可配自定义备注）。',
 		usage: '快捷 #编号 [<消息>]',
 		usageAlt: '快捷 <会话id|备注> [<消息>]',
 		usageAlt2: '快捷 加 [备注] | 删 #编号 | 备注 #编号 <新备注> | 列出',
+		// 通用排版（一段 `作用` + 一行 `用法：A 或 B 或 C`）在快捷这里读起来很乱（用户提过）：
+		// 它有三类动作、还叠着"带消息不切换"的细节，所以单独给一份**分节**的说明，
+		// 由 usageText() 原样返回（命令表仍是唯一来源）。
+		help: [
+			'**快捷** —— 常用会话的快捷入口',
+			'> 编号 / 备注 / 会话id，三种叫法都认',
+			'',
+			'**切过去**',
+			'- `快捷 #2` 直接切到 #2（不经过会话选择卡片）',
+			'- `快捷 #2 <消息>` 只把消息投给 #2，**不切换**当前会话',
+			'',
+			'**管条目**',
+			'- `快捷 加 [备注]` 把当前会话存成一条（自带 `#编号`）',
+			'- `快捷 列出` 看卡片，点按钮直接切',
+			'- `快捷 删 #2` / `快捷 备注 #2 <新备注>`',
+			'',
+			'> 英文缩写：`add`/`a`、`delete`/`d`、`list`/`l`、`rename`/`r`',
+			'> 备注不能有 `#`、不能是纯数字、不能重名；编号**只增不重用**',
+		].join('\n'),
 	},
 	{
 		name: '新建会话',
@@ -126,6 +141,8 @@ export function requiresArgs(name) {
 export function usageText(name) {
 	const cmd = BY_NAME.get(name)
 	if (!cmd) return ''
+	// 命令自己带了分节说明就原样用（快捷那种多动作命令，通用排版会挤成一团）。
+	if (cmd.help) return cmd.help
 	const lines = [`**${cmd.name}**`]
 	if (cmd.purpose) lines.push(`> 作用：${cmd.purpose}`)
 	// usage / usageAlt / usageAlt2 是同一份数据里的几种写法，统一渲染成"用法：A 或 B 或 C"。
@@ -471,11 +488,13 @@ export function createCommandRunner(deps) {
 	/** 回作用 + 用法（裸发、认不出、或需要看清楚写法时都走这里）。 */
 	async function shortcutHelp({ openid, replyContext, fromCard }) {
 		const items = state.shortcutsOf(openid)
-		const hint =
+		// 帮助在前、当前状态在后：先给读法，再告诉用户"你现在有几条"（以前提示压在最上面，
+		// 读起来像先挨一句抱怨再看说明书）。
+		const state_line =
 			items.length === 0
-				? '还没有快捷会话：`快捷 加 [备注]` 把当前会话存成 `#1`（也可以点卡片上的「加当前会话」）。'
-				: `现有：${shortcutListText(items)}\n> 发 \`快捷 列出\` 看卡片（点按钮直接切）。`
-		await deps.reply({ openid, content: `${hint}\n\n${usageText('快捷')}`, markdown: true, replyContext })
+				? '> 还没有快捷会话：发 `快捷 加 [备注]` 存第一条（也可以点卡片上的「加当前会话」）'
+				: `> 现有：${shortcutListText(items)}`
+		await deps.reply({ openid, content: `${usageText('快捷')}\n\n${state_line}`, markdown: true, replyContext })
 		await refreshShortcutCard({ openid, replyContext, fromCard })
 		return { handled: true }
 	}

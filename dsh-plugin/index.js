@@ -1209,6 +1209,32 @@ export function apply(ctx, rawConfig) {
 		if (event.kind === 'interaction') return onInteraction(event)
 	}
 
+	/**
+	 * 认不出的斜杠命令：明确回绝 + 列出这台会话真正可用的命令。
+	 *
+	 * 关键：**这一条不投给 AI**。slash 命令进模型没有任何意义，只会让模型对着一条不存在的
+	 * 命令瞎答；顺带给出"想发以 `/` 开头的话"的出路（换全角 `／`，它就不会被当命令截走）。
+	 */
+	async function unknownSlashText(agent, name) {
+		const available = await listCommands(ctx.commands, agent, logger)
+		const lines = [`没有 \`/${name}\` 这个命令，**这一条没有发给 AI**。`]
+		if (available.length > 0) {
+			lines.push(`> 这个会话可用：${available.map((cmd) => `\`/${cmd.name}\``).join('、')}`)
+		}
+		lines.push('> 桥自己的命令是中文的：`快捷`、`发送`、`延迟发送`、`进度`、`模型`…')
+		lines.push('> 真要把以 `/` 开头的话当消息发，把开头那个换成全角 `／`。')
+		return lines.join('\n')
+	}
+
+	/** 没绑定会话时的斜杠命令：同样回绝，不当普通消息。 */
+	function noSessionSlashText(name) {
+		return [
+			`当前没有绑定会话，\`/${name}\` 执行不了，**这一条没有发给 AI**。`,
+			'> 先发 `切换会话` 接一个，再用 dsh 命令；桥自己的命令（`快捷`/`发送`/`进度`…）不需要会话。',
+			'> 真要把以 `/` 开头的话当消息发，把开头那个换成全角 `／`。',
+		].join('\n')
+	}
+
 	async function onMessage(event) {
 		const openid = event.openid
 		const context = { msgId: event.msgId ?? '' }
@@ -1230,7 +1256,10 @@ export function apply(ctx, rawConfig) {
 		}
 
 		// 2) dsh 内置命令：'/xxx' 直接交给 ctx.commands.execute（不经模型），同样优先于提问捕获。
-		//    不兼容的（如 feedback）当普通消息处理。
+		//    **认不出就到这儿为止**：明确回一句"没有这个命令"，**绝不回落到普通消息** ——
+		//    用户要求"不存在的命令不要放行给 AI"（以前 `/unknown 参数` 会被当消息投进会话，
+		//    模型只好对着一条不存在的命令瞎答）。
+		//    例外只有 `feedback`（EXCLUDED_COMMANDS）：它是真命令、桥不兼容，仍按普通消息处理。
 		const slash = splitSlashLine(event.text)
 		if (slash && !EXCLUDED_COMMANDS.has(slash.name)) {
 			const bound = state.bindingOf(openid)
@@ -1257,7 +1286,12 @@ export function apply(ctx, rawConfig) {
 					}
 					return
 				}
+				await sendText({ openid, content: await unknownSlashText(agent, slash.name), markdown: true, context })
+				return
 			}
+			// 没绑定会话 / 没有活 agent：也明确回绝（不能当成普通消息扔给模型）。
+			await sendText({ openid, content: noSessionSlashText(slash.name), markdown: true, context })
+			return
 		}
 
 		// 3) 有待答提问：普通文本＝该题的「其他」答案

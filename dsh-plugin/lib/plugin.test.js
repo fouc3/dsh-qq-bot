@@ -1124,10 +1124,27 @@ test('端到端：dsh 内置命令从 QQ 直接执行（不进模型）；技能
 	assert.equal(executed.length, 1, 'feedback 不该走命令执行')
 	assert.equal(agent.followed[0].content[0].text, '/feedback 很好用')
 
-	// 认不出的斜杠命令 → 回退成普通消息
+	// 认不出的斜杠命令 → **明确回绝，绝不投给 AI**（用户要求：不存在的命令不要放行给模型）
 	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '/unknown 参数', msgId: 'M4' })
-	await waitFor(() => agent.followed.length === 2)
-	assert.equal(agent.followed[1].content[0].text, '/unknown 参数')
+	const refused = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /unknown/.test(String(c.args.content)) && /没有/.test(String(c.args.content))) ?? null
+	})
+	assert.match(String(refused.args.content), /没有发给 AI/, '要明确说"没发给 AI"')
+	assert.match(String(refused.args.content), /\/compact/, '顺手列出这个会话真的能用的命令')
+	assert.match(String(refused.args.content), /全角/, '给出"想把 / 开头的话当消息发"的出路')
+	assert.equal(agent.followed.length, 1, '认不出的斜杠命令绝不能投给 AI')
+
+	// 没绑定会话时发 dsh 命令：同样回绝，不当普通消息
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 none', msgId: 'M5' })
+	await drainFor(boot.socketPath, 60)
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '/compact', msgId: 'M6' })
+	const needBind = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /没有绑定会话/.test(String(c.args.content))) ?? null
+	})
+	assert.match(String(needBind.args.content), /没有发给 AI/)
+	assert.equal(agent.followed.length, 1, '没绑定会话时也不能把 /命令 扔给模型')
 })
 
 test('端到端：`/goal resume` 这类命令要原样透传（模型工具不许恢复 paused 目标，命令通道可以）', async (t) => {
@@ -2161,7 +2178,7 @@ test('端到端：快捷 —— 裸发是帮助、列出给卡片、点按钮直
 	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '快捷', msgId: 'M0' })
 	const help = await waitFor(async () => {
 		const list = await drainFor(boot.socketPath, 60)
-		return list.find((c) => c.kind === 'send_c2c' && /用法：/.test(String(c.args.content))) ?? null
+		return list.find((c) => c.kind === 'send_c2c' && /切过去/.test(String(c.args.content))) ?? null
 	})
 	assert.match(String(help.args.content), /还没有快捷会话/)
 	assert.equal(help.args.keyboard, undefined, '裸发只回帮助文本，不发卡片')
@@ -2263,7 +2280,7 @@ test('端到端：快捷的备注不能带 #（含 # 的备注必须被拒，列
 		const list = await drainFor(boot.socketPath, 80)
 		return list.find((c) => c.kind === 'send_c2c' && /备注里不能有/.test(String(c.args.content))) ?? null
 	})
-	assert.match(String(refused.args.content), /用法：/, '被拒时要带上用法')
+	assert.match(String(refused.args.content), /管条目/, '被拒时要带上分节帮助')
 	assert.equal(JSON.parse(readFileSync(boot.stateFile, 'utf8')).shortcuts?.U1?.items?.length ?? 0, 0)
 
 	boot.dispose()
