@@ -983,6 +983,68 @@ test('端到端：发送 / 延迟发送 / 停止 / 归档', async (t) => {
 	boot.dispose()
 })
 
+test('端到端：延迟投递必须等驱动空闲——running 时 followup 的唤醒会被吞掉（消息卡在「待发送」）', async (t) => {
+	const agent = makeAgent('session-1')
+	// 给假 agent 装上 **dsh 驱动的唤醒语义**（本 bug 的关键，不装就复现不了）：
+	//   running 且没有 abort 时，`followup` 只把消息放进 next-turn 队列、**不唤醒**
+	//   （dsh 的 wakeDriver 此时既不唤醒也不登记 wakeRequested）→ 消息就是界面上的「待发送」；
+	//   idle 时 `followup` 立刻开新一轮。
+	// 真实 dsh 里"驱动退休"排在 `turn/end` 事件之后（微任务序），所以处理器里发出的
+	// followup 一定会撞上 running —— 这正是线上卡住的画面。
+	const queue = []
+	let turnSeq = 0
+	agent.startedTurns = []
+	agent.pendingQueue = queue
+	const startTurn = () => {
+		turnSeq += 1
+		agent.startedTurns.push(turnSeq)
+		agent.status = 'running'
+		queue.shift() // 驱动把队列里最前面的那条捡走
+		agent.handlers['session/event'](null, { type: 'turn/start', data: { turn: turnSeq } })
+	}
+	agent.followup = (message) => {
+		agent.followed.push(message)
+		queue.push(message)
+		if (agent.status === 'idle') startTurn()
+	}
+	agent.retire = (reason = 'completed') => {
+		agent.status = 'idle'
+		agent.settleIdle(reason, turnSeq)
+	}
+
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': agent } })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', {
+		openids: [{ openid: 'U1' }],
+		panel: { enabled: true, users: ['U1'] },
+		menu: { enabled: true },
+	})
+
+	// 1) 普通发送：驱动开起第 1 轮
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '发送 session-1 帮我看下', msgId: 'M1' })
+	await waitFor(() => agent.startedTurns.length === 1)
+	assert.equal(agent.status, 'running', '这一轮在跑')
+
+	// 2) 登记一条延迟消息（先不投递）
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '延迟发送 session-1 打完了叫我', msgId: 'M2' })
+	await waitFor(async () => (await pumpQueue(boot.socketPath)).some((c) => /已登记/.test(String(c.args.content))))
+	assert.equal(agent.followed.length, 1, '延迟发送不该立即投递')
+
+	// 3) 这一轮正常结束：**turn/end 先到，驱动还没退休**（线上就是这个时序）
+	agent.handlers['session/event'](null, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+	// 驱动紧接着退休（排在插件那条投递链之后）
+	queueMicrotask(() => agent.retire('completed'))
+
+	// 4) 延迟消息必须**真的开出一轮**，而不是躺在「待发送」队列里
+	await waitFor(() => agent.startedTurns.length === 2)
+	assert.deepEqual(agent.startedTurns, [1, 2], '延迟消息应当自己开一轮')
+	assert.equal(queue.length, 0, '不能留在「待发送」队列里')
+	assert.equal(agent.followed.at(-1).content[0].text, '打完了叫我')
+	assert.equal(agent.followed.at(-1).source.kind, HUMAN_SOURCE.kind, '延迟投递也是"用户在 QQ 里打的字"')
+
+	boot.dispose()
+})
+
 test('端到端：token 握手与 health 诊断', async (t) => {
 	const boot = bootPlugin(t, { sessions: SUMMARIES, token: 's3cret' })
 	await waitFor(() => existsSync(boot.socketPath))

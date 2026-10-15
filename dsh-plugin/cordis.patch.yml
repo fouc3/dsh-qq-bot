@@ -47,6 +47,9 @@
         replyAckTimeoutMs: 8000
         # 结束通知的兜底：turn/end 没到也在此毫秒数后补发一次（按 会话+轮次 去重）。
         noticeFallbackMs: 3000
+        # 延迟发送在"这一轮刚结束"时把消息交出去，那一刻驱动还在收尾；直接 followup 会被
+        # dsh 吞掉唤醒（消息卡在「待发送」）。所以先等它真的空闲，最多等这么多毫秒。
+        idleWaitMs: 5000
         # 会话选择卡片每页最多列几个会话。
         sessionPageSize: 8
 

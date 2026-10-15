@@ -10,9 +10,12 @@ const CONFIG = {
 	defaultMarkdown: true,
 	needReplyText: '请把结果回复给用户。',
 	needReplyAckText: '已触发，正在请求回复…',
+	// 延迟投递前要等驱动空闲：测试里把等待窗口压到很小，别让用例卡 5 秒。
+	idleWaitMs: 200,
+	runningPollMs: 5,
 }
 
-function setup({ seed = { bindings: { U1: 'session-1' } }, agent = null } = {}) {
+function setup({ seed = { bindings: { U1: 'session-1' } }, agent = null, onDeliver = null } = {}) {
 	const enqueued = []
 	const delivered = []
 	const outbox = {
@@ -36,7 +39,7 @@ function setup({ seed = { bindings: { U1: 'session-1' } }, agent = null } = {}) 
 		userMessage: (text) => ({ text }),
 		contextMessage: (text) => ({ injected: text }),
 		agentFor: async (sessionId) => (sessionId === 'session-1' ? stubAgent : null),
-		onDeliver: async (req) => delivered.push(req),
+		onDeliver: onDeliver ?? (async (req) => delivered.push(req)),
 	})
 	rounds.attachAgent(stubAgent, 'session-1')
 	return { rounds, state, enqueued, delivered, agent: stubAgent }
@@ -180,6 +183,83 @@ test('延迟发送：只在"正常结束"时投递；被停止/出错不投递',
 	assert.equal(delivered.length, 1)
 	assert.equal(delivered[0].text, '打完了叫我')
 	assert.equal(state.delayedOf('session-1'), null, '投递后应清槽')
+})
+
+test('延迟发送：驱动还没退休就不投递（否则消息卡在 dsh 的「待发送」队列里）', async () => {
+	// 线上时序：finishRound 是在 `turn/end` 处理器里同步跑的，此刻驱动**还是 running**
+	// （它紧接着才退休）。这时候 followup，dsh 的 wakeDriver 会把唤醒直接丢掉 →
+	// 消息永远"待发送"。所以必须先等它空下来。
+	const agent = makeStubAgent()
+	agent.status = 'running'
+	let settleIdle = null
+	agent.whenIdle = () =>
+		new Promise((resolve) => {
+			settleIdle = resolve
+		})
+	const { rounds, state, delivered } = setup({ agent })
+	state.setDelayed('session-1', { content: '打完了叫我', openid: 'U1', at: 'now' })
+
+	rounds.beginRound({ sessionId: 'session-1', openid: 'U1', origin: 'qq' })
+	sessionEvent(agent, { type: 'turn/start', data: { turn: 5 } })
+	sessionEvent(agent, { type: 'turn/end', data: { turn: 5, reason: { kind: 'completed' } } })
+	await tick()
+	assert.equal(delivered.length, 0, '驱动还在 running：必须先等它空下来再投')
+	assert.ok(state.delayedOf('session-1'), '还没交出去之前，待发消息要留在槽里（别丢了）')
+
+	agent.status = 'idle'
+	settleIdle?.()
+	await tick()
+	assert.equal(delivered.length, 1, '驱动退休后按普通投递交出去')
+	assert.equal(delivered[0].text, '打完了叫我')
+	assert.equal(delivered[0].origin, 'delayed')
+	assert.equal(state.delayedOf('session-1'), null, '交出去之后才清槽')
+})
+
+test('延迟投递出去的那一轮也算 QQ 一轮：有每轮上下文注入 + 结束通知', async () => {
+	const { rounds, enqueued, agent } = setup()
+	const round = rounds.beginRound({ sessionId: 'session-1', openid: 'U1', origin: 'delayed' })
+	round.pendingContext = '这是 QQ 私信拉起的这一轮'
+
+	// 每轮上下文注入（以前 origin!=='qq' 会被挡掉：模型压根不知道要回 QQ）
+	const preStep = agent.handlers['agent/pre-step']
+	const decision = await preStep({ turn: 8, signal: { aborted: false } }, async () => ({
+		kind: 'enter',
+		messages: [{ text: '原有消息' }],
+	}))
+	assert.equal(decision.messages.length, 2, '延迟轮次也要注入 QQ 上下文')
+	assert.equal(decision.messages[1].injected, '这是 QQ 私信拉起的这一轮')
+
+	// 结束通知（以前 origin!=='qq' 会被跳过：用户等半天看不到结果）
+	sessionEvent(agent, { type: 'turn/start', data: { turn: 8 } })
+	sessionEvent(agent, { type: 'turn/end', data: { turn: 8, reason: { kind: 'completed' } } })
+	await tick()
+	const notice = enqueued.find((e) => e.kind === 'send_c2c' && String(e.args.content).includes('已结束'))
+	assert.ok(notice, '延迟投递的那一轮结束也要发「已结束」')
+	assert.equal(notice.args.openid, 'U1')
+})
+
+test('收尾时不能把"紧随其后新建的延迟轮次"一起删掉', async () => {
+	// 收尾（finishRound）里面会立刻投出延迟消息 → 投递方随后建出一个**新的轮次**
+	// （index.js 的 deliver 会 beginRound origin=delayed）；老代码收尾最后无脑
+	// `rounds.delete(sessionId)`，正好把这个新轮次删了 —— 于是那一轮拿不到每轮上下文
+	// 注入、结束通知也丢（线上实测）。
+	let roundsRef = null
+	const delivered = []
+	const built = setup({
+		onDeliver: async (req) => {
+			delivered.push(req)
+			// 模拟 index.js 的 deliver：用普通投递那条路建出新轮次
+			roundsRef.beginRound({ sessionId: req.sessionId, openid: req.openid, origin: req.origin })
+		},
+	})
+	roundsRef = built.rounds
+	built.state.setDelayed('session-1', { content: '打完了叫我', openid: 'U1', at: 'now' })
+
+	built.rounds.beginRound({ sessionId: 'session-1', openid: 'U1', origin: 'qq' })
+	await built.rounds.finishRound('session-1', { reason: 'completed', turn: 4, from: 'test' })
+
+	assert.equal(delivered.length, 1, '延迟消息应已交出')
+	assert.equal(built.rounds.roundOf('session-1')?.origin, 'delayed', '新轮次必须还在跟踪表里')
 })
 
 test('延迟发送：输入态登记的图片/分节也要一起投出去', async () => {

@@ -32,6 +32,18 @@ export const INTERACTION_CODES = {
 	adminOnly: 5,
 }
 
+/**
+ * 这一轮是不是 **QQ 用户发起**的：直接投递的（`qq`）或延迟投递的（`delayed`）。
+ *
+ * 延迟投递就是"用户那条消息，只是等这一轮正常结束才交出去"，所以它和直接投递一样得
+ * ①注入 QQ 上下文（否则模型不知道这条来自 QQ、不知道该用 `qq_reply` 回话）
+ * ②发结束/被打断通知（否则用户看不到结果）。
+ * 只有 `origin` 用于区分"什么时候投的"（日志、排查），不该用它区分"算不算 QQ 的一轮"。
+ */
+function fromQqUser(round) {
+	return round?.origin === 'qq' || round?.origin === 'delayed'
+}
+
 export function createRounds({
 	state,
 	sessions,
@@ -205,8 +217,8 @@ export function createRounds({
 
 	/** 发一条结束/被打断通知（按 会话+轮次 去重）。 */
 	function enqueueNotice(round, { interrupted = false, source = '' } = {}) {
-		if (!round || round.origin !== 'qq' || !round.openid) {
-			journal(`通知跳过：来源不是 QQ 或没 openid（${round?.sessionId ?? '?'}）`)
+		if (!round || !fromQqUser(round) || !round.openid) {
+			journal(`通知跳过：不是 QQ 用户发起的一轮或没 openid（${round?.sessionId ?? '?'}）`)
 			return
 		}
 		const key = `${round.sessionId}:${round.turn ?? round.startedAt}`
@@ -263,7 +275,7 @@ export function createRounds({
 
 	function pendingInjectText(sessionId) {
 		const round = currentRound(sessionId)
-		if (!round || round.origin !== 'qq') return null
+		if (!fromQqUser(round)) return null
 		return round.pendingContext ?? null
 	}
 
@@ -292,7 +304,7 @@ export function createRounds({
 				const decision = await next()
 				if (decision?.kind === 'reject' || payload?.signal?.aborted) return decision
 				const round = currentRound(sessionId)
-				if (!round || round.origin !== 'qq') return decision
+				if (!fromQqUser(round)) return decision
 				if (round.contextTurn === payload.turn) return decision
 				const text = round.pendingContext
 				if (!text) return decision
@@ -406,6 +418,45 @@ export function createRounds({
 		}
 	}
 
+	/**
+	 * 等 agent **真的空闲**（驱动退休）—— 延迟投递前必须过这一关。
+	 *
+	 * 为什么（2026-10-16 线上实测，session-3bebee33）：
+	 * 延迟投递是在 `turn/end` 的处理器里**同步**触发的，那一刻 dsh 的驱动**还活着**
+	 * （`phase.kind === 'running'`，它紧接着才 `setPhase(idle)`）。而 dsh 的 `wakeDriver`
+	 * 在 running 且没有 abort 时**既不唤醒、也不登记唤醒**（`wakeRequested` 不置位），
+	 * 于是 `followup` 交出去的消息会一直躺在 dsh 界面的「待发送」队列里：
+	 *
+	 *     turn 46 completed → followup（进 next-turn）→ 驱动随即退休，再没人唤醒它
+	 *     → 消息一直"待发送" → 25 秒后被用户取消；直到又发一条普通消息才被顺带捡走。
+	 *
+	 * 普通发送不踩这个空档：它是从网关 socket 事件进来的，那时驱动早就空闲了。
+	 * 所以这里先等它空下来，再走**和普通发送完全一样**的那条路（`onDeliver` → `deliver`）。
+	 *
+	 * 等不到（有别的轮次在跑）也照样投：那时 `followup` 会进 next-turn 队列，由那一轮
+	 * 收尾时捡走 —— 和用户手打一条消息落在待发送队列里的效果一样，不会丢。
+	 *
+	 * @returns {Promise<boolean>} 交出去之前驱动是不是已经空闲。
+	 */
+	async function waitForIdle(sessionId) {
+		const agent = await agentFor(sessionId)
+		if (!agent || agent.status !== 'running') return true
+		const limit = Math.max(50, Number(config.idleWaitMs) || 5000)
+		const startedAt = Date.now()
+		if (typeof agent.whenIdle === 'function') {
+			try {
+				// whenIdle 在驱动退休后才 settle；外面套超时，兜住"又有别的轮次在跑"。
+				await Promise.race([agent.whenIdle(), sleep(limit)])
+			} catch {
+				// 拿不到 whenIdle（被取消/抛错）：退回下面的轮询
+			}
+		}
+		const pollMs = Math.max(5, Number(config.runningPollMs) || 500)
+		const deadline = startedAt + limit
+		while (agent.status === 'running' && Date.now() < deadline) await sleep(pollMs)
+		return agent.status !== 'running'
+	}
+
 	/** 收尾：发结束通知（必要时）+ 投递延迟消息（仅正常结束）。 */
 	async function finishRound(sessionId, { reason, turn, from = '' } = {}) {
 		const round = currentRound(sessionId)
@@ -422,32 +473,46 @@ export function createRounds({
 				`origin=${round.origin} superseded=${round.superseded} stopped=${round.stopped} openid=${round.openid ? '有' : '无'}`,
 		)
 
-		if (round.origin === 'qq' && !round.superseded && !round.stopped && round.openid) {
+		if (fromQqUser(round) && !round.superseded && !round.stopped && round.openid) {
 			// 只有 reason=completed 才是「正常结束」；aborted/blocked/error 都算被打断。
 			enqueueNotice(round, { interrupted: reason !== 'completed' })
 		} else {
-			journal('通知不发：轮次不是 QQ 来源／已被顶替／已被停止（按设计）')
+			journal('通知不发：轮次不是 QQ 用户发起的／已被顶替／已被停止（按设计）')
 		}
 
 		// 延迟发送只在"AI 正常结束这一轮"时投递：被停止/被顶替/出错的轮不算。
 		if (reason === 'completed') {
-			const delayed = state.takeDelayed(sessionId)
+			// 正常结束就把状态立刻落地（通知去重表 notices、待发槽都在里面），别等 debounce。
+			const pending = state.delayedOf(sessionId)
 			state.flush()
-			if (delayed) {
-				logger?.info?.('投递延迟消息', { sessionId, from: delayed.openid, items: delayed.itemCount ?? 0 })
-				await onDeliver({
-					sessionId,
-					openid: delayed.openid,
-					text: delayed.content,
-					origin: 'delayed',
-					// 输入态登记的延迟消息可能带图片与附件/语音分节：一起带过去。
-					images: delayed.images ?? [],
-					sections: delayed.sections ?? [],
-				})
+			if (pending) {
+				// 先等驱动真的退休（见 waitForIdle），再把它拿走、用普通投递那条路交出去。
+				const idle = await waitForIdle(sessionId)
+				const delayed = state.takeDelayed(sessionId)
+				state.flush()
+				if (delayed) {
+					journal(
+						`延迟投递：${idle ? '驱动已空闲' : '等空闲超时（驱动还在跑）'}，` +
+							`按普通投递交给 AI（${sessionId.slice(-8)}）`,
+					)
+					logger?.info?.('投递延迟消息', { sessionId, from: delayed.openid, items: delayed.itemCount ?? 0 })
+					await onDeliver({
+						sessionId,
+						openid: delayed.openid,
+						text: delayed.content,
+						origin: 'delayed',
+						// 输入态登记的延迟消息可能带图片与附件/语音分节：一起带过去。
+						images: delayed.images ?? [],
+						sections: delayed.sections ?? [],
+					})
+				}
 			}
 		}
 
-		rounds.delete(sessionId)
+		// 只清掉"我这一轮"：延迟投递会在上面**紧接着建一个新轮次**（origin=delayed）并放进
+		// 同一张表，无脑 delete 会把那个新轮次一起删掉 —— 那样它就拿不到每轮上下文注入
+		// （模型不知道要回 QQ），结束通知也会跟着丢（线上实测就是这个现象）。
+		if (rounds.get(sessionId) === round) rounds.delete(sessionId)
 	}
 
 	/**

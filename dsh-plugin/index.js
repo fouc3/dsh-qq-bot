@@ -962,6 +962,9 @@ export function apply(ctx, rawConfig) {
 		nextSeqFor: (sessionId) => nextSeq(`session:${sessionId}`),
 		// 「已结束」卡片上的「发送消息」：填 `发送 <会话id>` → 进该会话的输入态。
 		sendCommand: (sessionId) => `发送 ${sessionId}`,
+		// 延迟投递：**和普通发送走同一条路**（`deliver` → `followup`），区别只有 `interrupt:false`
+		// （不打断）—— 而且 rounds 会先等驱动真的空闲再调这里（见 rounds.waitForIdle：
+		// 在 `turn/end` 处理器里直接 followup 会被驱动收尾窗口吞掉唤醒，消息卡在「待发送」）。
 		onDeliver: async ({ sessionId, openid, text, origin, images = [], sections = [] }) => {
 			await deliver({ sessionId, openid, text, interrupt: false, origin: origin ?? 'delayed', context: {}, images, sections })
 		},
