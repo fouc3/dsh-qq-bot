@@ -29,6 +29,7 @@ import { ATTACHMENT_TOOL_NAME, buildAttachmentTool } from './lib/attachment-tool
 import { DEFAULT_MAX_ATTACHMENT_BYTES, DEFAULT_MAX_FETCH_BYTES, createInbox, formatBytes } from './lib/inbox.js'
 import { createPermissions } from './lib/permissions.js'
 import { createModels, splitOnce } from './lib/models.js'
+import { createSessionStats } from './lib/session-stats.js'
 import {
 	QUESTION_MAX_BUTTONS,
 	buildInboxCard,
@@ -180,6 +181,8 @@ export function apply(ctx, rawConfig) {
 	const permissions = createPermissions({ ctx, logger })
 	// 模型目录与切换（就是 Web 里那个模型选择器）：可选服务，见 lib/models.js。
 	const models = createModels({ ctx, logger })
+	// 会话统计（Web 会话底部那块）：读 dsh 的四个会话投影，见 lib/session-stats.js。
+	const sessionStats = createSessionStats({ ctx, logger })
 
 	// ── 会话级序号：被动回复按 msg_id+msg_seq 去重，所以每条消息都要递增 ──────
 	const seqByKey = new Map()
@@ -1138,16 +1141,18 @@ export function apply(ctx, rawConfig) {
 		setModel: ({ openid, sessionId, spec }) => setModelForSession({ openid, sessionId, spec }),
 		// 裸发 `发送` 进入输入态（详细设计见 lib/inbox.js 顶部注释）。
 		beginInput: ({ openid, sessionId, replyContext, mode }) => beginInput({ openid, sessionId, replyContext, mode }),
-		// 「状态」是**只读**的：只用 agents.get（**不 resume、不 cancel**）+ 两条 durable 投影
-		// （模型 `model/selection`、权限 `permissions`）；没有活 agent 也照样给模型与权限，
+		// 「状态」是**只读**的：只用 agents.get（**不 resume、不 cancel**）+ dsh 登记的会话投影
+		// （模型 `model/selection`、权限 `permissions`、统计 `sessionStats`/`tokenUsage`/
+		// `contextBreakdown`/`contextPressure`）；没有活 agent 也照样给模型、权限与统计，
 		// 只把"跑起来"那段状态写清楚。
 		progress: async ({ sessionId }) => {
 			const label = sessions.get(sessionId) ? sessions.label(sessionId) : sessionId
 			const agent = ctx.agents.get(sessionId)
 			const model = await models.current(sessionId)
 			const permission = permissions.nameOf(await permissions.currentForId(sessionId))
+			const stats = await sessionStats.read(sessionId)
 			const snapshot = agent ? snapshotProgress(agent) : null
-			return { content: renderProgress({ label, snapshot, sessionId, model, permission }) }
+			return { content: renderProgress({ label, snapshot, sessionId, model, permission, stats }) }
 		},
 		deliver: ({ sessionId, openid, text, interrupt }) =>
 			deliver({ sessionId, openid, text, interrupt, origin: 'qq', context: {} }),

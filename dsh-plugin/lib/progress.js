@@ -218,7 +218,9 @@ function stepDistanceTag(step, snapshot) {
  * 渲染成 QQ 可用的 markdown（只用标题/引用/列表，绝不用表格）。
  *
  * 用户要求（2026-10-16）：标题从「进度快照」改成「**状态**」（命令也从 `进度` 改成 `状态`），
- * 抬头**带上这个会话用的是哪个模型、当前权限**，并**去掉原来的「说明：只读查询…」那一行**。
+ * 抬头**带上这个会话用的是哪个模型、当前权限**，并**去掉原来的「说明：只读查询…」那一行**；
+ * 再把 dsh web 会话底部那块「统计」搬进来（见 `statsLines`），位置放在抬头之后
+ * （都是短数字，凑成一眼能看完的概览；长的动作/输出 excerpts 留在后面）。
  *
  * @param {object} input
  * @param {string} input.label 会话显示名（标题(会话id)）
@@ -226,8 +228,16 @@ function stepDistanceTag(step, snapshot) {
  * @param {object|null} [input.snapshot] `snapshotProgress(agent)` 的结果；**没有活 agent 时传 null**
  * @param {{provider:string, model:string}|null} [input.model] 会话当前模型（读不到就 null）
  * @param {string} [input.permission] 会话当前权限的显示名（读不到就空串）
+ * @param {object|null} [input.stats] `createSessionStats().read()` 的结果（四个投影，缺就是 null）
  */
-export function renderProgress({ label, snapshot = null, sessionId, model = null, permission = '' }) {
+export function renderProgress({
+	label,
+	snapshot = null,
+	sessionId,
+	model = null,
+	permission = '',
+	stats = null,
+}) {
 	// 「几秒前」按**采样时刻**算，而不是渲染时刻：渲染可能晚很多，口径要一致。
 	const takenAt = Number.isFinite(snapshot?.takenAt) ? snapshot.takenAt : Date.now()
 	const lines = [
@@ -236,6 +246,7 @@ export function renderProgress({ label, snapshot = null, sessionId, model = null
 		`> 模型：${model?.provider && model?.model ? `${model.provider} / ${model.model}` : '（读不到）'}`,
 		`> 权限：${permission || '（读不到）'}`,
 		`> 状态：${describeStatus(snapshot)}`,
+		...statsLines(stats),
 	]
 	if (!snapshot) {
 		lines.push('', '（这个会话现在没有活着的 agent，下面是空的；发一条消息就能让它跑起来。）')
@@ -275,4 +286,132 @@ function describeStatus(snapshot) {
 	}
 	if (snapshot.status === 'running') return 'agent 标记为运行中，但没读到当前轮次'
 	return '空闲（没在跑，下面是最近一轮的情况）'
+}
+
+// ── 「统计」一节：把 dsh web 会话底部那块统计搬进 QQ（用户要求） ──────────────
+//
+// 数据来自四个会话投影（见 lib/session-stats.js）：`sessionStats`（用时/TTFT/TPS）、
+// `tokenUsage`（Token 用量与缓存）、`contextBreakdown`（上下文构成）、
+// `contextPressure`（上下文窗口占用）。**缺哪块就少哪行**：四块全缺就不出这一节
+// （读不到没必要占位），单个字段为 0 也省略（省得满屏 0）。
+
+/** 毫秒 → 人话时长：≥1 小时写「N 小时 M 分」，否则「M 分 S 秒」/「S 秒」。 */
+function formatDuration(ms) {
+	if (!Number.isFinite(ms) || ms <= 0) return '0 秒'
+	const total = Math.round(ms / 1000)
+	const hours = Math.floor(total / 3600)
+	const minutes = Math.floor((total % 3600) / 60)
+	const seconds = total % 60
+	if (hours > 0) return `${hours} 小时 ${minutes} 分`
+	if (minutes > 0) return `${minutes} 分 ${seconds} 秒`
+	return `${seconds} 秒`
+}
+
+/** 毫秒 → 「8.6 秒」（首 token 平均用）。 */
+function formatSeconds(ms) {
+	if (!Number.isFinite(ms) || ms <= 0) return ''
+	const seconds = ms / 1000
+	return `${seconds >= 100 ? Math.round(seconds) : Number(seconds.toFixed(1))} 秒`
+}
+
+/** 去掉小数点后多余的 0（`369.0K` → `369K`，`1.00M` → `1M`）。 */
+function trimZero(text) {
+	return text.replace(/\.?0+$/, '')
+}
+
+/**
+ * token 数 → 紧凑写法（电话上看数字更友好）：
+ * `929074071` → `929.07M`、`10314436` → `10.31M`、`4500` → `4.5K`。
+ * 精确值在 dsh web 的统计面板里。
+ */
+function formatTokens(count) {
+	const value = Number(count)
+	if (!Number.isFinite(value) || value < 0) return ''
+	if (value >= 1e9) return `${trimZero((value / 1e9).toFixed(2))}B`
+	if (value >= 1e6) return `${trimZero((value / 1e6).toFixed(2))}M`
+	if (value >= 1e3) return `${trimZero((value / 1e3).toFixed(1))}K`
+	return String(Math.round(value))
+}
+
+/** tok/s：输出 token ÷ 解码耗时。 */
+function formatTps(tokens, ms) {
+	if (!Number.isFinite(tokens) || tokens <= 0) return ''
+	if (!Number.isFinite(ms) || ms <= 0) return ''
+	return `${Math.round(tokens / (ms / 1000))} tok/s`
+}
+
+/** 是不是一个"有意义的正数"（0／null／NaN 都不算）。 */
+function positive(value) {
+	return Number.isFinite(value) && value > 0
+}
+
+/**
+ * 「统计」一节的行（含前面的空行与 `**统计**` 标题）；没有任何数据时返回空数组。
+ * @param {object|null} stats `createSessionStats().read()` 的结果
+ * @returns {string[]}
+ */
+function statsLines(stats) {
+	if (!stats) return []
+	const s = stats.sessionStats ?? null
+	const usage = stats.tokenUsage ?? null
+	const breakdown = stats.contextBreakdown ?? null
+	const pressure = stats.contextPressure ?? null
+	const rows = []
+	const push = (parts) => {
+		const text = parts.filter(Boolean).join(' ｜ ')
+		if (text) rows.push(`> ${text}`)
+	}
+
+	// 1) 用时：模型用时（llmMs）/ 工具调用用时（toolMs）
+	push([
+		positive(s?.llmMs) ? `模型用时 ${formatDuration(s.llmMs)}` : '',
+		positive(s?.toolMs) ? `工具调用 ${formatDuration(s.toolMs)}` : '',
+	])
+
+	// 2) 速度：首 token 平均（ttftMs/ttftSteps）/ 输出速度（decodeTokens/decodeMs）
+	const ttft = positive(s?.ttftMs) && positive(s?.ttftSteps) ? formatSeconds(s.ttftMs / s.ttftSteps) : ''
+	const tps = formatTps(s?.decodeTokens, s?.decodeMs)
+	push([ttft ? `首 token 平均 ${ttft}` : '', tps ? `输出速度 ${tps}` : ''])
+
+	// 3) Token 用量（未缓存输入 + 缓存读取 + 缓存写入 + 输出）与缓存命中率
+	if (usage) {
+		const uncached = Number(usage.uncachedInputTokens) || 0
+		const cacheRead = Number(usage.cacheReadTokens) || 0
+		const cacheWrite = Number(usage.cacheWriteTokens) || 0
+		const output = Number(usage.outputTokens) || 0
+		const input = uncached + cacheRead + cacheWrite
+		const total = input + output
+		const hit = input > 0 ? Math.round((cacheRead / input) * 100) : null
+		push([
+			positive(total) ? `Token 用量 ${formatTokens(total)}` : '',
+			hit === null ? '' : `缓存命中 ${hit}%`,
+		])
+		push([
+			positive(uncached) ? `未缓存输入 ${formatTokens(uncached)}` : '',
+			positive(cacheRead) ? `缓存读取 ${formatTokens(cacheRead)}` : '',
+			positive(cacheWrite) ? `缓存写入 ${formatTokens(cacheWrite)}` : '',
+			positive(output) ? `输出 ${formatTokens(output)}` : '',
+		])
+	}
+
+	// 4) 上下文已用（占用 ÷ 模型窗口）与构成
+	const window = Number(pressure?.contextWindow) || 0
+	const usedRaw = Number(pressure?.projectedTokens ?? pressure?.pressureTokens)
+	if (positive(window) && Number.isFinite(usedRaw) && usedRaw >= 0) {
+		push([`上下文已用 ${Math.round((usedRaw / window) * 100)}%（~${formatTokens(usedRaw)} / ${formatTokens(window)}）`])
+	} else if (positive(window) && breakdown) {
+		const used =
+			(Number(breakdown.systemTokens) || 0) + (Number(breakdown.toolsTokens) || 0) + (Number(breakdown.messageTokens) || 0)
+		if (positive(used)) push([`上下文已用 ${Math.round((used / window) * 100)}%（~${formatTokens(used)} / ${formatTokens(window)}）`])
+	}
+	if (breakdown) {
+		push([
+			positive(breakdown.systemTokens) ? `系统提示词 ${formatTokens(breakdown.systemTokens)}` : '',
+			positive(breakdown.toolsTokens) ? `工具定义 ${formatTokens(breakdown.toolsTokens)}` : '',
+			positive(breakdown.messageTokens) ? `对话消息 ${formatTokens(breakdown.messageTokens)}` : '',
+		])
+	}
+
+	if (rows.length === 0) return []
+	return ['', '**统计**', ...rows]
 }

@@ -151,6 +151,9 @@ function makeCtx({ sessionSummaries = [], live = {}, commands = null } = {}) {
 			// 模型：与 dsh 的 SessionController 同形（modelCatalog / selectModel / projections）。
 			selectedModels: [],
 			modelSelection: {},
+			// 统计投影（sessionStats/tokenUsage/contextBreakdown/contextPressure）：
+			// 默认 null = 这个部署没装统计插件 → `状态` 卡片就不出「统计」一节。
+			stats: null,
 			async modelCatalog() {
 				return {
 					default: { provider: 'deepseek', model: 'deepseek-chat' },
@@ -186,12 +189,14 @@ function makeCtx({ sessionSummaries = [], live = {}, commands = null } = {}) {
 				const value = ctx.sessionController.modelSelection[sessionId]
 				// 真实 dsh 里 `sessionController.projections()` 返回**所有**登记的会话投影视图：
 				// `model/selection` 来自模型选择，`permissions` 来自 permissionPresets
-				// （它的 wire view 就是 `{ currentValue: <预设> }`）。`状态` 卡片两条都读。
+				// （它的 wire view 就是 `{ currentValue: <预设> }`），四个统计视图来自
+				// dsh-session-stats / dsh-token-meter。`状态` 卡片把这些都读出来。
 				return {
 					asOfSeq: 1,
 					values: {
 						...(value ? { 'model/selection': { lastUsed: value, pending: null } } : {}),
 						permissions: { currentValue: ctx.permissionPresets.currentValue },
+						...(ctx.sessionController.stats ?? {}),
 					},
 				}
 			},
@@ -1991,6 +1996,40 @@ test('端到端：`状态` —— 抬头给会话/模型/权限，去掉"只读�
 	assert.doesNotMatch(text, /说明：/, '用户要求去掉"只读查询"那段说明')
 	assert.match(text, /> 状态：/, '保留跑没在跑那行')
 	assert.equal(card.args.keyboard, undefined, '状态是纯文本，不带键盘')
+	assert.doesNotMatch(text, /统计/, '这个部署没有统计投影 → 不出「统计」一节')
+
+	// 装上统计投影（dsh-session-stats + dsh-token-meter 那四个）→ 卡片多一节「统计」，
+	// 数字用用户贴来的那一份钉住换算。
+	boot.ctx.sessionController.stats = {
+		sessionStats: {
+			turns: 7,
+			steps: 98,
+			llmMs: 35_248_000,
+			toolMs: 3_792_000,
+			ttftMs: 4_300_000,
+			ttftSteps: 500,
+			decodeMs: 1_000_000,
+			decodeTokens: 191_000,
+		},
+		tokenUsage: {
+			uncachedInputTokens: 10_314_436,
+			cacheReadTokens: 916_849_920,
+			cacheWriteTokens: 0,
+			outputTokens: 1_909_715,
+		},
+		contextBreakdown: { systemTokens: 4500, toolsTokens: 19_900, messageTokens: 369_000 },
+		contextPressure: { contextWindow: 1_000_000, pressureTokens: 500_000, projectedTokens: 540_000 },
+	}
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '状态', msgId: 'M2B' })
+	const withStats = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 60)
+		return list.filter((c) => c.kind === 'send_c2c' && /^\*\*状态\*\*/m.test(String(c.args.content))).at(-1) ?? null
+	})
+	const statsText = String(withStats.args.content)
+	assert.match(statsText, /> 模型用时 9 小时 47 分 ｜ 工具调用 1 小时 3 分/)
+	assert.match(statsText, /> Token 用量 929\.07M ｜ 缓存命中 99%/)
+	assert.match(statsText, /> 上下文已用 54%（~540K \/ 1M）/)
+	assert.match(statsText, /> 系统提示词 4\.5K ｜ 工具定义 19\.9K ｜ 对话消息 369K/)
 
 	// 旧名 `进度` 仍然认（别名 → 状态），不能因为改名就被当成普通消息投给 AI
 	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '进度', msgId: 'M3' })

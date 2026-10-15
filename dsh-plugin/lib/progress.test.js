@@ -284,6 +284,104 @@ test('renderProgress：没有活 agent（snapshot=null）也照样给会话/模�
 	assert.match(partial, /> 模型：（读不到）/)
 })
 
+// 用户要求（2026-10-16）：把 dsh web 会话底部那块「统计」也搬进 QQ。
+// 这里的数字就用用户贴过来的那一份（587分28秒 / 63分12秒 / 8.6秒 / 191 tok/s /
+// 929,074,071 / 99% / 10,314,436 / 916,849,920 / 1,909,715 / 54% ~540K / 1M /
+// 4.5K / 19.9K / 369K），钉住换算与排版。
+test('renderProgress：统计一节（模型/工具用时、TTFT、TPS、Token 与缓存、上下文占用）', () => {
+	const text = renderProgress({
+		label: '参考docs重写后端并初始化项目(session-247658da)',
+		sessionId: 'session-247658da',
+		model: { provider: 'deepseek-official', model: 'deepseek-reasoner' },
+		permission: '工作区内修改',
+		snapshot: {
+			status: 'running',
+			midTurn: true,
+			turn: 7,
+			elapsedMs: 9_000,
+			actions: [{ name: 'bash', args: 'pnpm test', at: Date.now() - 1000 }],
+			scanned: 5,
+		},
+		stats: {
+			// 587 分 28 秒 / 63 分 12 秒；TTFT 平均 8.6 秒（8600ms × 500 步）
+			sessionStats: {
+				turns: 7,
+				steps: 98,
+				llmMs: 35_248_000,
+				toolMs: 3_792_000,
+				ttftMs: 4_300_000,
+				ttftSteps: 500,
+				decodeMs: 1_000_000,
+				decodeTokens: 191_000,
+			},
+			tokenUsage: {
+				uncachedInputTokens: 10_314_436,
+				cacheReadTokens: 916_849_920,
+				cacheWriteTokens: 0,
+				outputTokens: 1_909_715,
+			},
+			contextBreakdown: { systemTokens: 4500, toolsTokens: 19_900, messageTokens: 369_000 },
+			contextPressure: { contextWindow: 1_000_000, pressureTokens: 500_000, projectedTokens: 540_000 },
+		},
+	})
+	assert.match(text, /\n\n\*\*统计\*\*\n/, '统计是独立一节')
+	assert.match(text, /> 模型用时 9 小时 47 分 ｜ 工具调用 1 小时 3 分/, '587 分 28 秒要写成人话')
+	assert.match(text, /> 首 token 平均 8.6 秒 ｜ 输出速度 191 tok\/s/)
+	assert.match(text, /> Token 用量 929\.07M ｜ 缓存命中 99%/)
+	assert.match(text, /> 未缓存输入 10\.31M ｜ 缓存读取 916\.85M ｜ 输出 1\.91M/, '0 的项（缓存写入）不占位')
+	assert.match(text, /> 上下文已用 54%（~540K \/ 1M）/, '用 projectedTokens，不是 pressureTokens')
+	assert.match(text, /> 系统提示词 4\.5K ｜ 工具定义 19\.9K ｜ 对话消息 369K/)
+	// 统计排在抬头之后、动作之前：一眼看完的概览在前，长 excerpt 在后
+	assert.ok(text.indexOf('**统计**') < text.indexOf('**最近动作**'))
+})
+
+test('renderProgress：统计缺数据就少行、全缺就不出这一节（绝不占位）', () => {
+	const base = { label: 'x', sessionId: 's', snapshot: null }
+	// 四个投影都没有 → 连标题都不出现
+	const none = renderProgress({
+		...base,
+		stats: { sessionStats: null, tokenUsage: null, contextBreakdown: null, contextPressure: null },
+	})
+	assert.doesNotMatch(none, /统计/)
+	// 没传 stats（老调用方/没有统计服务）也一样
+	assert.doesNotMatch(renderProgress(base), /统计/)
+
+	// 只有 token 用量 → 只出 Token 两行，别的不占位
+	const onlyUsage = renderProgress({
+		...base,
+		stats: { tokenUsage: { uncachedInputTokens: 1000, cacheReadTokens: 0, outputTokens: 500 } },
+	})
+	assert.match(onlyUsage, /> Token 用量 1\.5K/, '1000+500 应该被算进总量')
+	assert.doesNotMatch(onlyUsage, /模型用时/)
+	assert.doesNotMatch(onlyUsage, /上下文已用/)
+	// 没有缓存读取就是 0%（如实说，不装作没这回事）
+	assert.match(onlyUsage, /缓存命中 0%/)
+
+	// 只有窗口没有占用数 → 用构成之和兜底
+	const fallback = renderProgress({
+		...base,
+		stats: { contextPressure: { contextWindow: 200_000 }, contextBreakdown: { systemTokens: 1000, toolsTokens: 1000 } },
+	})
+	assert.match(fallback, /> 上下文已用 1%（~2K \/ 200K）/)
+})
+
+test('renderProgress：统计里的数字绝不出现 NaN/undefined（脏数据只降级）', () => {
+	const dirty = renderProgress({
+		label: 'x',
+		sessionId: 's',
+		snapshot: null,
+		stats: {
+			sessionStats: { llmMs: Number.NaN, toolMs: 'x', ttftMs: 8600, ttftSteps: 0, decodeMs: 0, decodeTokens: 5 },
+			tokenUsage: { uncachedInputTokens: null, cacheReadTokens: undefined, outputTokens: 0 },
+			contextBreakdown: { systemTokens: 'a', toolsTokens: null, messageTokens: undefined },
+			contextPressure: { contextWindow: 0 },
+		},
+	})
+	assert.doesNotMatch(dirty, /NaN/)
+	assert.doesNotMatch(dirty, /undefined/)
+	assert.doesNotMatch(dirty, /统计/, '全是脏数据 → 整节不出现')
+})
+
 // 补票：线上真踩过——默认参数 `now = Date.now` 是个**函数**，被当成时间戳用，
 // `Date.now - startedAt` 直接算出 NaN，进度里显示「已跑 NaN 分 NaN 秒」。
 // 之前单测全都显式传数字，正好漏掉默认分支。
