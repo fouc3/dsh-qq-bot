@@ -151,6 +151,9 @@ export function apply(ctx, rawConfig) {
 		maxFetchBytes: rawConfig?.maxFetchBytes ?? DEFAULT_MAX_FETCH_BYTES,
 		replyAckTimeoutMs: rawConfig?.replyAckTimeoutMs ?? 8000,
 		noticeFallbackMs: rawConfig?.noticeFallbackMs ?? 3000,
+		// 投递后最多等多久"它真的开始跑"（等不到就不走 whenIdle 兜底，宁可漏报也不误报）
+		runningWaitMs: rawConfig?.runningWaitMs ?? 60_000,
+		runningPollMs: rawConfig?.runningPollMs ?? 500,
 		sessionPageSize: rawConfig?.sessionPageSize ?? 8,
 		needReplyText: rawConfig?.needReplyText ?? '用户点了「我需要回复」。请把上一条消息对应的结果完整地回复给用户。',
 		needReplyAckText: rawConfig?.needReplyAckText ?? '已触发，正在请求回复…',

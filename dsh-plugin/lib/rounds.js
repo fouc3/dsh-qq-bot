@@ -98,7 +98,7 @@ export function createRounds({
 	}
 
 	/**
-	 * 兜底：等 agent 真的空下来，再从**会话日志**里读这一轮的结束原因并收尾。
+	 * 兜底：等 agent **真的跑起来再空下来**，然后从会话日志里读这一轮的结束原因并收尾。
 	 *
 	 * 为什么还要这一条：线上踩过"完成通知不发了"——`session/event` 监听在某些情况下
 	 * 收不到（agent 实例被换、或事件派发范围变了），而 `turn/end` 是"已结束"通知的
@@ -106,36 +106,88 @@ export function createRounds({
 	 * `agent.session.events`（durable log，里面有 turn/end 与它的 reason），
 	 * 即使事件监听全聋，也能得出正确的"已结束 / 被打断"。
 	 *
+	 * **必须先等它跑起来**（线上又踩一次）：刚 followup 完 agent 还是 idle，
+	 * 直接 `whenIdle()` 会**立刻结算**，于是新轮次在 3 秒内被判成"被打断"并收尾，
+	 * 而这一轮其实跑了 37 分钟才正常结束 —— 「已结束」从此永远发不出来。
+	 *
 	 * 与事件路径幂等：先到的那个收尾，后到的看到 `round.ended` 直接返回。
 	 */
-	function watchIdle(agent, sessionId) {
+	async function watchIdle(agent, sessionId) {
 		if (!agent || typeof agent.whenIdle !== 'function') return
 		const round = currentRound(sessionId)
 		if (!round) return
-		Promise.resolve(agent.whenIdle()).then(
-			() => {
-				const latest = currentRound(sessionId)
-				if (!latest || latest.ended || latest !== round) return
-				const reason = lastTurnEndReason(agent)
-				journal(`whenIdle 兜底收尾：没等到 turn/end（reason=${reason ?? '未知'}，${sessionId.slice(-8)}）`)
-				void finishRound(sessionId, { reason: reason ?? 'unknown', turn: round.turn ?? undefined, from: 'whenIdle' })
-			},
-			() => {
-				// whenIdle 被取消/抛错：什么都不做，交给事件路径或下一次投递
-			},
+		// 等它真的开始跑（status=running）再等 idle。等不到就算了：宁可漏报，也不误报"被打断"。
+		const started = await waitForRunning(agent, sessionId, round)
+		if (!started) {
+			journal(`whenIdle 放弃：没等到它跑起来（${sessionId.slice(-8)}）`)
+			return
+		}
+		try {
+			await agent.whenIdle()
+		} catch {
+			return // 被取消/抛错：交给事件路径或下一次投递
+		}
+		const latest = currentRound(sessionId)
+		if (!latest || latest.ended || latest !== round) return
+		const ended = endedTurnFromLog(agent, round)
+		journal(
+			`whenIdle 兜底收尾：${ended ? `日志显示 turn=${ended.turn} reason=${ended.reason}` : '日志里没读到结束（按未知收尾）'}（${sessionId.slice(-8)}）`,
 		)
+		void finishRound(sessionId, {
+			reason: ended?.reason ?? 'unknown',
+			turn: ended?.turn ?? round.turn ?? undefined,
+			from: 'whenIdle',
+		})
 	}
 
-	/** 从会话日志里读最后一条 `turn/end` 的 reason（读不到返回 null）。 */
-	function lastTurnEndReason(agent) {
+	/** 轮询等 agent 进入 running（最多 `runningWaitMs`），异常/被顶替都算放弃。 */
+	async function waitForRunning(agent, sessionId, round) {
+		const limit = Math.max(1000, Number(config.runningWaitMs) || 60_000)
+		const pollMs = Math.max(5, Number(config.runningPollMs) || 500)
+		const deadline = Date.now() + limit
+		while (Date.now() < deadline) {
+			if (round.ended || currentRound(sessionId) !== round) return false
+			if (agent.status === 'running') return true
+			await sleep(pollMs)
+		}
+		return false
+	}
+
+	/** 可被打断的睡眠（定时器 unref，不拖住进程退出）。 */
+	function sleep(ms) {
+		return new Promise((resolve) => {
+			const timer = setTimeout(resolve, ms)
+			if (typeof timer.unref === 'function') timer.unref()
+		})
+	}
+
+	/**
+	 * 从会话日志里确认**我认领的这一轮**是否已经结束：结束返回 `{turn, reason}`，没结束返回 null。
+	 *
+	 * 为什么不能只看"agent 空闲了"：上一轮被顶替（aborted）时也会先来一次 idle，
+	 * 而新轮次此时刚建好（甚至刚认领了 turn）——把这次 idle 当收尾就会误报"被打断"，
+	 * 并且把这一轮后面真正的 turn/end 吃掉（round.ended 了就不再处理）。
+	 */
+	function endedTurnFromLog(agent, round) {
 		try {
 			const events = agent?.session?.events ?? []
 			for (let i = events.length - 1; i >= 0; i -= 1) {
 				const event = events[i]
-				if (event?.type === 'turn/end') return event.data?.reason?.kind ?? null
+				if (event?.type !== 'turn/end') continue
+				const turn = typeof event.data?.turn === 'number' ? event.data.turn : null
+				const reason = event.data?.reason?.kind ?? 'unknown'
+				if (round.turn !== null && round.turn !== undefined) {
+					// 只有"我这一轮或更靠后"的 turn/end 才算我结束了
+					return turn !== null && turn >= round.turn ? { turn, reason } : null
+				}
+				// 还没认领过轮次：只认"本轮开始之后"的结束，避免把上一轮的收尾算进来
+				if (typeof event.time === 'number' && typeof round.startedAt === 'number') {
+					return event.time >= round.startedAt ? { turn: turn ?? undefined, reason } : null
+				}
+				return { turn: turn ?? undefined, reason }
 			}
 		} catch {
-			// 读日志失败：当作未知原因
+			// 读日志失败：当作"还没结束"，宁可漏报也不误报
 		}
 		return null
 	}
@@ -256,14 +308,26 @@ export function createRounds({
 			const round = currentRound(sessionId)
 			if (!round || round.ended) return
 			// 兜底：turn/end 因异常路径没到，也要给用户一个收尾信号。
+			//
+			// **但"空闲"不等于"我这一轮结束了"**（线上事故 2026-10-15）：
+			// 上一轮被顶替（aborted）时 agent 会先报一次 idle，而此刻新轮次刚建好、
+			// 甚至刚认领 turn —— 3 秒后按"未知原因"收尾 → 误报「被打断」，
+			// 然后这一轮真跑到 37 分钟后正常结束，**「已结束」永远发不出来**。
+			// 所以收尾前必须回读会话日志，确认我认领的那一轮真的出现过 turn/end；
+			// 而且要用日志里的**真实 reason**，不能再一律写 unknown。
 			if (round.fallbackTimer) clearTimeout(round.fallbackTimer)
 			const delay = Math.max(500, Number(config.noticeFallbackMs) || 3000)
 			round.fallbackTimer = setTimeout(() => {
 				const latest = currentRound(sessionId)
 				if (!latest || latest.ended || latest !== round) return
-				journal(`兜底收尾：agent 已 idle 但没收到 turn/end（${sessionId.slice(-8)}）`)
-				logger?.warn?.('未收到 turn/end，按兜底路径收尾', { sessionId })
-				void finishRound(sessionId, { reason: 'unknown' })
+				const ended = endedTurnFromLog(agent, round)
+				if (!ended) {
+					journal(`忽略 idle 兜底：日志里这一轮还没结束（turn=${round.turn ?? '?'}，${sessionId.slice(-8)}）`)
+					return
+				}
+				journal(`兜底收尾：agent 已 idle 且日志里 turn=${ended.turn} 已结束（reason=${ended.reason}，${sessionId.slice(-8)}）`)
+				logger?.warn?.('未收到 turn/end，按日志兜底收尾', { sessionId, turn: ended.turn, reason: ended.reason })
+				void finishRound(sessionId, { reason: ended.reason, turn: ended.turn, from: 'status-idle' })
 			}, delay)
 			if (typeof round.fallbackTimer.unref === 'function') round.fallbackTimer.unref()
 		})

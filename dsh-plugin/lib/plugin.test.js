@@ -45,7 +45,10 @@ function makeAgent(sessionId) {
 			})
 			done?.()
 		},
+		/** 插件真的来等过吗？测试要等它挂上 whenIdle 再结算，否则会错过。 */
+		whenIdleCalls: 0,
 		whenIdle() {
+			agent.whenIdleCalls += 1
 			return idlePromise
 		},
 		ctx: {
@@ -745,7 +748,7 @@ test('端到端：agent 实例被换掉后要重挂监听（否则「已结束�
 
 test('端到端：事件监听全聋时，whenIdle + 会话日志也能给出正确的「已结束 / 被打断」', async (t) => {
 	const agent = makeAgent('session-1')
-	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': agent } })
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': agent }, config: { runningPollMs: 5 } })
 	await waitFor(() => existsSync(boot.socketPath))
 	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
 	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M0' })
@@ -754,6 +757,8 @@ test('端到端：事件监听全聋时，whenIdle + 会话日志也能给出正
 	// 第一轮：**完全不喂 session/event**，只让 whenIdle 结算，日志里写着 completed
 	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '第一条', msgId: 'M1' })
 	await waitFor(() => agent.followed.length === 1)
+	agent.status = 'running' // 兜底只在"真的跑起来过"之后才认 whenIdle
+	await waitFor(() => agent.whenIdleCalls > 0)
 	agent.settleIdle('completed', 3)
 	const finished = await waitFor(async () => {
 		const list = await drainFor(boot.socketPath, 80)
@@ -765,6 +770,8 @@ test('端到端：事件监听全聋时，whenIdle + 会话日志也能给出正
 	// 第二轮：日志里写着 aborted → 必须是「被打断」
 	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '第二条', msgId: 'M2' })
 	await waitFor(() => agent.followed.length === 2)
+	agent.status = 'running'
+	await waitFor(() => agent.whenIdleCalls > 1)
 	agent.settleIdle('aborted', 4)
 	const interrupted = await waitFor(async () => {
 		const list = await drainFor(boot.socketPath, 80)
@@ -781,6 +788,75 @@ test('端到端：事件监听全聋时，whenIdle + 会话日志也能给出正
 			return false
 		}
 	})
+
+	boot.dispose()
+})
+
+// 线上事故（2026-10-15，用户报"ai 停止后没有发送停止消息"）：
+// 上一轮被顶替时 agent 会先报一次 idle，而新轮次刚建好 → 旧代码 3 秒后按"未知原因"收尾，
+// 误报「被打断」，这一轮后面真跑完（37 分钟后 completed）的 turn/end 被当成已结束而吃掉，
+// 于是「已结束」永远发不出来。
+test('端到端：上一轮遗留的 idle 不能把新轮次误判成"被打断"（日志里它还没结束）', async (t) => {
+	const agent = makeAgent('session-1')
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': agent } })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M0' })
+	await drainFor(boot.socketPath, 60)
+
+	// 新轮次认领 turn=7（事件路径正常），日志里**还没有** turn/end
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '干活', msgId: 'M1' })
+	await waitFor(() => agent.followed.length === 1)
+	agent.handlers['session/event'](null, { type: 'turn/start', data: { turn: 7 } })
+	// 上一轮被顶替遗留的 idle 事件（真实时序里它就在这附近到）
+	agent.handlers['agent/status']({ status: 'idle' })
+
+	// 等过兜底窗口（测试里 20ms）——必须**什么都不发**
+	await new Promise((resolve) => setTimeout(resolve, 120))
+	const early = await drainFor(boot.socketPath, 60)
+	assert.equal(
+		early.filter((c) => c.kind === 'send_c2c' && /被打断|已结束/.test(String(c.args.content))).length,
+		0,
+		'日志里这一轮还没结束，就不能收尾（绝不能误报被打断）',
+	)
+
+	// 这一轮后来真的正常结束 → 必须发「已结束」
+	agent.session.events.push({ type: 'turn/end', seq: 99, time: Date.now(), data: { turn: 7, reason: { kind: 'completed' } } })
+	agent.handlers['session/event'](null, { type: 'turn/end', data: { turn: 7, reason: { kind: 'completed' } } })
+	const notice = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /已结束/.test(String(c.args.content))) ?? null
+	})
+	assert.equal(notice.args.content, 'proj-a(session-1)已结束')
+
+	boot.dispose()
+})
+
+test('端到端：idle 兜底要读日志里的真实 reason（completed → 已结束，不是一律"被打断"）', async (t) => {
+	const agent = makeAgent('session-1')
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': agent } })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M0' })
+	await drainFor(boot.socketPath, 60)
+
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '干活', msgId: 'M1' })
+	await waitFor(() => agent.followed.length === 1)
+	agent.handlers['session/event'](null, { type: 'turn/start', data: { turn: 8 } })
+	// 日志里已经写了 turn=8 completed，但 turn/end 事件走丢了（监听聋）
+	agent.session.events.push({ type: 'turn/end', seq: 50, time: Date.now(), data: { turn: 8, reason: { kind: 'completed' } } })
+	agent.handlers['agent/status']({ status: 'idle' })
+
+	const notice = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /已结束|被打断/.test(String(c.args.content))) ?? null
+	})
+	assert.equal(notice.args.content, 'proj-a(session-1)已结束', '日志说 completed 就该报已结束')
+	const notes = JSON.parse(readFileSync(boot.stateFile, 'utf8')).notes ?? []
+	assert.ok(
+		notes.some((line) => /兜底收尾：agent 已 idle 且日志里 turn=8 已结束（reason=completed/.test(line)),
+		`小日志应记录兜底用了真实 reason：\n${notes.slice(-5).join('\n')}`,
+	)
 
 	boot.dispose()
 })
