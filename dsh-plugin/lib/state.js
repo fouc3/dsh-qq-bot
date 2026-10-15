@@ -21,6 +21,8 @@ export const EMPTY_STATE = {
 	createdSessions: {}, // sessionId -> cwd（本桥建出来的会话：用来补登记工作区）
 	createdDirs: [], // 本桥建出来的目录（新建目录）：用来补登记工作区
 	sessionOwners: {}, // sessionId -> openid（最近一次从 QQ 跟这个会话说过话的人）
+	// 唤醒链：sessionId -> 'qq'（当前这条链是从 QQ 用户唤醒起的，目标/计划续跑的轮次也算）。
+	chainWakes: {},
 	// 快捷（命令 `快捷`）：openid -> { seq, items: [{ id, sessionId, name, at }] }。
 	// `id` 是按钮上那个 `#数字编号`：**只增不重用**（删掉 #2 后 #3 仍是原来那个会话），
 	// 否则用户记在脑子里的编号会悄悄指到别的会话。`name` 是自定义备注（空 = 用会话标题）。
@@ -46,10 +48,11 @@ function normalize(raw) {
 		createdSessions: {},
 		createdDirs: [],
 		sessionOwners: {},
+		chainWakes: {},
 		shortcuts: {},
 	}
 	if (!raw || typeof raw !== 'object') return base
-	for (const key of ['bindings', 'lastCard', 'delayed', 'inbox', 'attachSeq', 'pendingDir', 'pendingModel', 'createdSessions', 'sessionOwners', 'shortcuts']) {
+	for (const key of ['bindings', 'lastCard', 'delayed', 'inbox', 'attachSeq', 'pendingDir', 'pendingModel', 'createdSessions', 'sessionOwners', 'chainWakes', 'shortcuts']) {
 		if (raw[key] && typeof raw[key] === 'object') base[key] = { ...raw[key] }
 	}
 	if (Array.isArray(raw.createdDirs)) base.createdDirs = raw.createdDirs.filter((item) => typeof item === 'string' && item)
@@ -295,6 +298,24 @@ export function createState({ file, logger, seed, debounceMs = 200 } = {}) {
 		sessionOwnerOf(sessionId) {
 			const owner = data.sessionOwners?.[sessionId]
 			return typeof owner === 'string' && owner ? owner : null
+		},
+		/**
+		 * 「这一轮的唤醒链是不是从 QQ 用户起的」——`qq` = 用户从 QQ 唤醒的那条链还在延续，
+		 * 空串/无 = 不是（例如在 dsh web 里新起的一轮，或从来没从 QQ 说过话）。
+		 *
+		 * 为什么要记：目标/计划**自动续跑**出来的轮次不是用户发起的，但用户要求
+		 * "只要唤醒链能追到用户唤醒的那一轮，就按用户唤醒算"（也要发结束通知）。
+		 */
+		setChainWake(sessionId, kind = '') {
+			if (!sessionId) return
+			return this.update((s) => {
+				if (kind) s.chainWakes[sessionId] = kind
+				else delete s.chainWakes[sessionId]
+			})
+		},
+		chainWakeOf(sessionId) {
+			const kind = data.chainWakes?.[sessionId]
+			return typeof kind === 'string' ? kind : ''
 		},
 
 		// ── 快捷（自带 #编号 + 自定义备注） ─────────────────────────────────

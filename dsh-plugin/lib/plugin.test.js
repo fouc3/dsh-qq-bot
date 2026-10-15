@@ -711,6 +711,91 @@ test('端到端：一轮以 reason=error 结束 → 通知写「出现错误」+
 	boot.dispose()
 })
 
+// 用户要求（2026-10-16）：目标/计划**自动续跑**出来的轮次，只要唤醒链能追到"QQ 用户唤醒"的
+// 那一轮，就**按用户唤醒算** —— 也要发结束通知（否则长任务一跑起来，QQ 侧就一片安静）。
+// 判据用 `state.chainWakes`：我们投递的轮次记 'qq'，计划轮次沿用；**不是我们投的**用户消息
+// （在 dsh web 里新起一轮）会把链清掉 —— 那条链不该再往 QQ 发通知。
+test('端到端：计划/目标续跑的轮次沿用用户唤醒（也发通知），链断了就不发', async (t) => {
+	const agent = makeAgent('session-1')
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': agent } })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	const emit = (event) => agent.handlers['session/event'](null, event)
+	const notices = []
+
+	// 1) 用户从 QQ 起一轮 → 通知（同时这条链被记成"从 QQ 起的"）
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M0' })
+	await drainFor(boot.socketPath, 60)
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '开始长任务', msgId: 'M1' })
+	await waitFor(() => agent.followed.length === 1)
+	emit({ type: 'turn/start', data: { turn: 1 } })
+	emit({ type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+	const first = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		notices.push(...list.filter((c) => c.kind === 'send_c2c' && /已结束/.test(String(c.args.content))))
+		return notices[0] ?? null
+	})
+	assert.equal(first.args.content, 'proj-a(session-1)已结束')
+
+	// 2) 计划/目标续跑（本桥没有该轮次）：驱动消息 source.kind='goal' → 建"只发通知"的记录
+	emit({ type: 'turn/start', data: { turn: 2 } })
+	emit({ type: 'user/message', data: { source: { kind: 'goal' }, content: [{ type: 'text', text: '继续切片' }] } })
+	const chained = await waitFor(() => {
+		try {
+			return JSON.parse(readFileSync(boot.stateFile, 'utf8')).notes.find((line) => /计划轮次开始/.test(line)) ?? null
+		} catch {
+			return null
+		}
+	})
+	assert.match(chained, /turn=2/, '计划轮次要建"只发通知"的记录')
+	emit({ type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } })
+	await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		notices.push(...list.filter((c) => c.kind === 'send_c2c' && /已结束/.test(String(c.args.content))))
+		return notices.length >= 2
+	})
+	assert.equal(notices[1].args.content, 'proj-a(session-1)已结束', '续跑的那一轮也发通知')
+	assert.equal(notices[1].args.keyboard.content.rows[0].buttons[0].render_data.label, '我需要回复')
+
+	// 3) 还没断链：再续一轮照样发
+	emit({ type: 'turn/start', data: { turn: 3 } })
+	emit({ type: 'user/message', data: { source: { kind: 'goal' }, content: [{ type: 'text', text: '再切一片' }] } })
+	emit({ type: 'turn/end', data: { turn: 3, reason: { kind: 'completed' } } })
+	await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		notices.push(...list.filter((c) => c.kind === 'send_c2c' && /已结束/.test(String(c.args.content))))
+		return notices.length >= 3
+	})
+
+	// 4) 链断了：dsh web 里新起一轮（不是本桥投的 kind=user）→ 之后的目标轮**不发**通知
+	emit({ type: 'turn/start', data: { turn: 4 } })
+	emit({ type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '（在 web 里发的）' }] } })
+	const broken = await waitFor(() => {
+		try {
+			return JSON.parse(readFileSync(boot.stateFile, 'utf8')).notes.find((line) => /唤醒链断了/.test(line)) ?? null
+		} catch {
+			return null
+		}
+	})
+	assert.match(broken, /turn=4/)
+	emit({ type: 'turn/start', data: { turn: 5 } })
+	emit({ type: 'user/message', data: { source: { kind: 'goal' }, content: [{ type: 'text', text: '目标又续了一轮' }] } })
+	emit({ type: 'turn/end', data: { turn: 5, reason: { kind: 'completed' } } })
+	const rest = await drainFor(boot.socketPath, 120)
+	notices.push(...rest.filter((c) => c.kind === 'send_c2c' && /已结束/.test(String(c.args.content))))
+	assert.equal(notices.length, 3, '链断之后的目标轮不该再发通知')
+	const noNotice = await waitFor(() => {
+		try {
+			return JSON.parse(readFileSync(boot.stateFile, 'utf8')).notes.find((line) => /计划轮次不发通知/.test(line)) ?? null
+		} catch {
+			return null
+		}
+	})
+	assert.match(noNotice, /turn=5/)
+
+	boot.dispose()
+})
+
 // 线上事故（2026-10-15）：插件自己 `ctx.agents.resume({resumeSessionId})` 唤醒冷会话，
 // 造出的 agent **没有模型、没有预设/工具** → 系统提示词里 `{{model}}` 取不到值
 // （`prompt variable "{{model}}" has no value for this assembly (section "deployment:persona-prefix")`）

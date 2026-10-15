@@ -70,6 +70,8 @@ export function createRounds({
 	}
 	/** 收到过几个会话事件：只在小日志里留前几条，作为"事件到底来没来"的证据。 */
 	let observedEvents = 0
+	/** 外来的 turn/start 暂存：sessionId -> turn（等它的驱动消息来判断是哪一种唤醒）。 */
+	const foreignTurns = new Map()
 
 	function currentRound(sessionId) {
 		return rounds.get(sessionId) ?? null
@@ -81,6 +83,55 @@ export function createRounds({
 	 * 被顶替 = 被打断：给上一轮补一条「被打断」通知，并尽量带上打断它的那条消息
 	 * （interruptSource 拿不到就不带引用行，照样提示被打断）。
 	 */
+	/**
+	 * 「计划轮次」＝ 不是用户发的消息唤醒的那一轮（目标/计划自动续跑：`source.kind === 'goal'` 等）。
+	 *
+	 * 用户要求（2026-10-16）：**只要唤醒链能追到"QQ 用户唤醒"的那一轮，就按用户唤醒算** ——
+	 * 也就是说：上一轮是用户唤醒 → 算；上一轮是计划唤醒 → 再往上一轮看；一直追到用户唤醒
+	 * 为止（追不到就不算）。落地上用 `state.chainWakes` 记住"这条链是从 QQ 用户起的"：
+	 *   - 我们从 QQ 投递（含延迟投递）一轮 → 记上 `'qq'`；
+	 *   - 计划/目标续跑的轮次 → **沿用**这个记号（链在延续）；
+	 *   - 出现一条**不是我们投的** `source.kind === 'user'` 消息（比如在 dsh web 里新起一轮）
+	 *     → 链断了，清掉记号（那一轮不是从 QQ 起的，不该往 QQ 发通知）。
+	 */
+	function chainFromQq(sessionId) {
+		return state.chainWakeOf(sessionId) === 'qq'
+	}
+
+	/**
+	 * 给"计划/目标自动续跑"的轮次建一条**只发通知**的轮次记录。
+	 *
+	 * 它不注入每轮 QQ 上下文（`pendingContext: null`）——自动续跑的那一轮不是"用户在 QQ 问的那句"，
+	 * 往会话里塞"要回 QQ"的提示会污染模型行为；但它的 `turn/end` 会照常走 `finishRound()`，
+	 * 于是「已结束 / 被打断 / 出现错误」都能发到 QQ 上（这就是用户要的那条规则）。
+	 */
+	function beginChainRound({ sessionId, turn, openid }) {
+		const round = {
+			sessionId,
+			openid,
+			// origin 记 'qq'：通知门槛只看"是不是用户唤醒的链"；`chain: true` 标出它是续跑轮。
+			origin: 'qq',
+			chain: true,
+			context: { msgId: '', eventId: '' },
+			turn,
+			seq: 0,
+			replied: false,
+			superseded: false,
+			stopped: false,
+			ended: false,
+			pendingContext: null,
+			contextTurn: null,
+			fallbackTimer: null,
+			startedAt: Date.now(),
+		}
+		rounds.set(sessionId, round)
+		journal(
+			`计划轮次开始：${sessionId.slice(-8)} turn=${turn} openid=${openid ? '有' : '无'}` +
+				'（唤醒链追到 QQ 用户，结束照发通知）',
+		)
+		return round
+	}
+
 	function beginRound({ sessionId, openid, origin = 'qq', context = {}, pendingContext = null, interruptSource = '' }) {
 		const previous = rounds.get(sessionId)
 		if (previous) {
@@ -105,6 +156,8 @@ export function createRounds({
 			startedAt: Date.now(),
 		}
 		rounds.set(sessionId, round)
+		// 这一条链是从 QQ 用户起的（延迟投递也算：那是用户自己排队要发的话）。
+		state.setChainWake(sessionId, 'qq')
 		journal(`轮次开始：${sessionId.slice(-8)} origin=${origin} openid=${openid ? '有' : '无'}`)
 		return round
 	}
@@ -398,7 +451,41 @@ export function createRounds({
 			)
 		}
 		const round = currentRound(sessionId)
-		if (!round) return
+		// 不是本桥起的轮次（目标/计划自动续跑等）：先记下"这个 turn 是外来的"，
+		// 等它的**驱动消息**（紧跟 turn/start 后面那条 user/message）到了再判断唤醒链。
+		if (!round) {
+			if (event?.type === 'turn/start') {
+				const turn = Number(event.data?.turn)
+				if (Number.isFinite(turn)) foreignTurns.set(sessionId, turn)
+				return
+			}
+			if (event?.type === 'user/message') {
+				const turn = foreignTurns.get(sessionId)
+				if (turn === undefined) return
+				foreignTurns.delete(sessionId)
+				const kind = String(event.data?.source?.kind ?? '')
+				if (kind === 'user') {
+					// 我们投的那一轮会先建 round（所以走到这里是**别人**发起的用户消息，
+					// 例如在 dsh web 里新起一轮）：链断了，别再把这条链的续跑算到 QQ 头上。
+					if (chainFromQq(sessionId)) {
+						state.setChainWake(sessionId, '')
+						journal(`唤醒链断了：外部用户消息（kind=user）新起一轮（${sessionId.slice(-8)} turn=${turn}）`)
+					}
+					return
+				}
+				// 计划/目标唤醒：只要这条链是从 QQ 用户起的，就给这一轮建"只发通知"的记录。
+				const owner = state.sessionOwnerOf(sessionId)
+				if (chainFromQq(sessionId) && owner) {
+					beginChainRound({ sessionId, turn, openid: owner })
+				} else {
+					journal(
+						`计划轮次不发通知：唤醒链不是从 QQ 起的（${sessionId.slice(-8)} turn=${turn} kind=${kind || '?'}）`,
+					)
+				}
+				return
+			}
+			return
+		}
 		switch (event?.type) {
 			case 'turn/start':
 				// 认领这一轮：只有认领到的轮次才归本轮结算。
