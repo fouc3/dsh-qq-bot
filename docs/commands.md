@@ -197,6 +197,32 @@
 ```
 对当前会话没有在跑的轮次时，回一句"该会话当前没有在运行的轮次"。`停止` **不要求**参数，所以无参不会回用法。
 
+> **`停止` 不恢复目标**：它是人主动按的（见下一节）。
+
+## 打断后自动恢复"运行中的目标"
+
+QQ 消息是**打断式**投递（`agent.cancel({kind:'user'})` → 再 `followup`），而打断会连累 dsh 的**目标**：
+
+- `dsh-goal-round-driver` 收到 `turn/end` 且 `reason.kind === 'aborted'` 时，如果被取消的**不是**目标
+  自己那一轮（我们打断的就是这种），它会直接 `ctx.goals.disarm(agent)` ——
+  **`phase` 仍是 `active`，但 `activation` 变成 `disarmed`，于是"结束后不会被唤起"**：
+  自动续跑永久停住，只能人工 `/goal resume` 才接着跑（线上事故：K-Vault 会话被一条 QQ 消息
+  打断后 `roundsStarted: 0`，后面几个切片全断在半路）；
+- 如果被取消的**恰好是目标自己那一轮**，驱动走的是 `ctx.goals.pause(agent, ref)`（`phase` 变 `paused`）。
+
+所以桥在**打断 + 投递之后**会把目标恢复回来（`ctx.goals.resume(agent, { id, revision })`）：
+
+- **判据（用户要求）**：只恢复**打断前处于运行中**的目标，即 `phase === 'active' && activation === 'armed'`。
+  打断前**没有目标**、目标**已暂停**（`paused`/`blocked`/`complete`）、以及 active 但**已经 disarmed**
+  的，一律**不做任何操作** —— 免得把用户自己停下的目标又给启动起来；
+- **用当前 revision**：打断/暂停会改 revision，不能用打断前那个旧 ref（会 `goal revision mismatch`）；
+- **时序**：失能发生在 **aborted 的 `turn/end` 处理器里**（异步、可能晚于投递），所以这里是**轮询**：
+  每 `goalRearmPollMs`（默认 250ms）重读一次当前目标，最多盯 `goalRearmWaitMs`（默认 5000ms）；
+  只在"同一目标 + 仍是 active 或 paused"时 resume，恢复后又观察到它稳住在 `armed` 就收手；
+  目标被换掉/完成/阻塞/到轮次上限都立刻放弃（失败会写进状态文件的小日志，提示人工 `/goal resume`）；
+- **谁能触发**：一切**打断式投递**（普通消息、`发送 <会话id> <内容>`、输入态发送、`快捷 <目标> <消息>`）
+  都会。`停止`、`归档` 不会（人主动停/归档，目标停着才对）。
+
 ### 归档
 
 ```

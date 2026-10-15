@@ -50,6 +50,11 @@
         # 延迟发送在"这一轮刚结束"时把消息交出去，那一刻驱动还在收尾；直接 followup 会被
         # dsh 吞掉唤醒（消息卡在「待发送」）。所以先等它真的空闲，最多等这么多毫秒。
         idleWaitMs: 5000
+        # 打断"运行中的目标"之后：dsh 的 goal-round-driver 会因为 `turn/end reason=aborted`
+        # 把目标失能/暂停（那是打断的副作用），桥要盯一会儿再把它 `resume` 回来。
+        # 这两个是那次盯梢的上限与轮询间隔；只恢复"打断前处于运行中（active+armed）"的目标。
+        goalRearmWaitMs: 5000
+        goalRearmPollMs: 250
         # 会话选择卡片每页最多列几个会话。
         sessionPageSize: 8
 

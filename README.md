@@ -49,6 +49,7 @@ QQ 用户 ──私聊──▶ QQ 开放平台 ──WebSocket──▶ Go: dsh
 | 人类来源标记 | **用户在 QQ 里打的字**按 `{ kind: 'user' }` 注入（`HUMAN_SOURCE`）——dsh 里有一批动作只认人类输入（`create_goal` / `update_goal edit\|pause\|resume` 要求当前轮里有一条 `source.kind === 'user'` 的 `user/message`），QQ 只是那根线，不标就等于把用户的授权吞了。插件**自己写的话**（「我需要回复」唤醒文本、每轮上下文注入）仍标成插件来源（`PLUGIN_SOURCE`），不冒充用户授权 |
 | 排查用的小日志 | `~/.dsh/dsh-qq-bot/state.json` 的 `notes`（最近 40 条）：轮次开始/认领、收尾的 reason 与各门槛、通知入队或跳过、agent 挂载/重挂、收到过几类会话事件。**为什么放状态里**：插件日志进不了 journald（`dsh web` 只在启动时写几行），线上排查"结束通知怎么不发了"这类问题此前完全没有可观测性 |
 | 卡片键盘限额 | 内联键盘最多 5 行、每行最多 5 按钮（平台硬限制）：目录与会话共用一页预算、装不下就翻页，导航按钮永远并进一行 |
+| 打断后恢复目标 | QQ 消息打断正在跑的轮次时，dsh 的 `goal-round-driver` 会把**运行中的目标**关掉（`turn/end reason=aborted` → `ctx.goals.disarm`：phase 仍是 active 但**不再自动续跑**；若被取消的恰好是目标自己那一轮，它走的是 `pause`）。桥在**打断 + 投递之后**自动把它重新武装（`ctx.goals.resume`，用**当前** revision —— 打断会让 revision 变），否则目标就一直躺着、只能人工 `/goal resume`（K-Vault 线上就是这么断在半路的）。**只恢复打断前处于运行中（`active` + `armed`）的目标**：没有目标、已暂停（`paused`/`blocked`/`complete`）、以及 active 但已 `disarmed` 的都不动；用户显式 `停止` 也不恢复（那是人主动按的） |
 | 失败退避 | 出站命令按失败类型处理：限速类（40034100/50002 等）指数退避重试（2s→4s→8s，最多 4 次），参数类硬错直接丢弃——避免无限重投把自己打成风暴 |
 | dsh 内置命令 | QQ 里发 `/compact`、`/model`、`/goal`… 直接走 `ctx.commands.execute` 执行（不经模型）；这些命令在菜单里**收进二级菜单**（顶层留给桥命令）；技能不在内，「反馈」不兼容。**认不出的斜杠命令明确回绝、不进模型**：回一句「没有 `/xxx` 这个命令（**这一条没有发给 AI**）」+ 列出这台会话真正可用的命令；没绑定会话时同样回绝。想把以 `/` 开头的话当消息发（如绝对路径）改用**全角 `／`**。**`/plan <文本>` 特殊处理**：只把 `/plan` 交给 dsh 切模式，文本走本桥正常投递（否则 dsh 会把它 `steer` 进会话、绕过本桥的轮次跟踪，QQ 侧看不到思考与结束通知）；plan 模式下模型提交的计划也会转发到 QQ |
 
@@ -351,6 +352,11 @@ if (this.phase.kind !== "idle") {
   —— `lib/plugin.test.js`「输入态」
 - ✅ UNIX socket 通道：目录 0700 / socket 0600 / 可选 token / 帧上限 1 MiB / 残留 socket 清理 / health 诊断
   —— `lib/socket.test.js` + Go `internal/bridge/socketclient_test.go`
+- ✅ **打断后自动恢复"运行中的目标"**：打断会让 `goal-round-driver` 把目标失能/暂停，桥在投递后用
+  **当前 revision** 调 `ctx.goals.resume` 把它武装回来；没有目标 / 已暂停 / active 但已失能的
+  **都不动**，用户显式 `停止` 也不恢复；恢复动作写进状态文件的小日志（插件日志进不了 journald）
+  —— `lib/plugin.test.js`「打断"运行中的目标"后自动重新武装；没目标/已暂停/已失能都不动」
+  （探针验证：临时关掉恢复调用后该测试会失败）
 - ✅ **热重载不掐桥**（线上事故 2026-10-16 03:53）：改 `cordis.patch.yml` 触发的 profile 重组合里，
   旧实例的 `uv_close` 会**按路径名** unlink，新实例若抢先 `listen` 同名路径，路径随后被旧实例删掉
   （`ss` 里监听还在、路径没了 → 网关永久 `no such file`）。现在接管前先等老实例退出（3s 上限）、
@@ -381,7 +387,7 @@ if (this.phase.kind !== "idle") {
 # Go 侧（含假 QQ 平台 + 真 UNIX socket 桩）
 go vet ./... && gofmt -l . && go test -race ./...
 
-# 插件侧：语法 + 183 项（含"装配级端到端"）
+# 插件侧：语法 + 184 项（含"装配级端到端"）
 node --check dsh-plugin/index.js dsh-plugin/lib/*.js
 node --test dsh-plugin/lib/*.test.js
 ```

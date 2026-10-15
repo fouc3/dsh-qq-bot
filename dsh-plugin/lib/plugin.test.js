@@ -246,6 +246,37 @@ function makeCtx({ sessionSummaries = [], live = {}, commands = null } = {}) {
 				ctx.permissionPresets.setCalls.push({ sessionId: session?.id, value })
 			},
 		},
+		// dsh 的目标服务（`ctx.goals`）：打断后桥要按"打断前是不是运行中"决定要不要重新武装。
+		// `state` 由测试直接摆（null = 这个会话没有目标）；get() 返回**拷贝**，免得插件改到我们的状态。
+		goals: {
+			state: null,
+			resumeCalls: [],
+			disarmCalls: [],
+			get() {
+				if (!this.state) return undefined
+				return { roundsStarted: 1, createdAt: 0, updatedAt: 0, maxGoalRounds: 60, ...this.state }
+			},
+			resume(agent, ref) {
+				if (!this.state) throw new Error('no current goal')
+				if (ref.id !== this.state.id || ref.revision !== this.state.revision) {
+					throw new Error(`goal revision mismatch: ${ref.revision} != ${this.state.revision}`)
+				}
+				this.resumeCalls.push({ sessionId: agent?.id, ref: { ...ref } })
+				this.state = { ...this.state, phase: 'active', activation: 'armed', revision: this.state.revision + 1 }
+				return { ...this.state }
+			},
+			disarm() {
+				if (!this.state) return undefined
+				this.disarmCalls.push({ ...this.state })
+				this.state = { ...this.state, activation: 'disarmed' }
+				return { ...this.state }
+			},
+			pause() {
+				if (!this.state) return undefined
+				this.state = { ...this.state, phase: 'paused', activation: 'disarmed', revision: this.state.revision + 1 }
+				return { ...this.state }
+			},
+		},
 	}
 
 	return {
@@ -1969,6 +2000,77 @@ test('端到端：`状态` —— 抬头给会话/模型/权限，去掉"只读�
 	})
 	assert.match(String(legacy.args.content), /> 权限：工作区内修改/, '别名走的是同一条路')
 	assert.equal(agent.followed.length, 0, '旧名不能被当成普通消息发给 AI')
+
+	boot.dispose()
+})
+
+// 用户要求（2026-10-16）：打断会让 dsh 的目标"失能"——`dsh-goal-round-driver` 收到
+// `turn/end reason.kind === 'aborted'` 且被取消的不是目标自己的那一轮时，会直接
+// `ctx.goals.disarm()`：**phase 仍是 active 但不再自动续跑**（线上表现是 `roundsStarted: 0`、
+// 目标一直躺着，只能人工 `/goal resume`）。如果被取消的恰好是目标自己的轮，驱动走的是 `pause`。
+// 所以桥在"打断 + 投递"之后要把它重新武装 —— 但**只恢复打断前处于运行中的目标**。
+test('端到端：打断"运行中的目标"后自动重新武装；没目标/已暂停/已失能都不动', async (t) => {
+	const agent = makeAgent('session-1')
+	const boot = bootPlugin(t, {
+		sessions: SUMMARIES,
+		live: { 'session-1': agent },
+		config: { goalRearmPollMs: 20, goalRearmWaitMs: 500 },
+	})
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M0' })
+	await drainFor(boot.socketPath, 60)
+
+	const goals = boot.ctx.goals
+	// 模拟"打断那一刻驱动的反应"：cancel() 之后目标被 disarm（真实驱动在 aborted 的 turn/end 里做）
+	const cancel = agent.cancel.bind(agent)
+	agent.cancel = (...args) => {
+		const result = cancel(...args)
+		goals.disarm()
+		return result
+	}
+	agent.status = 'running'
+
+	// 1) 打断前是 active + armed（运行中）→ 投递后要重新武装
+	goals.state = { id: 'goal-1', revision: 7, phase: 'active', activation: 'armed' }
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '换方向', msgId: 'M1' })
+	await waitFor(() => goals.resumeCalls.length === 1)
+	assert.deepEqual(goals.resumeCalls[0], { sessionId: 'session-1', ref: { id: 'goal-1', revision: 7 } })
+	assert.equal(goals.state.activation, 'armed', '恢复后目标应回到 armed（会自己续跑）')
+	// 插件日志进不了 journald，小日志是唯一可观测通道：这一笔必须留痕
+	const noted = await waitFor(() => {
+		try {
+			return JSON.parse(readFileSync(boot.stateFile, 'utf8')).notes.find((line) => /重新武装/.test(line)) ?? null
+		} catch {
+			return null
+		}
+	})
+	assert.match(noted, /goal-1/, '要写明恢复的是哪个目标')
+
+	// 2) 打断前**没有目标** → 什么都不做
+	goals.state = null
+	goals.resumeCalls.length = 0
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '再来一条', msgId: 'M2' })
+	await drainFor(boot.socketPath, 80)
+	assert.equal(goals.resumeCalls.length, 0, '没有目标就不该动什么')
+
+	// 3) 打断前目标是 **paused**（用户自己停的）→ 不该被我们启动起来
+	goals.state = { id: 'goal-2', revision: 3, phase: 'paused', activation: 'disarmed' }
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '第三条', msgId: 'M3' })
+	await drainFor(boot.socketPath, 80)
+	assert.equal(goals.resumeCalls.length, 0, '暂停的目标不该被自动恢复')
+
+	// 4) 打断前 active 但已经 disarmed（本来就没在跑）→ 不算"运行中"，不动
+	goals.state = { id: 'goal-3', revision: 5, phase: 'active', activation: 'disarmed' }
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '第四条', msgId: 'M4' })
+	await drainFor(boot.socketPath, 80)
+	assert.equal(goals.resumeCalls.length, 0, '只有"运行中"（active + armed）的目标才恢复')
+
+	// 5) 用户显式 `停止` 不恢复（那是人主动停的）
+	goals.state = { id: 'goal-4', revision: 9, phase: 'active', activation: 'armed' }
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '停止', msgId: 'M5' })
+	await drainFor(boot.socketPath, 80)
+	assert.equal(goals.resumeCalls.length, 0, '`停止` 是人主动按的，不该把目标又启动起来')
 
 	boot.dispose()
 })

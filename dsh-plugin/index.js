@@ -70,6 +70,9 @@ function deepFreeze(value, seen = new WeakSet()) {
 	return Object.freeze(value)
 }
 
+/** 睡一会儿：只在"等某个异步状态落定"的轮询路径上用（绝不阻塞事件循环）。 */
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)))
+
 /** 链接卡片（ark）当文字处理：抽标题/描述/跳转链接，让 AI 知道用户分享的是什么。 */
 function arkAsText(ark) {
 	if (!ark) return ''
@@ -155,6 +158,9 @@ export function apply(ctx, rawConfig) {
 		// 投递后最多等多久"它真的开始跑"（等不到就不走 whenIdle 兜底，宁可漏报也不误报）
 		runningWaitMs: rawConfig?.runningWaitMs ?? 60_000,
 		runningPollMs: rawConfig?.runningPollMs ?? 500,
+		// 打断"运行中的目标"之后，最多盯多久把它重新武装起来（见 rearmGoalAfterInterrupt）。
+		goalRearmWaitMs: rawConfig?.goalRearmWaitMs ?? 5000,
+		goalRearmPollMs: rawConfig?.goalRearmPollMs ?? 250,
 		sessionPageSize: rawConfig?.sessionPageSize ?? 8,
 		needReplyText: rawConfig?.needReplyText ?? '用户点了「我需要回复」。请把上一条消息对应的结果完整地回复给用户。',
 		needReplyAckText: rawConfig?.needReplyAckText ?? '已触发，正在请求回复…',
@@ -762,8 +768,11 @@ export function apply(ctx, rawConfig) {
 			})
 			return { ok: false }
 		}
+		// 打断之前先记下"目标"的状态：**只有运行中（active + armed）的目标**在打断后才需要恢复
+		// （见 rearmGoalAfterInterrupt 的注释）。没有目标 / 已暂停都不动。
+		const goalBefore = interrupt && agent.status === 'running' ? runningGoal(agent) : null
 		if (interrupt && agent.status === 'running') {
-			logger.info?.('会话正在运行，先打断', { sessionId })
+			logger.info?.('会话正在运行，先打断', { sessionId, goal: goalBefore ? `${goalBefore.id}@${goalBefore.revision}` : '无' })
 			agent.cancel({ kind: 'user' }, { keepInbox: false })
 		}
 		ensureAgentSetup(agent, sessionId)
@@ -784,7 +793,89 @@ export function apply(ctx, rawConfig) {
 		// 兜底收尾：事件路径（session/event 的 turn/end）在某些情况下收不到，
 		// 就用 Agent 的一等 API whenIdle + 会话日志里的 reason 收尾（见 rounds.watchIdle）。
 		rounds.watchIdle(agent, sessionId)
+		// 恢复被我这次打断的目标（不 await：投递不该被它拖住）。
+		if (goalBefore) void rearmGoalAfterInterrupt(agent, goalBefore)
 		return { ok: true }
+	}
+
+	// ── 目标（goal）：打断会把它"失能"，这里负责按用户要求恢复运行中的那个 ──────
+	/**
+	 * 读目标的**只读视图**（`ctx.goals.get(agent)`；没有 goal 服务或没有目标就返回 null）。
+	 * 不吞异常：读不到只记日志，绝不影响投递。
+	 */
+	function goalViewOf(agent) {
+		try {
+			const goals = ctx.get?.('goals') ?? null
+			if (!goals || typeof goals.get !== 'function') return null
+			return goals.get(agent) ?? null
+		} catch (error) {
+			logger.debug?.('读取目标失败（忽略）', { sessionId: agent?.id, error: String(error) })
+			return null
+		}
+	}
+
+	/**
+	 * 「运行中的目标」＝ `phase === 'active' && activation === 'armed'`（会自己续跑的才算运行中）。
+	 *
+	 * 用户要求（2026-10-16）：**只有打断前处于运行中的目标才恢复**；打断前没有目标、
+	 * 或者目标处于暂停（`paused`/`blocked`/`complete`，以及 active 但已经 `disarmed` 的）
+	 * 都**不做任何操作** —— 免得把用户自己停下的目标又给启动起来。
+	 */
+	function runningGoal(agent) {
+		const view = goalViewOf(agent)
+		if (!view || view.phase !== 'active' || view.activation !== 'armed') return null
+		return { id: view.id, revision: view.revision }
+	}
+
+	/**
+	 * 打断之后把那个"运行中的目标"重新武装起来。
+	 *
+	 * 为什么需要：`dsh-goal-round-driver` 收到 `turn/end reason.kind === 'aborted'` 时，如果被取消的
+	 * 不是目标自己的那一轮（我们打断的就是这种情况），它会直接 `ctx.goals.disarm(agent)` ——
+	 * **失能但 phase 仍是 active**，于是"结束后不会被唤起"，自动续跑永久停住（线上事故：
+	 * K-Vault 会话一轮被 QQ 消息打断后 `roundsStarted: 0`、目标一直躺着，只能人工 `/goal resume`）。
+	 * 如果被取消的恰好是目标自己的那一轮，驱动那边走的是 `ctx.goals.pause()`（phase 变 paused）。
+	 *
+	 * 时序：disarm/pause 发生在 **aborted 的 turn/end 处理器里**（异步，可能晚于本函数），
+	 * 所以这里**轮询**：每次重新读一遍当前目标，用**当前 revision** 调 `resume()`（revision 会变，
+	 * 不能用打断前那个旧 ref）；只在"同一目标 + 仍是 active 或 paused"时恢复，
+	 * 恢复后又观察到它稳住在 armed 就收手。目标被换掉/完成/阻塞/到轮次上限都立刻放弃。
+	 */
+	async function rearmGoalAfterInterrupt(agent, before) {
+		const goals = (() => {
+			try {
+				return ctx.get?.('goals') ?? null
+			} catch {
+				return null
+			}
+		})()
+		if (!goals || typeof goals.resume !== 'function') return
+		const pollMs = Math.max(20, Number(config.goalRearmPollMs) || 250)
+		const deadline = Date.now() + Math.max(pollMs, Number(config.goalRearmWaitMs) || 5000)
+		let resumed = 0
+		for (;;) {
+			const view = goalViewOf(agent)
+			if (!view || view.id !== before.id) return
+			if (view.phase === 'complete' || view.phase === 'blocked') return
+			if (view.activation === 'armed') {
+				if (resumed > 0) return // 恢复成功并且稳住了：收手
+			} else if (view.phase === 'active' || view.phase === 'paused') {
+				try {
+					goals.resume(agent, { id: view.id, revision: view.revision })
+					resumed += 1
+					const short = String(view.id).slice(0, 8)
+					state.note(`目标被这次打断关掉了，已重新武装：${short} rev ${view.revision}（phase=${view.phase}）`)
+					logger.info?.('已重新武装被打断的目标', { sessionId: agent.id, phase: view.phase, revision: view.revision })
+				} catch (error) {
+					// 到轮次上限、revision 变了、agent 不再是活实例…都只是"恢复不了"：记一笔就走。
+					state.note(`恢复目标失败（${String(error?.message ?? error)}），请人工 /goal resume`)
+					logger.warn?.('重新武装目标失败', { sessionId: agent.id, error: String(error) })
+					return
+				}
+			}
+			if (Date.now() >= deadline) return
+			await sleep(pollMs)
+		}
 	}
 
 	// ── 输入态（"输入框"）：附件先入列，点卡片上的「发送」才投递 ──────────────
