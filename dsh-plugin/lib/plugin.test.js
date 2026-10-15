@@ -667,6 +667,50 @@ test('端到端：命令 → 会话卡片；绑定后普通消息进会话；一
 	boot.dispose()
 })
 
+// 用户要求（2026-10-16）：`reason=error` 的收尾**不能再说成"被打断"** —— 通知要写
+// 「出现错误」并把**具体报错**带出来（线上踩过：`{{model}}` 那个错全被渲染成"被打断"，
+// 用户以为是被谁打断的，看不出是模型/配置问题）。
+test('端到端：一轮以 reason=error 结束 → 通知写「出现错误」+ 具体报错', async (t) => {
+	const agent = makeAgent('session-1')
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': agent } })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M0' })
+	await drainFor(boot.socketPath, 60)
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '跑一下', msgId: 'M1' })
+	await waitFor(() => agent.followed.length === 1)
+
+	// 认领这一轮，再让它以 error 收尾（形状照 dsh 的 TurnEndReasonMap）
+	agent.handlers['session/event'](null, { type: 'turn/start', data: { turn: 1 } })
+	const failure =
+		'prompt variable "{{model}}" has no value for this assembly (section "deployment:persona-prefix")'
+	agent.handlers['session/event'](null, {
+		type: 'turn/end',
+		data: { turn: 1, reason: { kind: 'error', error: { message: failure, code: 'UNKNOWN' } } },
+	})
+
+	const notice = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /出现错误/.test(String(c.args.content))) ?? null
+	})
+	assert.equal(String(notice.args.content), `proj-a(session-1)出现错误\n> 错误：${failure}`)
+	assert.doesNotMatch(String(notice.args.content), /被打断/, '出错的措辞必须和"被打断"分开')
+	// 按钮照旧：错误卡也要能点「我需要回复」
+	assert.equal(notice.args.keyboard.content.rows[0].buttons[0].render_data.label, '我需要回复')
+
+	// 小日志（插件日志进不了 journald，线上只有这里能看）要能看出"出错"和具体报错
+	const noted = await waitFor(() => {
+		try {
+			return JSON.parse(readFileSync(boot.stateFile, 'utf8')).notes.find((line) => /通知已入队：出现错误/.test(line)) ?? null
+		} catch {
+			return null
+		}
+	})
+	assert.match(noted, /has no value/, '小日志里要带上具体报错')
+
+	boot.dispose()
+})
+
 // 线上事故（2026-10-15）：插件自己 `ctx.agents.resume({resumeSessionId})` 唤醒冷会话，
 // 造出的 agent **没有模型、没有预设/工具** → 系统提示词里 `{{model}}` 取不到值
 // （`prompt variable "{{model}}" has no value for this assembly (section "deployment:persona-prefix")`）

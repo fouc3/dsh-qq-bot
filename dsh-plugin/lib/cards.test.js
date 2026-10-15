@@ -472,6 +472,38 @@ test('结束通知：多一个「发送消息」指令按钮，填入 `发送 <�
 	assert.deepEqual(plain.keyboard.content.rows[0].buttons.map((b) => b.render_data.label), ['我需要回复'])
 })
 
+// 用户要求（2026-10-16）：`reason=error` 不能再说成"被打断" —— 要写「出现错误」+ 具体报错。
+test('结束通知：出错时说「出现错误」并带上具体报错（不再混成"被打断"）', () => {
+	const message =
+		'prompt variable "{{model}}" has no value for this assembly (section "deployment:persona-prefix")'
+	const card = buildNoticeCard({
+		label: '项目甲(session-1)',
+		sessionId: 'session-1',
+		interrupted: true, // 出错也属于"非正常结束"，但要盖过"被打断"的措辞
+		error: message,
+		source: '打断来自某条消息（出错时不该出现）',
+	})
+	assert.equal(card.content, `项目甲(session-1)出现错误\n> 错误：${message}`)
+	assert.doesNotMatch(card.content, /被打断/)
+	assert.doesNotMatch(card.content, /打断来自/)
+	// 按钮照旧（错误卡也要能点「我需要回复」）
+	assert.deepEqual(card.keyboard.content.rows[0].buttons.map((b) => b.render_data.label), ['我需要回复'])
+
+	// 超长报错要截断（平台一条消息有限长，别把整段栈塞进去）
+	const long = buildNoticeCard({ label: 'x(s1)', sessionId: 's1', error: 'E'.repeat(500) })
+	const quotedLine = long.content.split('\n')[1]
+	assert.ok(quotedLine.startsWith('> 错误：EEE'))
+	assert.ok(quotedLine.endsWith('…'), '截断要带省略号')
+	assert.ok(quotedLine.length <= 170, `截断后不该太长：${quotedLine.length}`)
+
+	// 空/空白 error 不算出错：退回原来的措辞
+	assert.equal(buildNoticeCard({ label: 'x(s1)', sessionId: 's1', error: '   ' }).content, 'x(s1)已结束')
+	assert.equal(
+		buildNoticeCard({ label: 'x(s1)', sessionId: 's1', interrupted: true, error: '' }).content,
+		'x(s1)被打断',
+	)
+})
+
 test('权限卡片：每行两个按钮（放不下就加宽），当前项标记出来', () => {
 	const options = [
 		{ value: 'read-only', name: '仅可查看', description: '只能看' },

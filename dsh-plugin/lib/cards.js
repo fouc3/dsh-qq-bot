@@ -396,11 +396,25 @@ function oneLine(text, limit = 60) {
  *   - 正常结束：`标题(id)已结束`
  *   - 被打断：`标题(id)被打断`，并尽量带上"打断来自哪条消息"（`> 打断来自：…`）；
  *     拿不到那条消息时照样报被打断，只是不带引用行。
+ *
+ * 用户补充（2026-10-16）：`reason=error` 不能再混进"被打断" —— 改成
+ * `标题(id)出现错误` + `> 错误：<具体报错>`，否则用户只看到"被打断"，不知道出了什么事
+ * （线上踩过：`{{model}}` 那个错全被渲染成"被打断"，看不出是配置/模型问题）。
+ *
+ * @param {{label:string, sessionId:string, interrupted?:boolean, error?:string,
+ *   source?:string, sendCommand?:Function}} input
  */
-export function buildNoticeCard({ label, sessionId, interrupted = false, source = '', sendCommand }) {
-	const lines = [interrupted ? `${label}被打断` : `${label}已结束`]
-	const quoted = interrupted ? oneLine(source) : ''
-	if (quoted) lines.push(`> 打断来自：${quoted}`)
+export function buildNoticeCard({ label, sessionId, interrupted = false, error = '', source = '', sendCommand }) {
+	const failed = typeof error === 'string' && error.trim() !== ''
+	const lines = [failed ? `${label}出现错误` : interrupted ? `${label}被打断` : `${label}已结束`]
+	let quoted = ''
+	if (failed) {
+		quoted = `错误：${oneLine(error, 160)}`
+	} else if (interrupted) {
+		const from = oneLine(source)
+		if (from) quoted = `打断来自：${from}`
+	}
+	if (quoted) lines.push(`> ${quoted}`)
 	const buttons = [callbackButton('我需要回复', data.needReply(sessionId), { visited: '已触发' })]
 	if (typeof sendCommand === 'function') {
 		// 「发送消息」是指令按钮：只把 `发送 <会话id>` 填进 QQ 输入框（由用户自己按发送）。

@@ -147,6 +147,7 @@ export function createRounds({
 		)
 		void finishRound(sessionId, {
 			reason: ended?.reason ?? 'unknown',
+			error: ended?.error ?? '',
 			turn: ended?.turn ?? round.turn ?? undefined,
 			from: 'whenIdle',
 		})
@@ -174,7 +175,7 @@ export function createRounds({
 	}
 
 	/**
-	 * 从会话日志里确认**我认领的这一轮**是否已经结束：结束返回 `{turn, reason}`，没结束返回 null。
+	 * 从会话日志里确认**我认领的这一轮**是否已经结束：结束返回 `{turn, reason, error}`，没结束返回 null。
 	 *
 	 * 为什么不能只看"agent 空闲了"：上一轮被顶替（aborted）时也会先来一次 idle，
 	 * 而新轮次此时刚建好（甚至刚认领了 turn）——把这次 idle 当收尾就会误报"被打断"，
@@ -188,15 +189,16 @@ export function createRounds({
 				if (event?.type !== 'turn/end') continue
 				const turn = typeof event.data?.turn === 'number' ? event.data.turn : null
 				const reason = event.data?.reason?.kind ?? 'unknown'
+				const error = errorTextOf(event)
 				if (round.turn !== null && round.turn !== undefined) {
 					// 只有"我这一轮或更靠后"的 turn/end 才算我结束了
-					return turn !== null && turn >= round.turn ? { turn, reason } : null
+					return turn !== null && turn >= round.turn ? { turn, reason, error } : null
 				}
 				// 还没认领过轮次：只认"本轮开始之后"的结束，避免把上一轮的收尾算进来
 				if (typeof event.time === 'number' && typeof round.startedAt === 'number') {
-					return event.time >= round.startedAt ? { turn: turn ?? undefined, reason } : null
+					return event.time >= round.startedAt ? { turn: turn ?? undefined, reason, error } : null
 				}
-				return { turn: turn ?? undefined, reason }
+				return { turn: turn ?? undefined, reason, error }
 			}
 		} catch {
 			// 读日志失败：当作"还没结束"，宁可漏报也不误报
@@ -215,8 +217,22 @@ export function createRounds({
 		notifyInterrupted(round, source)
 	}
 
+	/**
+	 * `turn/end` 的 `reason=error` 里那段**具体报错**（其它 reason 返回空串）。
+	 *
+	 * 形状（dsh 的 TurnEndReasonMap）：`{ kind: 'error', error: { message, code } }`。
+	 * 用户要求：出错的通知要带上它 —— 只说"被打断"看不出出什么事。
+	 */
+	function errorTextOf(event) {
+		const reason = event?.data?.reason
+		if (reason?.kind !== 'error') return ''
+		const failure = reason.error ?? {}
+		const text = failure.message ?? failure.code ?? ''
+		return typeof text === 'string' ? text.trim() : ''
+	}
+
 	/** 发一条结束/被打断通知（按 会话+轮次 去重）。 */
-	function enqueueNotice(round, { interrupted = false, source = '' } = {}) {
+	function enqueueNotice(round, { interrupted = false, source = '', error = '' } = {}) {
 		if (!round || !fromQqUser(round) || !round.openid) {
 			journal(`通知跳过：不是 QQ 用户发起的一轮或没 openid（${round?.sessionId ?? '?'}）`)
 			return
@@ -230,6 +246,7 @@ export function createRounds({
 			label: sessions.label(round.sessionId),
 			sessionId: round.sessionId,
 			interrupted,
+			error,
 			source,
 			sendCommand,
 		})
@@ -243,10 +260,12 @@ export function createRounds({
 			msgSeq: nextSeq(round.sessionId),
 		})
 		state.markNotice(key)
-		journal(`通知已入队：${interrupted ? '被打断' : '已结束'} turn=${round.turn ?? '?'}（${key.slice(-12)}）`)
-		logger?.info?.(interrupted ? '已发被打断通知' : '已发结束通知', {
+		const kind = error ? '出现错误' : interrupted ? '被打断' : '已结束'
+		journal(`通知已入队：${kind} turn=${round.turn ?? '?'}（${key.slice(-12)}）${error ? ` :: ${error.slice(0, 120)}` : ''}`)
+		logger?.info?.(`已发通知：${kind}`, {
 			sessionId: round.sessionId,
 			hasSource: Boolean(source),
+			error: error.slice(0, 200),
 		})
 	}
 
@@ -339,7 +358,7 @@ export function createRounds({
 				}
 				journal(`兜底收尾：agent 已 idle 且日志里 turn=${ended.turn} 已结束（reason=${ended.reason}，${sessionId.slice(-8)}）`)
 				logger?.warn?.('未收到 turn/end，按日志兜底收尾', { sessionId, turn: ended.turn, reason: ended.reason })
-				void finishRound(sessionId, { reason: ended.reason, turn: ended.turn, from: 'status-idle' })
+				void finishRound(sessionId, { reason: ended.reason, error: ended.error ?? '', turn: ended.turn, from: 'status-idle' })
 			}, delay)
 			if (typeof round.fallbackTimer.unref === 'function') round.fallbackTimer.unref()
 		})
@@ -410,7 +429,12 @@ export function createRounds({
 					logger?.debug?.('忽略其它轮次的 turn/end', { sessionId, turn, current: round.turn })
 					return
 				}
-				void finishRound(sessionId, { reason: event.data?.reason?.kind ?? 'unknown', turn, from })
+				void finishRound(sessionId, {
+					reason: event.data?.reason?.kind ?? 'unknown',
+					error: errorTextOf(event),
+					turn,
+					from,
+				})
 				break
 			}
 			default:
@@ -458,7 +482,7 @@ export function createRounds({
 	}
 
 	/** 收尾：发结束通知（必要时）+ 投递延迟消息（仅正常结束）。 */
-	async function finishRound(sessionId, { reason, turn, from = '' } = {}) {
+	async function finishRound(sessionId, { reason, turn, from = '', error = '' } = {}) {
 		const round = currentRound(sessionId)
 		if (!round || round.ended) return
 		round.ended = true
@@ -474,8 +498,12 @@ export function createRounds({
 		)
 
 		if (fromQqUser(round) && !round.superseded && !round.stopped && round.openid) {
-			// 只有 reason=completed 才是「正常结束」；aborted/blocked/error 都算被打断。
-			enqueueNotice(round, { interrupted: reason !== 'completed' })
+			// 只有 reason=completed 才是「正常结束」；aborted/blocked/error 都算被打断 ——
+			// 但 **reason=error 单独出一条「出现错误」+ 具体报错**（用户要求：别混进"被打断"）。
+			enqueueNotice(round, {
+				interrupted: reason !== 'completed',
+				error: reason === 'error' ? error : '',
+			})
 		} else {
 			journal('通知不发：轮次不是 QQ 用户发起的／已被顶替／已被停止（按设计）')
 		}
