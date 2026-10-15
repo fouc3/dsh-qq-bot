@@ -7,7 +7,8 @@
  *
  * 纪律：
  *   - **纯只读**：不 append、不 cancel、不发消息、不 resume（`agents.get` 拿不到就当"没有活跃 agent"）；
- *   - 扫描有上限（maxScan），绝不把整个会话读一遍；
+ *   - 扫描有上限（maxScan，默认 2000 条；reasoning/tool 事件很密，太小会读不到最近一段正文），
+ *     绝不把整个会话读一遍；
  *   - 任何字段缺失都降级，不抛错（进度查不到不该影响主流程）。
  */
 
@@ -45,11 +46,28 @@ export function summarizeToolArgs(rawArguments) {
 	return clip(pick, SUMMARY_LIMIT)
 }
 
-/** 从 assistant/message 的 content 里取第一段文本（跳过 reasoning）。 */
+/** 从 assistant/message 的 content 里取第一段文本（跳过 reasoning / tool-call）。 */
 export function extractAssistantText(message) {
 	const content = Array.isArray(message?.content) ? message.content : []
 	for (const block of content) {
 		if (block?.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
+			return clip(block.text, TEXT_LIMIT)
+		}
+	}
+	return ''
+}
+
+/**
+ * 从 assistant/message 的 content 里取第一段**思考**（dsh 里是 `reasoning` 块）。
+ *
+ * 为什么要单独摘：用户看进度时想区分"它在想什么"和"它说出来了什么"——
+ * 以前只有一段"最近一段输出"，实际经常是 reasoning（看起来像正文，其实不是）。
+ * 兼容旧字段名：个别版本/适配器写的是 `thinking`，也认。
+ */
+export function extractAssistantReasoning(message) {
+	const content = Array.isArray(message?.content) ? message.content : []
+	for (const block of content) {
+		if ((block?.type === 'reasoning' || block?.type === 'thinking') && typeof block.text === 'string' && block.text.trim()) {
 			return clip(block.text, TEXT_LIMIT)
 		}
 	}
@@ -67,10 +85,12 @@ export function extractAssistantText(message) {
  * @returns {{
  *   status: string, midTurn: boolean, turn: number|null, startedAt: number|null,
  *   elapsedMs: number|null, actions: Array<{name:string,args:string,at:number|null}>,
- *   lastText: string, lastEventAgoMs: number|null, scanned: number
+ *   lastText: string, lastReasoning: string, latestStep: number|null,
+ *   lastTextStep: number|null, lastReasoningStep: number|null, textStepsBehind: number|null,
+ *   lastEventAgoMs: number|null, scanned: number
  * }}
  */
-export function snapshotProgress(agent, { now = Date.now, maxScan = 800 } = {}) {
+export function snapshotProgress(agent, { now = Date.now, maxScan = 2000 } = {}) {
 	const nowMs = typeof now === 'function' ? Number(now()) : Number(now)
 	const snapshot = {
 		status: String(agent?.status ?? 'unknown'),
@@ -80,6 +100,11 @@ export function snapshotProgress(agent, { now = Date.now, maxScan = 800 } = {}) 
 		elapsedMs: null,
 		actions: [],
 		lastText: '',
+		lastReasoning: '',
+		latestStep: null,
+		lastTextStep: null,
+		lastReasoningStep: null,
+		textStepsBehind: null,
 		lastEventAgoMs: null,
 		scanned: 0,
 		takenAt: Number.isFinite(nowMs) ? nowMs : null,
@@ -101,6 +126,12 @@ export function snapshotProgress(agent, { now = Date.now, maxScan = 800 } = {}) 
 		if (typeof event.time === 'number' && lastEventTime === null) lastEventTime = event.time
 		const turn = event.data?.turn ?? null
 		const sameTurn = snapshot.turn === null || turn === null || turn === snapshot.turn
+		// 步号（`step/start` 与 `assistant/message` / `tool/call` 都带）：用来回答
+		// "这段正文是几步之前写的"。
+		const step = typeof event.data?.step === 'number' ? event.data.step : null
+		if (step !== null && sameTurn) {
+			snapshot.latestStep = snapshot.latestStep === null ? step : Math.max(snapshot.latestStep, step)
+		}
 
 		if (!turnBoundarySeen && (event.type === 'turn/end' || event.type === 'turn/start')) {
 			turnBoundarySeen = true
@@ -117,11 +148,21 @@ export function snapshotProgress(agent, { now = Date.now, maxScan = 800 } = {}) 
 				at: typeof event.time === 'number' ? event.time : null,
 			})
 		}
-		if (!snapshot.lastText && event.type === 'assistant/message' && sameTurn) {
-			snapshot.lastText = extractAssistantText(event.data?.message)
+		if (event.type === 'assistant/message' && sameTurn) {
+			if (!snapshot.lastText) {
+				snapshot.lastText = extractAssistantText(event.data?.message)
+				if (snapshot.lastText) snapshot.lastTextStep = step
+			}
+			if (!snapshot.lastReasoning) {
+				snapshot.lastReasoning = extractAssistantReasoning(event.data?.message)
+				if (snapshot.lastReasoning) snapshot.lastReasoningStep = step
+			}
 		}
 	}
 
+	if (snapshot.latestStep !== null && snapshot.lastTextStep !== null) {
+		snapshot.textStepsBehind = Math.max(0, snapshot.latestStep - snapshot.lastTextStep)
+	}
 	if (snapshot.startedAt !== null && Number.isFinite(nowMs)) {
 		snapshot.elapsedMs = Math.max(0, nowMs - snapshot.startedAt)
 	}
@@ -145,6 +186,25 @@ const formatElapsed = (ms) => {
 	return `${Math.floor(ms / 60_000)} 分 ${Math.round((ms % 60_000) / 1000)} 秒`
 }
 
+/** 「第 N 步」标注（拿不到步号就不标）。 */
+function stepTag(step) {
+	return Number.isFinite(step) ? `（第 ${step} 步）` : ''
+}
+
+/**
+ * 正文的步号标注：除"第几步"外，还要写清**距最新步骤隔了多少步**（用户要求）。
+ * 例：`（第 9 步，距最新第 14 步隔 5 步）`；当它就是最新一步时写「就是最新一步」。
+ */
+function textStepTag(snapshot) {
+	const step = Number.isFinite(snapshot?.lastTextStep) ? snapshot.lastTextStep : null
+	if (step === null) return ''
+	const latest = Number.isFinite(snapshot?.latestStep) ? snapshot.latestStep : null
+	if (latest === null) return `（第 ${step} 步）`
+	const behind = Math.max(0, latest - step)
+	if (behind === 0) return `（第 ${step} 步，就是最新一步）`
+	return `（第 ${step} 步，距最新第 ${latest} 步隔 ${behind} 步）`
+}
+
 /** 渲染成 QQ 可用的 markdown（只用标题/引用/列表，绝不用表格）。 */
 export function renderProgress({ label, snapshot, sessionId }) {
 	// 「几秒前」按**采样时刻**算，而不是渲染时刻：渲染可能晚很多，口径要一致。
@@ -165,8 +225,16 @@ export function renderProgress({ label, snapshot, sessionId }) {
 			lines.push(`- ${action.name}${action.args ? `：${action.args}` : ''}${ago ? `（${ago}）` : ''}`)
 		}
 	}
+	// 两段分开（用户要求）：想的是「最近一段思考」，说出来的是「最近一段正文」；
+	// 正文还要标出"距最新步骤隔了多少步"，这样一眼知道它多久没对外说话了。
+	if (snapshot.lastReasoning) {
+		lines.push('', `**最近一段思考${stepTag(snapshot.lastReasoningStep)}**`, `> ${snapshot.lastReasoning}`)
+	}
 	if (snapshot.lastText) {
-		lines.push('', '**最近一段输出**', `> ${snapshot.lastText}`)
+		lines.push('', `**最近一段正文${textStepTag(snapshot)}**`, `> ${snapshot.lastText}`)
+	}
+	if (!snapshot.lastReasoning && !snapshot.lastText && snapshot.scanned > 0) {
+		lines.push('', '最近还没有模型输出（可能刚起轮次或在跑工具）。')
 	}
 	if (snapshot.scanned === 0) lines.push('', '（会话里还没有可读的事件）')
 	return lines.join('\n')

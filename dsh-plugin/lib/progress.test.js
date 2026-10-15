@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
+	extractAssistantReasoning,
 	extractAssistantText,
 	renderProgress,
 	snapshotProgress,
@@ -39,6 +40,121 @@ test('extractAssistantText：只取 text 块，跳过 reasoning', () => {
 	)
 	assert.equal(extractAssistantText({ content: [{ type: 'reasoning', text: '只有推理' }] }), '')
 	assert.equal(extractAssistantText(null), '')
+})
+
+test('extractAssistantReasoning：只取 reasoning 块（thinking 也认），跳过 text/tool-call', () => {
+	assert.equal(
+		extractAssistantReasoning({
+			content: [
+				{ type: 'reasoning', text: '先看看这个路径' },
+				{ type: 'text', text: '正文' },
+				{ type: 'tool-call', text: '' },
+			],
+		}),
+		'先看看这个路径',
+	)
+	assert.equal(extractAssistantReasoning({ content: [{ type: 'thinking', text: '老字段名也认' }] }), '老字段名也认')
+	assert.equal(extractAssistantReasoning({ content: [{ type: 'text', text: '只有正文' }] }), '')
+	assert.equal(extractAssistantReasoning(null), '')
+})
+
+test('snapshotProgress：思考与正文分开摘，并算出"正文距最新步骤隔了多少步"', () => {
+	const t0 = 2_000_000
+	const agent = makeAgent({
+		events: [
+			ev(0, 'turn/start', t0, { turn: 5 }),
+			// 第 1 步：说了句正文
+			ev(1, 'assistant/message', t0 + 1000, {
+				turn: 5,
+				step: 1,
+				message: { content: [{ type: 'text', text: '先读一下配置' }] },
+			}),
+			ev(2, 'tool/call', t0 + 2000, { turn: 5, step: 2, name: 'read', arguments: '{"file_path":"a.js"}' }),
+			ev(3, 'tool/result', t0 + 3000, { turn: 5, step: 2 }),
+			// 第 3 步：只有思考 + 工具调用（还没对外说话）
+			ev(4, 'assistant/message', t0 + 4000, {
+				turn: 5,
+				step: 3,
+				message: { content: [{ type: 'reasoning', text: '这个路径可能泄露' }, { type: 'tool-call', text: '' }] },
+			}),
+			ev(5, 'tool/call', t0 + 5000, { turn: 5, step: 3, name: 'edit', arguments: '{"file_path":"b.md"}' }),
+			ev(6, 'step/start', t0 + 6000, { turn: 5, step: 6 }),
+			ev(7, 'tool/call', t0 + 7000, { turn: 5, step: 6, name: 'bash', arguments: '{"command":"pnpm test"}' }),
+		],
+	})
+	const snapshot = snapshotProgress(agent, { now: t0 + 8000 })
+
+	assert.equal(snapshot.lastReasoning, '这个路径可能泄露', '思考取 reasoning 块')
+	assert.equal(snapshot.lastReasoningStep, 3)
+	assert.equal(snapshot.lastText, '先读一下配置', '正文取 text 块（最新那条正文）')
+	assert.equal(snapshot.lastTextStep, 1)
+	assert.equal(snapshot.latestStep, 6)
+	assert.equal(snapshot.textStepsBehind, 5, '正文在第 1 步、最新第 6 步 → 隔 5 步')
+})
+
+test('renderProgress：思考与正文分两段，正文标注距最新步骤隔多少步', () => {
+	const text = renderProgress({
+		label: '会话(session-1)',
+		sessionId: 'session-1',
+		snapshot: {
+			status: 'running',
+			midTurn: true,
+			turn: 5,
+			startedAt: Date.now() - 3000,
+			elapsedMs: 3000,
+			actions: [{ name: 'bash', args: 'pnpm test', at: Date.now() - 1000 }],
+			lastReasoning: '这个路径可能泄露',
+			lastReasoningStep: 3,
+			lastText: '先读一下配置',
+			lastTextStep: 1,
+			latestStep: 6,
+			textStepsBehind: 5,
+			lastEventAgoMs: 1000,
+			scanned: 8,
+		},
+	})
+	assert.match(text, /\*\*最近一段思考（第 3 步）\*\*/, '思考单独一段，带步号')
+	assert.match(text, /> 这个路径可能泄露/)
+	assert.match(text, /\*\*最近一段正文（第 1 步，距最新第 6 步隔 5 步）\*\*/, '正文要标出落后多少步')
+	assert.match(text, /> 先读一下配置/)
+	assert.ok(text.indexOf('最近一段思考') < text.indexOf('最近一段正文'))
+	assert.doesNotMatch(text, /\|/, '不要出现表格竖线')
+
+	// 正文就是最新一步：另一种措辞
+	const fresh = renderProgress({
+		label: 'x',
+		sessionId: 's',
+		snapshot: {
+			status: 'running',
+			midTurn: true,
+			turn: 1,
+			elapsedMs: 100,
+			actions: [],
+			lastText: '刚写完',
+			lastTextStep: 4,
+			latestStep: 4,
+			textStepsBehind: 0,
+			scanned: 3,
+		},
+	})
+	assert.match(fresh, /\*\*最近一段正文（第 4 步，就是最新一步）\*\*/)
+})
+
+test('snapshotProgress：抓不到步号时只降级标注，绝不崩、也不印 NaN', () => {
+	const agent = makeAgent({
+		events: [
+			ev(0, 'turn/start', 1000, { turn: 1 }),
+			ev(1, 'assistant/message', 1500, { turn: 1, message: { content: [{ type: 'text', text: '没有步号' }] } }),
+		],
+	})
+	const snapshot = snapshotProgress(agent, { now: 3000 })
+	assert.equal(snapshot.lastText, '没有步号')
+	assert.equal(snapshot.latestStep, null)
+	assert.equal(snapshot.lastTextStep, null)
+	assert.equal(snapshot.textStepsBehind, null)
+	const text = renderProgress({ label: 'x', sessionId: 's', snapshot })
+	assert.match(text, /\*\*最近一段正文\*\*/, '没步号就不标，标题仍然给')
+	assert.doesNotMatch(text, /NaN/)
 })
 
 test('snapshotProgress：抓到当前轮次、耗时、最近动作与最近输出', () => {
