@@ -1,15 +1,16 @@
 /**
- * 只读进度快照（方案 A）。
+ * 只读「状态」快照（方案 A）：命令 `状态`（旧名 `进度` 仍认，见 commands.js 的 ALIASES）。
  *
  * 目标：**不打断正在跑的 AI**，也能知道它在干什么。
  * 做法：从会话事件日志里往回读（`session.eventAt`），摘出当前/最近一轮的关键信息：
- *   状态、轮次、已耗时、最近几个工具调用、最近一段 AI 文本。
+ *   状态、轮次、已耗时、最近几个工具调用、最近一段 AI 文本；
+ *   会话/模型/权限由调用方（index.js）读两条 durable 投影后传进来。
  *
  * 纪律：
  *   - **纯只读**：不 append、不 cancel、不发消息、不 resume（`agents.get` 拿不到就当"没有活跃 agent"）；
  *   - 扫描有上限（maxScan，默认 2000 条；reasoning/tool 事件很密，太小会读不到最近一段正文），
  *     绝不把整个会话读一遍；
- *   - 任何字段缺失都降级，不抛错（进度查不到不该影响主流程）。
+ *   - 任何字段缺失都降级，不抛错（状态查不到不该影响主流程）。
  */
 
 /** 每条动作/文本最多截断到这个长度。 */
@@ -213,15 +214,32 @@ function stepDistanceTag(step, snapshot) {
 	return `（第 ${step} 步，距最新第 ${latest} 步隔 ${behind} 步）`
 }
 
-/** 渲染成 QQ 可用的 markdown（只用标题/引用/列表，绝不用表格）。 */
-export function renderProgress({ label, snapshot, sessionId }) {
+/**
+ * 渲染成 QQ 可用的 markdown（只用标题/引用/列表，绝不用表格）。
+ *
+ * 用户要求（2026-10-16）：标题从「进度快照」改成「**状态**」（命令也从 `进度` 改成 `状态`），
+ * 抬头**带上这个会话用的是哪个模型、当前权限**，并**去掉原来的「说明：只读查询…」那一行**。
+ *
+ * @param {object} input
+ * @param {string} input.label 会话显示名（标题(会话id)）
+ * @param {string} [input.sessionId] 兜底显示
+ * @param {object|null} [input.snapshot] `snapshotProgress(agent)` 的结果；**没有活 agent 时传 null**
+ * @param {{provider:string, model:string}|null} [input.model] 会话当前模型（读不到就 null）
+ * @param {string} [input.permission] 会话当前权限的显示名（读不到就空串）
+ */
+export function renderProgress({ label, snapshot = null, sessionId, model = null, permission = '' }) {
 	// 「几秒前」按**采样时刻**算，而不是渲染时刻：渲染可能晚很多，口径要一致。
 	const takenAt = Number.isFinite(snapshot?.takenAt) ? snapshot.takenAt : Date.now()
-	const lines = ['**进度快照**', `> 会话：${label ?? sessionId}`, `> 状态：${describeStatus(snapshot)}`]
-	if (snapshot.midTurn) {
-		lines.push('> 说明：只读查询，**没有打断它**（AI 还在继续跑）')
-	} else {
-		lines.push('> 说明：当前没有在跑的轮次，下面是最近一轮的情况')
+	const lines = [
+		'**状态**',
+		`> 会话：${label ?? sessionId}`,
+		`> 模型：${model?.provider && model?.model ? `${model.provider} / ${model.model}` : '（读不到）'}`,
+		`> 权限：${permission || '（读不到）'}`,
+		`> 状态：${describeStatus(snapshot)}`,
+	]
+	if (!snapshot) {
+		lines.push('', '（这个会话现在没有活着的 agent，下面是空的；发一条消息就能让它跑起来。）')
+		return lines.join('\n')
 	}
 	if (snapshot.actions.length === 0) {
 		lines.push('', '最近还没有工具调用记录。')
@@ -249,11 +267,12 @@ export function renderProgress({ label, snapshot, sessionId }) {
 }
 
 function describeStatus(snapshot) {
+	if (!snapshot) return '没有活跃的 agent（这一轮没在跑）'
 	if (snapshot.midTurn) {
 		const elapsed = formatElapsed(snapshot.elapsedMs)
 		const turn = snapshot.turn === null ? '' : `第 ${snapshot.turn} 轮，`
 		return `运行中（${turn}已跑 ${elapsed || '未知时长'}）`
 	}
 	if (snapshot.status === 'running') return 'agent 标记为运行中，但没读到当前轮次'
-	return '空闲'
+	return '空闲（没在跑，下面是最近一轮的情况）'
 }

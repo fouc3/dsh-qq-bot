@@ -184,7 +184,16 @@ function makeCtx({ sessionSummaries = [], live = {}, commands = null } = {}) {
 			},
 			async projections({ sessionId }) {
 				const value = ctx.sessionController.modelSelection[sessionId]
-				return { asOfSeq: 1, values: value ? { 'model/selection': { lastUsed: value, pending: null } } : {} }
+				// 真实 dsh 里 `sessionController.projections()` 返回**所有**登记的会话投影视图：
+				// `model/selection` 来自模型选择，`permissions` 来自 permissionPresets
+				// （它的 wire view 就是 `{ currentValue: <预设> }`）。`状态` 卡片两条都读。
+				return {
+					asOfSeq: 1,
+					values: {
+						...(value ? { 'model/selection': { lastUsed: value, pending: null } } : {}),
+						permissions: { currentValue: ctx.permissionPresets.currentValue },
+					},
+				}
 			},
 		},
 		workspaceRegistry: {
@@ -459,7 +468,7 @@ test('register → panel：白名单快照 + 十条命令的面板定义（只�
 	assert.deepEqual(panel.value.userOpenIds, ['U1'])
 	assert.deepEqual(
 		panel.value.items.map((item) => item.name),
-		['切换会话', '快捷', '新建会话', '进度', '发送', '停止', '归档', '延迟发送', '权限', '模型'],
+		['切换会话', '快捷', '新建会话', '状态', '发送', '停止', '归档', '延迟发送', '权限', '模型'],
 	)
 	// 扁平键 menuItems：与 Go 侧 PanelDefinition.MenuItems 对齐（大小写不敏感匹配）
 	// 顶层 8 项 = 7 个平铺 + 1 个「管理」二级菜单（停止/归档/权限）+ 2 个 dsh 命令二级菜单 = 10（平台上限）。
@@ -1922,6 +1931,44 @@ test('端到端：`权限` 发卡片（每行两个）／带参数直接设定�
 		return list.find((c) => c.kind === 'send_c2c' && /认不出权限级别/.test(String(c.args.content))) ?? null
 	})
 	assert.match(String(bad.args.content), /用法：/)
+
+	boot.dispose()
+})
+
+// 用户要求（2026-10-16）：`进度` 改名 `状态`，抬头带上"哪个会话 / 哪个模型 / 什么权限"，
+// 并去掉原来那句「说明：只读查询，没有打断它」。
+test('端到端：`状态` —— 抬头给会话/模型/权限，去掉"只读说明"，旧名 `进度` 仍认', async (t) => {
+	const agent = makeAgent('session-1')
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': agent } })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M0' })
+	await drainFor(boot.socketPath, 60)
+	// 先切个模型，这样卡片上能读出"用的是哪个模型"
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '模型 deepseek/deepseek-reasoner', msgId: 'M1' })
+	await drainFor(boot.socketPath, 60)
+
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '状态', msgId: 'M2' })
+	const card = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 60)
+		return list.find((c) => c.kind === 'send_c2c' && /^\*\*状态\*\*/m.test(String(c.args.content))) ?? null
+	})
+	const text = String(card.args.content)
+	assert.match(text, /> 会话：proj-a\(session-1\)/, '要写清是哪个会话')
+	assert.match(text, /> 模型：deepseek \/ deepseek-reasoner/, '要写清用的哪个模型')
+	assert.match(text, /> 权限：工作区内修改/, '要写清当前权限（中文显示名）')
+	assert.doesNotMatch(text, /说明：/, '用户要求去掉"只读查询"那段说明')
+	assert.match(text, /> 状态：/, '保留跑没在跑那行')
+	assert.equal(card.args.keyboard, undefined, '状态是纯文本，不带键盘')
+
+	// 旧名 `进度` 仍然认（别名 → 状态），不能因为改名就被当成普通消息投给 AI
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '进度', msgId: 'M3' })
+	const legacy = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 60)
+		return list.find((c) => c.kind === 'send_c2c' && /^\*\*状态\*\*/m.test(String(c.args.content))) ?? null
+	})
+	assert.match(String(legacy.args.content), /> 权限：工作区内修改/, '别名走的是同一条路')
+	assert.equal(agent.followed.length, 0, '旧名不能被当成普通消息发给 AI')
 
 	boot.dispose()
 })

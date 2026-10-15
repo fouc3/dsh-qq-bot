@@ -232,10 +232,12 @@ test('snapshotProgress：没有会话/没有事件都不炸，只如实给出空
 	assert.deepEqual(empty.actions, [])
 })
 
-test('renderProgress：输出是 QQ 能渲染的 markdown（无表格），并写明没打断', () => {
+test('renderProgress：标题是「状态」，抬头带会话/模型/权限，且没有"只读说明"那一行', () => {
 	const running = renderProgress({
 		label: '标题(session-1)',
 		sessionId: 'session-1',
+		model: { provider: 'deepseek-official', model: 'deepseek-reasoner' },
+		permission: '工作区内修改',
 		snapshot: {
 			status: 'running',
 			midTurn: true,
@@ -248,11 +250,13 @@ test('renderProgress：输出是 QQ 能渲染的 markdown（无表格），并�
 			scanned: 5,
 		},
 	})
-	assert.match(running, /进度快照/)
+	assert.match(running, /^\*\*状态\*\*/)
 	assert.match(running, /标题\(session-1\)/)
+	assert.match(running, /> 模型：deepseek-official \/ deepseek-reasoner/, '要写清用的哪个模型')
+	assert.match(running, /> 权限：工作区内修改/, '要写清当前权限')
+	assert.doesNotMatch(running, /说明：/, '用户要求去掉"只读查询"那段说明')
 	assert.match(running, /运行中/)
 	assert.match(running, /第 3 轮/)
-	assert.match(running, /没有打断它/, '必须说明只读、没打断')
 	assert.match(running, /bash：pnpm test/)
 	assert.match(running, /正在跑测试/)
 	assert.doesNotMatch(running, /\|/, '不要出现表格竖线')
@@ -264,6 +268,20 @@ test('renderProgress：输出是 QQ 能渲染的 markdown（无表格），并�
 	})
 	assert.match(idle, /空闲/)
 	assert.match(idle, /没有可读的事件/)
+})
+
+test('renderProgress：没有活 agent（snapshot=null）也照样给会话/模型/权限/状态', () => {
+	const text = renderProgress({ label: 'x(session-9)', sessionId: 'session-9', snapshot: null })
+	assert.match(text, /^\*\*状态\*\*/)
+	assert.match(text, /> 模型：（读不到）/, '读不到模型就明说，不印空')
+	assert.match(text, /> 权限：（读不到）/)
+	assert.match(text, /没有活跃的 agent/)
+	assert.match(text, /发一条消息就能让它跑起来/)
+	assert.doesNotMatch(text, /NaN/)
+
+	// 模型给成半截（只有 provider）也要按"读不到"处理，不能印 `deepseek / undefined`
+	const partial = renderProgress({ label: 'x', sessionId: 's', snapshot: null, model: { provider: 'deepseek' } })
+	assert.match(partial, /> 模型：（读不到）/)
 })
 
 // 补票：线上真踩过——默认参数 `now = Date.now` 是个**函数**，被当成时间戳用，

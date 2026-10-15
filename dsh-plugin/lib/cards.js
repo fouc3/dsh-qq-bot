@@ -777,7 +777,7 @@ function questionButtonCost(question) {
 function questionHints({ cardIndex, cardTotal }) {
 	const hints = [
 		'> 不选任何字母直接点「提交」= 跳过本题。',
-		'> 命令（如 进度 / 停止 / 切换会话）照常生效，不会被当成答案。',
+		'> 命令（如 状态 / 停止 / 切换会话）照常生效，不会被当成答案。',
 	]
 	if (cardTotal > 1) {
 		hints.unshift(

@@ -1047,17 +1047,16 @@ export function apply(ctx, rawConfig) {
 		setModel: ({ openid, sessionId, spec }) => setModelForSession({ openid, sessionId, spec }),
 		// 裸发 `发送` 进入输入态（详细设计见 lib/inbox.js 顶部注释）。
 		beginInput: ({ openid, sessionId, replyContext, mode }) => beginInput({ openid, sessionId, replyContext, mode }),
-		// 进度是**只读**的：只用 agents.get（不 resume、不 cancel）；拿不到活跃 agent 就如实说没在跑。
+		// 「状态」是**只读**的：只用 agents.get（**不 resume、不 cancel**）+ 两条 durable 投影
+		// （模型 `model/selection`、权限 `permissions`）；没有活 agent 也照样给模型与权限，
+		// 只把"跑起来"那段状态写清楚。
 		progress: async ({ sessionId }) => {
 			const label = sessions.get(sessionId) ? sessions.label(sessionId) : sessionId
 			const agent = ctx.agents.get(sessionId)
-			if (!agent) {
-				return {
-					content: `**进度快照**\n> 会话：${label}\n> 状态：没有活跃的 agent（这一轮没在跑）\n\n让它跑起来的话，直接发一条消息即可。`,
-				}
-			}
-			const snapshot = snapshotProgress(agent)
-			return { content: renderProgress({ label, snapshot, sessionId }) }
+			const model = await models.current(sessionId)
+			const permission = permissions.nameOf(await permissions.currentForId(sessionId))
+			const snapshot = agent ? snapshotProgress(agent) : null
+			return { content: renderProgress({ label, snapshot, sessionId, model, permission }) }
 		},
 		deliver: ({ sessionId, openid, text, interrupt }) =>
 			deliver({ sessionId, openid, text, interrupt, origin: 'qq', context: {} }),
@@ -1221,7 +1220,7 @@ export function apply(ctx, rawConfig) {
 		if (available.length > 0) {
 			lines.push(`> 这个会话可用：${available.map((cmd) => `\`/${cmd.name}\``).join('、')}`)
 		}
-		lines.push('> 桥自己的命令是中文的：`快捷`、`发送`、`延迟发送`、`进度`、`模型`…')
+		lines.push('> 桥自己的命令是中文的：`快捷`、`发送`、`延迟发送`、`状态`、`模型`…')
 		lines.push('> 真要把以 `/` 开头的话当消息发，把开头那个换成全角 `／`。')
 		return lines.join('\n')
 	}
@@ -1230,7 +1229,7 @@ export function apply(ctx, rawConfig) {
 	function noSessionSlashText(name) {
 		return [
 			`当前没有绑定会话，\`/${name}\` 执行不了，**这一条没有发给 AI**。`,
-			'> 先发 `切换会话` 接一个，再用 dsh 命令；桥自己的命令（`快捷`/`发送`/`进度`…）不需要会话。',
+			'> 先发 `切换会话` 接一个，再用 dsh 命令；桥自己的命令（`快捷`/`发送`/`状态`…）不需要会话。',
 			'> 真要把以 `/` 开头的话当消息发，把开头那个换成全角 `／`。',
 		].join('\n')
 	}
@@ -1240,7 +1239,7 @@ export function apply(ctx, rawConfig) {
 		const context = { msgId: event.msgId ?? '' }
 
 		// 1) 桥命令最优先：**即使正在等提问作答，命令也必须先执行** ——
-		//    否则 `停止`/`进度` 这类命令会被提问桥当「其他」答案吃掉。
+		//    否则 `停止`/`状态` 这类命令会被提问桥当「其他」答案吃掉。
 		const parsed = parseCommand(event.text)
 		if (parsed) {
 			// 命令也当"取消等目录名/等会话id"：不然点了「新建目录」或「切到其他会话」

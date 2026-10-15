@@ -89,6 +89,9 @@ test('parseCommand：可带一个前导斜杠，非命令返回 null', () => {
 		tokens: ['session-2', '打完了叫我'],
 		rest: 'session-2 打完了叫我',
 	})
+	// 旧名 `进度` 是 `状态` 的别名（改名后手滑按老习惯发，不该被当成普通消息投给 AI）
+	assert.deepEqual(parseCommand('进度'), { name: '状态', tokens: [], rest: '' })
+	assert.deepEqual(parseCommand('进度 session-1'), { name: '状态', tokens: ['session-1'], rest: 'session-1' })
 	assert.equal(parseCommand('你好'), null)
 	assert.equal(parseCommand('/'), null)
 	assert.equal(parseCommand(''), null)
@@ -108,7 +111,7 @@ test('需要参数的命令无参时回作用与用法', () => {
 test('面板条目与菜单条目都由同一张命令表派生', () => {
 	const items = panelItems()
 	assert.equal(items.length, 10)
-	assert.deepEqual(items.map((i) => i.name), ['切换会话', '快捷', '新建会话', '进度', '发送', '停止', '归档', '延迟发送', '权限', '模型'])
+	assert.deepEqual(items.map((i) => i.name), ['切换会话', '快捷', '新建会话', '状态', '发送', '停止', '归档', '延迟发送', '权限', '模型'])
 	assert.equal(items.at(-1).desc, '看/切模型（提供商/模型）')
 
 	// 自定义菜单：顶层只有 8 项（7 个平铺 + 1 个「管理」二级菜单），
@@ -117,7 +120,7 @@ test('面板条目与菜单条目都由同一张命令表派生', () => {
 	assert.equal(menu.length, 8)
 	assert.deepEqual(
 		menu.filter((it) => it.type !== 'menu').map((it) => it.sendMessage),
-		['切换会话', '快捷', '新建会话', '发送', '延迟发送', '模型', '进度'],
+		['切换会话', '快捷', '新建会话', '发送', '延迟发送', '模型', '状态'],
 	)
 	const manage = menu.find((it) => it.type === 'menu')
 	assert.equal(manage.name, '管理')

@@ -123,6 +123,50 @@ export function createPermissions({ ctx, logger }) {
 	}
 
 	/**
+	 * 只给**会话id**也能读出当前预设 value —— `状态` 卡片要显示权限，而它不许把冷会话唤醒。
+	 *
+	 * 两条路：
+	 *   1. 会话**活着**（`ctx.sessions.get(id)`，内存会话表）→ 直接问服务，最准；
+	 *   2. 冷会话 → 读 dsh 自己登记的**会话投影**：`permissionPresets` 注册的 key 是
+	 *      `permissions`，它的 wire view 就是 `{ currentValue: <预设> }`，
+	 *      和 `model/selection` 走同一个 `sessionController.projections()`（durable、不用唤醒）。
+	 * 两条都读不到就返回空串，调用方显示「（读不到）」。
+	 */
+	async function currentForId(sessionId) {
+		if (!sessionId) return ''
+		try {
+			const session = ctx.get?.('sessions')?.get?.(sessionId) ?? null
+			if (session) {
+				const value = current(session)
+				if (value) return value
+			}
+		} catch (error) {
+			logger?.debug?.('按活会话读权限失败（改走投影）', { sessionId, error: String(error) })
+		}
+		try {
+			const controller = ctx.get?.('sessionController') ?? null
+			if (typeof controller?.projections === 'function') {
+				const signal = typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+					? AbortSignal.timeout(5000)
+					: new AbortController().signal
+				const baseline = await controller.projections({ sessionId }, signal)
+				const value = baseline?.values?.['permissions']?.currentValue
+				if (typeof value === 'string' && value) return value
+			}
+		} catch (error) {
+			logger?.debug?.('读权限投影失败（忽略）', { sessionId, error: String(error) })
+		}
+		return ''
+	}
+
+	/** 预设 value → 显示名（内置三档是 Web 同款中文；未知值原样返回）。 */
+	function nameOf(value) {
+		if (typeof value !== 'string' || !value) return ''
+		const option = catalog().find((item) => item.value === value)
+		return option?.name ?? displayName({ value, name: value })
+	}
+
+	/**
 	 * 把用户输入解析成预设 value。
 	 * 认：精确 value / 预设显示名 / 别名表 / 纯序号（`1` 起）。
 	 * @returns {{ok:true, value:string}|{ok:false, error:string}}
@@ -171,5 +215,5 @@ export function createPermissions({ ctx, logger }) {
 		return option.description ? `**${option.name}**（${option.description}）` : `**${option.name}**`
 	}
 
-	return { available, catalog, current, resolveToken, set, describe }
+	return { available, catalog, current, currentForId, nameOf, resolveToken, set, describe }
 }

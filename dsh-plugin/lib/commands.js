@@ -50,11 +50,13 @@ export const COMMANDS = [
 		usageAlt: '新建会话                 # 不带参数：用卡片选目录',
 	},
 	{
-		name: '进度',
-		desc: '看当前进展（只读不打断）',
-		purpose: '只读地看一眼某会话现在在干什么（状态/轮次/耗时/最近动作），**不会打断**正在跑的 AI。',
-		usage: '进度',
-		usageAlt: '进度 <会话id>                 # 看指定会话',
+		name: '状态',
+		desc: '看当前状态（会话/模型/权限）',
+		purpose:
+			'一眼看清某会话现在的样子：**在哪个会话、用的哪个模型、当前什么权限**、跑没在跑（第几轮/已跑多久）、' +
+			'最近 3 个动作，以及最近一段思考与最近一段正文。**只读**，不会打断正在跑的 AI。',
+		usage: '状态',
+		usageAlt: '状态 <会话id>                 # 看指定会话',
 	},
 	{
 		name: '发送',
@@ -115,6 +117,14 @@ export const COMMANDS = [
 const BY_NAME = new Map(COMMANDS.map((cmd) => [cmd.name, cmd]))
 
 /**
+ * 旧名 → 新名的别名（用户把 `进度` 改名成了 `状态`）。
+ *
+ * 为什么留：桥里**认不出的文本会被当成普通消息投给 AI** —— 手滑按老习惯发 `进度`，
+ * 就等于往会话里扔一条"进度"；留别名没有这个坑。指令面板与菜单里只列新名（`状态`）。
+ */
+const ALIASES = { 进度: '状态' }
+
+/**
  * 解析一条消息是不是命令。
  *
  * 允许一个可选的前导 `/`（QQ 自定义菜单与指令按钮填过来的文本可能带或不带）。
@@ -128,8 +138,9 @@ export function parseCommand(text) {
 	const withoutSlash = trimmed.startsWith('/') ? trimmed.slice(1).trim() : trimmed
 	if (!withoutSlash) return null
 	const tokens = withoutSlash.split(/\s+/)
-	if (!BY_NAME.has(tokens[0])) return null
-	return { name: tokens[0], tokens: tokens.slice(1), rest: tokens.slice(1).join(' ') }
+	const name = ALIASES[tokens[0]] ?? tokens[0]
+	if (!BY_NAME.has(name)) return null
+	return { name, tokens: tokens.slice(1), rest: tokens.slice(1).join(' ') }
 }
 
 /** 该命令是否需要参数（用于"无参回用法"）。 */
@@ -176,7 +187,7 @@ const MENU_LAYOUT = [
 	'发送',
 	'延迟发送',
 	'模型',
-	'进度',
+	'状态',
 	{ name: '管理', children: ['停止', '归档', '权限'] },
 ]
 
@@ -247,7 +258,7 @@ export function createCommandRunner(deps) {
 				return shortcuts(context, parsed)
 			case '新建会话':
 				return newSession(context, parsed)
-			case '进度':
+			case '状态':
 				return showProgress(context, parsed)
 			case '发送':
 				return sendOnce(context, parsed)
@@ -295,7 +306,7 @@ export function createCommandRunner(deps) {
 	}
 
 	/**
-	 * 进度：只读快照，**不打断**正在跑的 AI。
+	 * 状态：只读快照（会话 / 模型 / 权限 / 跑没在跑 / 最近动作与两段输出），**不打断**正在跑的 AI。
 	 *
 	 * 无参 = 当前绑定会话；带参 = 指定会话（`<会话id>` 或 `<目录> <会话id>`）。
 	 */
@@ -306,7 +317,7 @@ export function createCommandRunner(deps) {
 			if (!bound || bound === 'none') {
 				await deps.reply({
 					openid,
-					content: '当前没有绑定会话。用 `进度 <会话id>` 可以直接看某个会话。',
+					content: '当前没有绑定会话。用 `状态 <会话id>` 可以直接看某个会话。',
 					markdown: true,
 					replyContext,
 				})
@@ -316,11 +327,11 @@ export function createCommandRunner(deps) {
 		} else {
 			const target = sessions.resolveRef(parsed.tokens)
 			if (target?.error) {
-				await deps.reply({ openid, content: `${target.error}\n\n${usageText('进度')}`, replyContext })
+				await deps.reply({ openid, content: `${target.error}\n\n${usageText('状态')}`, replyContext })
 				return { handled: true }
 			}
 			if (!target) {
-				await deps.reply({ openid, content: usageText('进度'), replyContext })
+				await deps.reply({ openid, content: usageText('状态'), replyContext })
 				return { handled: true }
 			}
 			sessionId = target.sessionId

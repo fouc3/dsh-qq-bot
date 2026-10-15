@@ -54,6 +54,48 @@ test('权限：目录/当前值/切换（并如实回执名称与描述）', () 
 	assert.match(bad.error, /nope/)
 })
 
+// 「状态」卡片要显示权限，而它**不许把冷会话唤醒**：所以既能只给会话id读，
+// 又要有"活会话问服务、冷会话读 permissions 投影"两条路。
+test('权限：只给会话id也能读 —— 活会话走服务，冷会话走 permissions 投影', async () => {
+	// 1) 活会话：ctx.sessions.get(id) 拿到会话对象 → 问服务（最准）
+	const liveService = { currentValue: 'danger-full-access' }
+	const liveValue = { current: () => liveService.currentValue }
+	const liveCtx = {
+		get: (name) =>
+			({
+				permissionPresets: { ...liveValue, catalog: () => ({ options: [] }) },
+				sessions: { get: (id) => (id === 's-live' ? { id } : undefined) },
+			})[name],
+	}
+	assert.equal(await createPermissions({ ctx: liveCtx }).currentForId('s-live'), 'danger-full-access')
+
+	// 2) 冷会话：读 dsh 登记的会话投影 `permissions` 的 wire view（{ currentValue }）
+	const coldCtx = {
+		get: (name) =>
+			({
+				permissionPresets: { catalog: () => ({ options: [] }) },
+				sessions: { get: () => undefined },
+				sessionController: {
+					projections: async ({ sessionId }) =>
+						sessionId === 's-cold' ? { values: { permissions: { currentValue: 'read-only' } } } : { values: {} },
+				},
+			})[name],
+	}
+	const cold = createPermissions({ ctx: coldCtx })
+	assert.equal(await cold.currentForId('s-cold'), 'read-only')
+
+	// 3) 两条路都读不到 → 空串（调用方显示"读不到"，不崩、不猜）
+	assert.equal(await cold.currentForId('s-missing'), '')
+	assert.equal(await cold.currentForId(''), '')
+
+	// 4) 显示名映射：内置档用 Web 同款中文；未知 kebab key 按 Web 的 displayPresetName 变成 Title Case
+	const withCatalog = createPermissions({ ctx: fakeCtx().ctx })
+	assert.equal(withCatalog.nameOf('workspace-write'), '工作区内修改')
+	assert.equal(withCatalog.nameOf('whatever'), 'Whatever')
+	assert.equal(withCatalog.nameOf(''), '')
+	assert.equal(withCatalog.nameOf(undefined), '')
+})
+
 test('权限：解析用户输入（中文名/英文 key/别名/序号），认不出就报错', () => {
 	const { ctx } = fakeCtx()
 	const permissions = createPermissions({ ctx })
