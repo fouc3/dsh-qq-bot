@@ -86,7 +86,8 @@ export function extractAssistantReasoning(message) {
  *   status: string, midTurn: boolean, turn: number|null, startedAt: number|null,
  *   elapsedMs: number|null, actions: Array<{name:string,args:string,at:number|null}>,
  *   lastText: string, lastReasoning: string, latestStep: number|null,
- *   lastTextStep: number|null, lastReasoningStep: number|null, textStepsBehind: number|null,
+ *   lastTextStep: number|null, lastReasoningStep: number|null,
+ *   textStepsBehind: number|null, reasoningStepsBehind: number|null,
  *   lastEventAgoMs: number|null, scanned: number
  * }}
  */
@@ -105,6 +106,7 @@ export function snapshotProgress(agent, { now = Date.now, maxScan = 2000 } = {})
 		lastTextStep: null,
 		lastReasoningStep: null,
 		textStepsBehind: null,
+		reasoningStepsBehind: null,
 		lastEventAgoMs: null,
 		scanned: 0,
 		takenAt: Number.isFinite(nowMs) ? nowMs : null,
@@ -163,6 +165,9 @@ export function snapshotProgress(agent, { now = Date.now, maxScan = 2000 } = {})
 	if (snapshot.latestStep !== null && snapshot.lastTextStep !== null) {
 		snapshot.textStepsBehind = Math.max(0, snapshot.latestStep - snapshot.lastTextStep)
 	}
+	if (snapshot.latestStep !== null && snapshot.lastReasoningStep !== null) {
+		snapshot.reasoningStepsBehind = Math.max(0, snapshot.latestStep - snapshot.lastReasoningStep)
+	}
 	if (snapshot.startedAt !== null && Number.isFinite(nowMs)) {
 		snapshot.elapsedMs = Math.max(0, nowMs - snapshot.startedAt)
 	}
@@ -192,12 +197,15 @@ function stepTag(step) {
 }
 
 /**
- * 正文的步号标注：除"第几步"外，还要写清**距最新步骤隔了多少步**（用户要求）。
+ * 一段输出的步号标注：除"第几步"外，还要写清**距最新步骤隔了多少步**。
  * 例：`（第 9 步，距最新第 14 步隔 5 步）`；当它就是最新一步时写「就是最新一步」。
+ *
+ * 思考与正文**用同一套措辞**（用户反馈）：线上同时看到「思考（第 95 步）」和
+ * 「正文（第 95 步，距最新第 100 步隔 5 步）」，像两段打架 —— 其实两段都是第 95 步
+ * 的输出，只是当时只有正文标了距离（那 5 步是正在跑的步骤/纯工具步骤，还没新输出）。
  */
-function textStepTag(snapshot) {
-	const step = Number.isFinite(snapshot?.lastTextStep) ? snapshot.lastTextStep : null
-	if (step === null) return ''
+function stepDistanceTag(step, snapshot) {
+	if (!Number.isFinite(step)) return ''
 	const latest = Number.isFinite(snapshot?.latestStep) ? snapshot.latestStep : null
 	if (latest === null) return `（第 ${step} 步）`
 	const behind = Math.max(0, latest - step)
@@ -226,12 +234,12 @@ export function renderProgress({ label, snapshot, sessionId }) {
 		}
 	}
 	// 两段分开（用户要求）：想的是「最近一段思考」，说出来的是「最近一段正文」；
-	// 正文还要标出"距最新步骤隔了多少步"，这样一眼知道它多久没对外说话了。
+	// **两段都标**"距最新步骤隔了多少步"，这样同一轮里可以直接对比、不会看着像打架。
 	if (snapshot.lastReasoning) {
-		lines.push('', `**最近一段思考${stepTag(snapshot.lastReasoningStep)}**`, `> ${snapshot.lastReasoning}`)
+		lines.push('', `**最近一段思考${stepDistanceTag(snapshot.lastReasoningStep, snapshot)}**`, `> ${snapshot.lastReasoning}`)
 	}
 	if (snapshot.lastText) {
-		lines.push('', `**最近一段正文${textStepTag(snapshot)}**`, `> ${snapshot.lastText}`)
+		lines.push('', `**最近一段正文${stepDistanceTag(snapshot.lastTextStep, snapshot)}**`, `> ${snapshot.lastText}`)
 	}
 	if (!snapshot.lastReasoning && !snapshot.lastText && snapshot.scanned > 0) {
 		lines.push('', '最近还没有模型输出（可能刚起轮次或在跑工具）。')

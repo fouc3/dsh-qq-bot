@@ -90,9 +90,10 @@ test('snapshotProgress：思考与正文分开摘，并算出"正文距最新步
 	assert.equal(snapshot.lastTextStep, 1)
 	assert.equal(snapshot.latestStep, 6)
 	assert.equal(snapshot.textStepsBehind, 5, '正文在第 1 步、最新第 6 步 → 隔 5 步')
+	assert.equal(snapshot.reasoningStepsBehind, 3, '思考在第 3 步、最新第 6 步 → 隔 3 步')
 })
 
-test('renderProgress：思考与正文分两段，正文标注距最新步骤隔多少步', () => {
+test('renderProgress：思考与正文分两段，两段都标"距最新步骤隔多少步"', () => {
 	const text = renderProgress({
 		label: '会话(session-1)',
 		sessionId: 'session-1',
@@ -109,16 +110,40 @@ test('renderProgress：思考与正文分两段，正文标注距最新步骤隔
 			lastTextStep: 1,
 			latestStep: 6,
 			textStepsBehind: 5,
+			reasoningStepsBehind: 3,
 			lastEventAgoMs: 1000,
 			scanned: 8,
 		},
 	})
-	assert.match(text, /\*\*最近一段思考（第 3 步）\*\*/, '思考单独一段，带步号')
+	assert.match(text, /\*\*最近一段思考（第 3 步，距最新第 6 步隔 3 步）\*\*/, '思考也要标出落后多少步（和正文同一套措辞）')
 	assert.match(text, /> 这个路径可能泄露/)
-	assert.match(text, /\*\*最近一段正文（第 1 步，距最新第 6 步隔 5 步）\*\*/, '正文要标出落后多少步')
+	assert.match(text, /\*\*最近一段正文（第 1 步，距最新第 6 步隔 5 步）\*\*/, '正文同样标')
 	assert.match(text, /> 先读一下配置/)
 	assert.ok(text.indexOf('最近一段思考') < text.indexOf('最近一段正文'))
 	assert.doesNotMatch(text, /\|/, '不要出现表格竖线')
+
+	// 两段同在最新一步：都写「就是最新一步」，不会再出现"一个不带距离、一个带距离"的观感
+	const same = renderProgress({
+		label: 'x',
+		sessionId: 's',
+		snapshot: {
+			status: 'running',
+			midTurn: true,
+			turn: 2,
+			elapsedMs: 100,
+			actions: [],
+			lastReasoning: '想清楚了',
+			lastReasoningStep: 20,
+			lastText: '核心已通过',
+			lastTextStep: 20,
+			latestStep: 20,
+			textStepsBehind: 0,
+			reasoningStepsBehind: 0,
+			scanned: 5,
+		},
+	})
+	assert.match(same, /\*\*最近一段思考（第 20 步，就是最新一步）\*\*/)
+	assert.match(same, /\*\*最近一段正文（第 20 步，就是最新一步）\*\*/)
 
 	// 正文就是最新一步：另一种措辞
 	const fresh = renderProgress({
