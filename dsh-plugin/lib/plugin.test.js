@@ -510,19 +510,28 @@ test('register → panel：白名单快照 + 十条命令的面板定义（只�
 	assert.equal(panel.value.enabled, true)
 	assert.equal(panel.value.menuEnabled, true)
 	assert.deepEqual(panel.value.userOpenIds, ['U1'])
-	assert.deepEqual(
-		panel.value.items.map((item) => item.name),
-		['切换会话', '快捷', '新建会话', '状态', '发送', '停止', '归档', '延迟发送', '权限', '模型'],
-	)
+	assert.deepEqual(panel.value.items.map((item) => item.name), [
+		'切换会话',
+		'运行中会话',
+		'快捷',
+		'新建会话',
+		'状态',
+		'发送',
+		'停止',
+		'归档',
+		'延迟发送',
+		'权限',
+		'模型',
+	])
 	// 扁平键 menuItems：与 Go 侧 PanelDefinition.MenuItems 对齐（大小写不敏感匹配）
-	// 顶层 8 项 = 7 个平铺 + 1 个「管理」二级菜单（停止/归档/权限）+ 2 个 dsh 命令二级菜单 = 10（平台上限）。
+	// 顶层 8 项 = 7 个平铺 + 1 个「管理」二级菜单（停止/归档/权限/运行中会话）+ 2 个 dsh 命令二级菜单 = 10（平台上限）。
 	assert.equal(panel.value.menuItems.length, 8)
 	assert.equal(panel.value.menuItems[0].name, '切换会话')
 	assert.equal(panel.value.menuItems[0].sendMessage, '切换会话')
 	assert.equal(panel.value.menuItems[1].sendMessage, '快捷')
 	const manageGroup = panel.value.menuItems.find((item) => item.type === 'menu')
 	assert.equal(manageGroup.name, '管理')
-	assert.deepEqual(manageGroup.children.map((child) => child.name), ['停止', '归档', '权限'])
+	assert.deepEqual(manageGroup.children.map((child) => child.name), ['停止', '归档', '权限', '运行中会话'])
 	assert.equal(panel.value.menu, undefined)
 
 	// 白名单落了盘（插件重启后仍能门守）
@@ -534,6 +543,72 @@ test('register → panel：白名单快照 + 十条命令的面板定义（只�
 			return false
 		}
 	})
+	boot.dispose()
+})
+
+// 用户要求（2026-10-16）：新增 `运行中会话`（列出**正在跑**的会话，点按钮**直接切过去**），
+// 并在「切换会话」卡片的「返回上级」与「不指定会话」之间也放一个入口按钮。
+test('端到端：运行中会话 —— 只列正在跑的；点按钮直接切过去并重发卡片；切换会话卡片里有入口', async (t) => {
+	const sessions = [
+		{ sessionId: 'session-1', cwd: '/home/u/proj-a', updatedAt: 9, running: true },
+		{ sessionId: 'session-2', cwd: '/home/u/proj-b', updatedAt: 8, running: false },
+		{ sessionId: 'session-3', cwd: '/home/u/proj-c', updatedAt: 7, running: true },
+	]
+	const agent = makeAgent('session-1')
+	const boot = bootPlugin(t, { sessions, live: { 'session-1': agent } })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	await drainFor(boot.socketPath, 60)
+
+	// ① 命令：只列正在跑的（session-1 / session-3），空闲的 session-2 不出现
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '运行中会话', msgId: 'M1' })
+	const card = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /\*\*运行中会话\*\*/.test(String(c.args.content))) ?? null
+	})
+	assert.match(String(card.args.content), /共 2 个正在跑/)
+	assert.doesNotMatch(String(card.args.content), /proj-b/, '空闲会话不该出现在"运行中"卡片里')
+	const buttons = card.args.keyboard.content.rows.flatMap((row) => row.buttons)
+	assert.deepEqual(buttons.map((b) => b.action.data).sort(), ['qqb:run:session-1', 'qqb:run:session-3'])
+	assert.equal(buttons[0].action.type, 1, '回调按钮：点一下当场切')
+
+	// ② 点 session-3：绑定切过去 + 回执 + 回应互动
+	await rpc(boot.socketPath, 'event', {
+		kind: 'interaction',
+		openid: 'U1',
+		buttonData: 'qqb:run:session-3',
+		eventId: 'INT-RUN',
+		msgId: 'CARD-RUN',
+	})
+	const after = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.some((c) => c.kind === 'send_c2c' && /已接入/.test(String(c.args.content))) ? list : null
+	})
+	assert.ok(
+		after.some((c) => c.kind === 'respond_interaction' && c.args.code === 0),
+		'要回应互动（code=0）',
+	)
+	const bound = await waitFor(() => {
+		try {
+			return JSON.parse(readFileSync(boot.stateFile, 'utf8')).bindings?.U1 ?? null
+		} catch {
+			return null
+		}
+	})
+	assert.equal(bound, 'session-3', '点一下就该切过去')
+
+	// ③ 「切换会话」卡片的导航行里有这个入口，且夹在「返回上级」与「不指定会话」之间
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话', msgId: 'M2' })
+	const switchCard = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /\*\*切换会话\*\*/.test(String(c.args.content))) ?? null
+	})
+	const nav = switchCard.args.keyboard.content.rows.at(-1).buttons.map((b) => b.render_data.label)
+	assert.ok(nav.length <= 3, `导航行最多 3 个按钮（实际 ${nav.join('/')}）`)
+	assert.equal(nav[0], '返回上级', '顺序：返回上级 → 运行中会话 → 不指定会话')
+	assert.equal(nav[1], '运行中会话')
+	assert.equal(nav[2], '不指定会话')
+
 	boot.dispose()
 })
 

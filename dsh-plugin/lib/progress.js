@@ -283,7 +283,7 @@ export function renderProgress({
 	return lines.join('\n')
 }
 
-function describeStatus(snapshot) {
+export function describeStatus(snapshot) {
 	if (!snapshot) return '没有活跃的 agent（这一轮没在跑）'
 	if (snapshot.midTurn) {
 		const elapsed = formatElapsed(snapshot.elapsedMs)

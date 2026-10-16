@@ -48,6 +48,7 @@ function makeRunner({ seed = {}, modelResult = { ok: true, text: '**DeepSeek / D
 		modelCards: [],
 		models: [],
 		shortcutCards: [],
+		runningCards: [],
 	}
 	const state = createState({ seed })
 	const runner = createCommandRunner({
@@ -57,6 +58,7 @@ function makeRunner({ seed = {}, modelResult = { ok: true, text: '**DeepSeek / D
 		reply: async ({ openid, content }) => calls.replies.push({ openid, content }),
 		showSessionCard: async ({ openid, dir }) => calls.cards.push({ openid, dir }),
 		showShortcutCard: async ({ openid }) => calls.shortcutCards.push({ openid, items: state.shortcutsOf(openid) }),
+		showRunningCard: async ({ openid }) => calls.runningCards.push({ openid }),
 		showModelCard: async ({ openid, sessionId }) => calls.modelCards.push({ openid, sessionId }),
 		setModel: async ({ openid, sessionId, spec }) => {
 			calls.models.push({ openid, sessionId, spec })
@@ -110,12 +112,24 @@ test('需要参数的命令无参时回作用与用法', () => {
 
 test('面板条目与菜单条目都由同一张命令表派生', () => {
 	const items = panelItems()
-	assert.equal(items.length, 10)
-	assert.deepEqual(items.map((i) => i.name), ['切换会话', '快捷', '新建会话', '状态', '发送', '停止', '归档', '延迟发送', '权限', '模型'])
+	assert.equal(items.length, 11)
+	assert.deepEqual(items.map((i) => i.name), [
+		'切换会话',
+		'运行中会话',
+		'快捷',
+		'新建会话',
+		'状态',
+		'发送',
+		'停止',
+		'归档',
+		'延迟发送',
+		'权限',
+		'模型',
+	])
 	assert.equal(items.at(-1).desc, '看/切模型（提供商/模型）')
 
-	// 自定义菜单：顶层只有 8 项（7 个平铺 + 1 个「管理」二级菜单），
-	// 这是为了给 dsh 命令的二级菜单留顶层位（平台顶层最多 10 项）。
+	// 自定义菜单：顶层仍只有 8 项（7 个平铺 + 1 个「管理」二级菜单）——
+	// 平台顶层最多 10，得给 dsh 命令的二级菜单留位，所以新命令进「管理」。
 	const menu = menuItems()
 	assert.equal(menu.length, 8)
 	assert.deepEqual(
@@ -126,7 +140,7 @@ test('面板条目与菜单条目都由同一张命令表派生', () => {
 	assert.equal(manage.name, '管理')
 	assert.deepEqual(
 		manage.children.map((it) => it.sendMessage),
-		['停止', '归档', '权限'],
+		['停止', '归档', '权限', '运行中会话'],
 	)
 	// 每条命令都还在菜单里（平铺或二级菜单），不能因为收编而消失
 	const shown = new Set([
@@ -136,8 +150,28 @@ test('面板条目与菜单条目都由同一张命令表派生', () => {
 	assert.deepEqual([...shown].sort(), items.map((i) => i.name).sort())
 })
 
-test('切换会话：无参=会话选择；带会话id=绑定；none=解绑', async () => {
+// 用户要求（2026-10-16）：新增 `运行中会话`（无参发卡片；带会话id 直接切）。
+test('运行中会话：无参发卡片；带会话id 直接切（复用 switchSession）', async () => {
 	const { runner, calls, state: s } = makeRunner({ seed: boundSeed() })
+
+	const carded = await runner.run({ openid: 'U1', quote: '' }, { name: '运行中会话', tokens: [], rest: '' })
+	assert.equal(carded.handled, true)
+	assert.equal(calls.runningCards.length, 1, '无参 = 发那张卡片')
+
+	// 带会话id：直接切过去（等价 `切换会话 <id>`，不重复实现）
+	const switched = await runner.run({ openid: 'U1', quote: '' }, { name: '运行中会话', tokens: ['session-2'], rest: 'session-2' })
+	assert.equal(switched.handled, true)
+	assert.equal(s.bindingOf('U1'), 'session-2', '点一下就该切过去')
+	assert.ok(calls.replies.some((r) => /已接入/.test(r.content)), '要有切过去的回执')
+
+	// 从卡片上点过来（fromCard）：切完把卡片重发一遍，标出新的「当前会话」
+	calls.runningCards.length = 0
+	await runner.run({ openid: 'U1', quote: '', fromCard: true }, { name: '运行中会话', tokens: ['session-1'], rest: 'session-1' })
+	assert.equal(s.bindingOf('U1'), 'session-1')
+	assert.equal(calls.runningCards.length, 1, '卡片上点过来要重发卡片（更新"当前"）')
+})
+
+test('切换会话：无参=会话选择；带会话id=绑定；none=解绑', async () => {	const { runner, calls, state: s } = makeRunner({ seed: boundSeed() })
 
 	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('切换会话'))
 	assert.equal(calls.cards.length, 1)

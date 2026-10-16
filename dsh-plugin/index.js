@@ -41,13 +41,14 @@ import {
 	buildInboxResult,
 	buildMkdirPromptCard,
 	buildNewSessionCard,
+	buildRunningCard,
 	buildSessionCard,
 	buildShortcutCard,
 	data as cardData,
 	parseCallback,
 } from './lib/cards.js'
 import { createCommandRunner, menuItems, panelItems, parseCommand } from './lib/commands.js'
-import { renderProgress, snapshotProgress } from './lib/progress.js'
+import { describeStatus, renderProgress, snapshotProgress } from './lib/progress.js'
 import {
 	EXCLUDED_COMMANDS,
 	buildMenuItems,
@@ -628,6 +629,34 @@ export function apply(ctx, rawConfig) {
 		})
 		await io.sendCard({ openid, content: card.content, keyboard: card.keyboard, context: replyContext })
 		logger.info?.('已发快捷卡片', { count: items.length })
+	}
+
+	/**
+	 * 「运行中会话」卡片：列出**正在跑**的会话（每条带"第 N 轮 / 已跑多久"），
+	 * 点按钮**直接切过去**（回调按钮，不用再按发送）。
+	 *
+	 * 用户要求（2026-10-16）：新增这个命令；并在「切换会话」卡片的「返回上级」与
+	 * 「不指定会话」之间也放一个入口按钮。`running` 取的是**会话级**状态
+	 * （`api-session/status` 事件维护），不是"有没有活 agent"。
+	 */
+	async function showRunningCard({ openid, replyContext = {} }) {
+		const bound = state.bindingOf(openid)
+		const items = sessions.runningSessions().map((session) => {
+			const agent = ctx.agents.get(session.sessionId)
+			const snapshot = agent ? snapshotProgress(agent) : null
+			return {
+				sessionId: session.sessionId,
+				label: session.label,
+				status: snapshot ? describeStatus(snapshot) : '',
+				current: session.sessionId === bound,
+			}
+		})
+		const card = buildRunningCard({
+			items,
+			currentLabel: bound && bound !== 'none' ? sessions.label(bound) : '',
+		})
+		await io.sendCard({ openid, content: card.content, keyboard: card.keyboard, context: replyContext })
+		logger.info?.('已发运行中会话卡片', { count: items.length })
 	}
 
 	/**
@@ -1229,6 +1258,7 @@ export function apply(ctx, rawConfig) {
 		showSessionCard: ({ openid, replyContext }) => showSessionCard({ openid, replyContext }),
 		showNewSessionCard: ({ openid, replyContext }) => showNewSessionCard({ openid, replyContext }),
 		showShortcutCard: ({ openid, replyContext }) => showShortcutCard({ openid, replyContext }),
+		showRunningCard: ({ openid, replyContext }) => showRunningCard({ openid, replyContext }),
 		createSession: ({ openid, cwd }) => createSessionHere({ openid, cwd }),
 		// 权限卡片 / 直接设定（dsh 的权限预设是 per-session 的，见 lib/permissions.js）。
 		showPermissionCard: ({ openid, sessionId, replyContext }) =>
@@ -1730,6 +1760,17 @@ export function apply(ctx, rawConfig) {
 				logger.debug?.('收到未知的模型卡片动作', { action: parsed.action })
 				code = 1
 			}
+		} else if (parsed.kind === 'run') {
+			// 「运行中会话」：空 arg = 打开那张卡片；带会话id = **直接切过去**。
+			// 语义全在 commands.js（`运行中会话`），这里只把按钮翻译成等价的命令文本。
+			// `fromCard: true` 让命令侧切完把卡片重发一遍（标出新的「当前会话」）。
+			const ctxReply = { eventId: event.eventId, msgId: event.msgId ?? '' }
+			const tokens = parsed.sessionId ? [parsed.sessionId] : []
+			await commands.run(
+				{ openid, replyContext: ctxReply, quote: '', fromCard: true },
+				{ name: '运行中会话', tokens, rest: tokens.join(' ') },
+			)
+			code = 0
 		} else if (parsed.kind === 'shortcut') {
 			// 快捷卡片：go（点某条 = 直接切过去）/ add（把当前会话加进来）。
 			// 语义全在 commands.js 里，这里只把按钮翻译成等价的命令文本，避免两套实现。

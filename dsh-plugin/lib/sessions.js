@@ -118,6 +118,27 @@ export function createSessions({ ctx, logger, idStyle = 'full' }) {
 		return byId.get(sessionId)
 	}
 
+	/**
+	 * **正在跑的**会话（`running` 为真）—— 「运行中会话」命令与那张卡片用。
+	 *
+	 * `running` 由 `api-session/status` 事件维护，是**会话级**状态（不是"有没有活 agent"：
+	 * 空闲会话的 agent 可能还活着，但它没在跑）。按最近活动排序。
+	 *
+	 * @param {number} [limit] 只要前 N 条（0/不传 = 全部）
+	 */
+	function runningSessions(limit = 0) {
+		const list = visible()
+			.filter((session) => session.running)
+			.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
+		const sliced = limit > 0 ? list.slice(0, limit) : list
+		return sliced.map((session) => ({
+			sessionId: session.sessionId,
+			cwd: session.cwd,
+			label: titles.get(session.sessionId) || displayId(session.sessionId),
+			running: true,
+		}))
+	}
+
 	/** 显示名：标题(会话id)；缺标题时退到目录末段。 */
 	function describe(sessionId) {
 		const entry = byId.get(sessionId)
@@ -242,6 +263,7 @@ export function createSessions({ ctx, logger, idStyle = 'full' }) {
 		defaultRoot,
 		listDirs,
 		sessionsInDir,
+		runningSessions,
 		parentOf,
 		resolveRef,
 		refreshAge: () => refreshedAt,

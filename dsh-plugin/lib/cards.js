@@ -113,6 +113,8 @@ export const data = {
 	dir: (path) => `${DATA_PREFIX}:dir:${path}`,
 	needReply: (sessionId) => `${DATA_PREFIX}:needreply:${sessionId}`,
 	page: (path, page) => `${DATA_PREFIX}:dir:${path}?page=${page}`,
+	// 「运行中会话」：空 arg = 打开那张卡片；带会话id = **直接切过去**（用户要求"点一下快速切换"）。
+	run: (sessionId = '') => `${DATA_PREFIX}:run:${sessionId}`,
 	// 新建会话的目录浏览用独立前缀：同一个"点文件夹"动作要能区分是哪张卡片，
 	// 否则点进子目录后会错误地回到"切换会话"卡片（回调 data 里带模式，天然无状态）。
 	newDir: (path) => `${DATA_PREFIX}:newdir:${path}`,
@@ -142,6 +144,9 @@ export function parseCallback(raw) {
 	if (typeof raw !== 'string' || !raw.startsWith(`${DATA_PREFIX}:`)) return null
 	if (raw.startsWith(`${DATA_PREFIX}:needreply:`)) {
 		return { kind: 'needreply', sessionId: raw.slice(`${DATA_PREFIX}:needreply:`.length) }
+	}
+	if (raw.startsWith(`${DATA_PREFIX}:run:`)) {
+		return { kind: 'run', sessionId: raw.slice(`${DATA_PREFIX}:run:`.length) }
 	}
 	if (raw.startsWith(`${DATA_PREFIX}:inbox:`)) {
 		const rest = raw.slice(`${DATA_PREFIX}:inbox:`.length)
@@ -283,12 +288,51 @@ export function buildSessionCard({ dir, dirs, sessions, currentLabel, page = 1, 
 
 	// 导航行：「返回上级」与「不指定会话」必须共用同一行 —— 绝不能另起一行，
 	// 否则总行数会超平台 5 行上限，整条消息被 40034029 拒收（线上踩过）。
+	// 用户要求（2026-10-16）：把「运行中会话」**夹在这两个之间**（一行最多 3 个，正好放下）。
 	const nav = []
 	if (parentPath) nav.push(callbackButton('返回上级', data.dir(parentPath)))
+	nav.push(callbackButton('运行中会话', data.run()))
 	nav.push(commandButton('不指定会话', switchCommand('none')))
 	rows.push({ buttons: nav })
 
 	return { content: lines.join('\n'), keyboard: keyboardOf(clampRows(rows)) }
+}
+
+/**
+ * 「运行中会话」卡片：列出**正在跑**的会话，点一下**直接切过去**。
+ *
+ * 与「切换会话」卡片的关键区别：那张卡片的会话按钮是**指令按钮**（只把 `切换会话 <id>`
+ * 填进输入框，还得自己按发送）；这张是**回调按钮**（点一下当场切）—— 用户要的就是"快速切换"。
+ *
+ * @param {{items:Array<{sessionId:string, label:string, status?:string, current?:boolean}>,
+ *   currentLabel?:string, maxRows?:number}} input
+ */
+export function buildRunningCard({ items = [], currentLabel = '', maxRows = KEYBOARD_MAX_ROWS - 1 }) {
+	const lines = ['**运行中会话**', `> 当前会话：${currentLabel ? `\`${currentLabel}\`` : '`none`（未绑定）'}`]
+	if (items.length === 0) {
+		lines.push('', '现在**没有正在跑的会话**。', '', '> 发 `切换会话` 可以浏览全部会话（含空闲的）。')
+		return { content: lines.join('\n'), keyboard: keyboardOf([]) }
+	}
+	lines.push(`> 共 ${items.length} 个正在跑；点下面的按钮**直接切过去**（卡片是快照，要最新的再发一次）。`, '')
+	items.forEach((item) => {
+		lines.push(`● **${item.label}**`)
+		if (item.status) lines.push(`> ${item.status}`)
+		lines.push('')
+	})
+	// 按钮行数有平台上限：正文全列（信息全），按钮只放得下的那些，并明说还有几个得走 `切换会话`。
+	const capacity = Math.max(1, maxRows) * CARD_BUTTONS_PER_ROW
+	const shown = items.slice(0, capacity)
+	if (shown.length < items.length) {
+		lines.push(`> 按钮只放了前 ${shown.length} 个（平台行数上限），其余用 \`切换会话\` 切。`)
+	}
+	const buttons = shown.map((item) =>
+		callbackButton(item.label, data.run(item.sessionId), {
+			// 显式给灰：`callbackButton` 的默认 style 是 1（蓝），不传就会"没选中也是蓝的"
+			//（「其他」按钮上刚踩过同一个坑）。
+			style: item.current ? BUTTON_STYLE.primary : BUTTON_STYLE.neutral,
+		}),
+	)
+	return { content: lines.join('\n').trimEnd(), keyboard: keyboardOf(rowsOf(buttons, CARD_BUTTONS_PER_ROW)) }
 }
 
 /**

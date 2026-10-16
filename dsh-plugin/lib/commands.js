@@ -16,6 +16,16 @@ export const COMMANDS = [
 		argHint: '<会话id> | <目录> <会话id> | none',
 	},
 	{
+		name: '运行中会话',
+		desc: '看正在跑的会话，点一下切过去',
+		purpose:
+			'列出**正在跑**的会话（会话级 `running` 状态，不是"有没有活 agent"），每条带上' +
+			'"第 N 轮 / 已跑多久"，**点按钮直接切过去**（回调按钮，不用再按发送）。卡片是快照，' +
+			'要最新的就再发一次。`运行中会话 <会话id>` 等价于 `切换会话 <会话id>`。',
+		usage: '运行中会话',
+		usageAlt: '运行中会话 <会话id>            # 直接切过去（同 `切换会话 <会话id>`）',
+	},
+	{
 		name: '快捷',
 		desc: '快捷入口：编号/备注/会话id 直达',
 		purpose: '把常用会话存成快捷入口（每条自带 `#编号`，可配自定义备注）。',
@@ -188,7 +198,10 @@ const MENU_LAYOUT = [
 	'延迟发送',
 	'模型',
 	'状态',
-	{ name: '管理', children: ['停止', '归档', '权限'] },
+	// 顶层已满（7 平铺 + 本二级菜单 + 2 个 dsh 子菜单 = 10），新命令只能进二级菜单。
+	// 「运行中会话」放这里：它的主入口是「切换会话」卡片里那个按钮（用户要求），
+	// 菜单里给一条兜底入口即可，不值得为它把谁挤下去。
+	{ name: '管理', children: ['停止', '归档', '权限', '运行中会话'] },
 ]
 
 /**
@@ -254,6 +267,8 @@ export function createCommandRunner(deps) {
 		switch (parsed.name) {
 			case '切换会话':
 				return switchSession(context, parsed)
+			case '运行中会话':
+				return showRunning(context, parsed)
 			case '快捷':
 				return shortcuts(context, parsed)
 			case '新建会话':
@@ -389,8 +404,25 @@ export function createCommandRunner(deps) {
 		return { handled: true }
 	}
 
+	/**
+	 * 「运行中会话」：不带参数 = 一张卡（列出正在跑的会话，点按钮**直接切过去**）；
+	 * 带会话id = 直接切 —— **复用 switchSession**，两套实现迟早走偏。
+	 *
+	 * 为什么值得有：`切换会话` 卡片的会话按钮是**指令按钮**（填命令、还得自己按发送），
+	 * 挂在目标链上一跑几十分钟的会话想切过去，得先翻目录再按发送；这里的按钮点了就切。
+	 */
+	async function showRunning({ openid, replyContext, fromCard = false }, parsed) {
+		if (parsed.tokens.length > 0) {
+			const result = await switchSession({ openid, replyContext }, parsed)
+			// 从卡片上点过来的：切完把卡片重发一遍，标出新的「当前会话」。
+			if (fromCard) await deps.showRunningCard?.({ openid, replyContext })
+			return result
+		}
+		await deps.showRunningCard({ openid, replyContext })
+		return { handled: true }
+	}
+
 	// ── 快捷（#编号 / 备注 / 会话id） ─────────────────────────────────────────
-	//
 	// 四条设计约束，都来自"用户把编号/名字记在脑子里"这件事：
 	//   1. **编号只增不重用**（`state.addShortcut` 的 seq）：删掉 `#2` 不会让 `#3` 变成别的会话。
 	//   2. **备注不能含 `#`**：`#` 是编号专用前缀，掺进备注就分不清 `#3` 是编号还是名字；
