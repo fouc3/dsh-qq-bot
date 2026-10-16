@@ -1028,6 +1028,36 @@ test('冷会话恢复：契约面（只有 resolveAgent、没有 resume）必须
 	boot.dispose()
 })
 
+// 顺手修（用户 2026-10-16）：那行诊断日志以前写 `String(sessionId).slice(0, 8)` ⇒ 取到的是
+// `session-` 这个**前缀**，id 全被吃掉（线上看到的正是 `冷会话恢复：resolveAgent ✓ session-`）。
+// 全库小日志都用 `slice(-8)`（会话id 尾部），这里补一条**真能抓住**它的回归用例 ——
+// 老用例只 match /sessio/i，坏写法也能过，所以一直没被发现。
+test('冷会话恢复：小日志要写得出会话id（尾部 8 位），不能只剩 `session-` 前缀', async (t) => {
+	const longId = 'session-ca96b214-668a-4bfc-b218-dc7a7f92ee43'
+	const boot = bootPlugin(t, {
+		sessions: [{ sessionId: longId, cwd: '/home/u/proj-a', updatedAt: 1, running: false }],
+		live: {},
+	})
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: `切换会话 ${longId}`, msgId: 'M1' })
+	await drainFor(boot.socketPath, 60)
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '冷会话消息', msgId: 'M2' })
+	await waitFor(() => boot.ctx.agents.get(longId) ?? null)
+
+	const notes = await waitFor(() => {
+		try {
+			const parsed = JSON.parse(readFileSync(boot.stateFile, 'utf8'))
+			return parsed.notes.find((line) => /冷会话恢复：resolveAgent ✓/.test(line)) ?? null
+		} catch {
+			return null
+		}
+	})
+	assert.match(notes, /resolveAgent ✓ 7f92ee43（/, `要写 id 尾部（实际：${notes}）`)
+	assert.doesNotMatch(notes, /resolveAgent ✓ session-（/, '不能只剩 `session-` 前缀')
+	boot.dispose()
+})
+
 // 线上事故（2026-10-16，第二次踩）：恢复入口**抛错**时，老代码会回退到裸
 // `ctx.agents.resume` —— 造出的坏 agent 被当成活 agent 缓存，于是**每条**后续消息都继续
 // 报 `{{model}}` 那个错，直到用户手动切一次模型。现在：恢复入口失败 → 不回退，

@@ -238,13 +238,21 @@ turn 121/124/125/126 全在 `session/end-seed` 后第一条 turn 就 `reason=err
 现在 `agentFor()` 的顺序：① `resolveAgent`（契约入口；`{ error }` 或没给 agent 都如实失败并记小日志）
 → ② 认"某些嵌入方式把内部 `resume` 暴露出来"（同样带模型与预设，安全）→ ③ 两个都没有时
 **绝不裸恢复**：如实回一句"会话打不开"，小日志记 `冷会话没有可用的恢复入口（不裸恢复）…`。
-每次冷恢复都记下走的是哪条入口（`冷会话恢复：resolveAgent ✓ <会话前 8 位>（<来自哪个 ctx>）`）——
-插件日志进不了 journald，状态文件小日志是唯一可观测通道。
+每次冷恢复都记下走的是哪条入口（`冷会话恢复：resolveAgent ✓ <会话id 尾部 8 位>（<来自哪个 ctx>）`）——
+插件日志进不了 journald，状态文件小日志是唯一可观测通道。**顺手修（2026-10-16）**：这行原先写的是
+`String(sessionId).slice(0, 8)` ⇒ 取到的是 `session-` 这个**前缀**，id 全被吃掉（线上看到的正是
+`冷会话恢复：resolveAgent ✓ session-`，多会话时没法归因）；全库小日志都用 `slice(-8)`（id 尾部），
+现在统一了。同一文件里目标id那行（`已重新武装：…`）也是同样的前缀写法（`goal-3a6` 只剩 3 位十六进制），
+一并改成尾部 8 位（`cad69bb0`）。老用例只 match `/sessio/i`、坏写法也能过，所以一直没被发现 ——
+新增用例拿**真实长 id**（`session-ca96b214-…-7f92ee43`）断言日志里出现 `resolveAgent ✓ 7f92ee43（`，
+并断言不会只剩 `session-` 前缀（探针：改回 `slice(0, 8)`，该用例立刻红，日志正是
+`冷会话恢复：resolveAgent ✓ session-（ctx.sessionController）`）。
 
 —— `lib/plugin.test.js`「契约面（只有 `resolveAgent`、没有 `resume`）必须走 `resolveAgent`，
 不能裸 `agents.resume`」（测试双件已改成与真实契约同形，这条就是回归）「`resolveAgent` 抛错时
 **不许**回退裸恢复」「只有内部 `resume` 时走 `resume`」「没有任何恢复入口时**绝不**裸恢复」
-（探针验证：换回旧判据 / 放回裸恢复兜底，对应测试各会失败）。
+「小日志要写得出会话id（尾部 8 位），不能只剩 `session-` 前缀」
+（探针验证：换回旧判据 / 放回裸恢复兜底 / 日志改回 `slice(0, 8)`，对应测试各会失败）。
 
 复核"服务面上到底有没有 `resume`"（一行，读的是**装着的那个包**）：
 
@@ -432,7 +440,7 @@ if (this.phase.kind !== "idle") {
 # Go 侧（含假 QQ 平台 + 真 UNIX socket 桩）
 go vet ./... && gofmt -l . && go test -race ./...
 
-# 插件侧：语法 + 206 项（含"装配级端到端"）
+# 插件侧：语法 + 207 项（含"装配级端到端"）
 node --check dsh-plugin/index.js dsh-plugin/lib/*.js
 node --test dsh-plugin/lib/*.test.js
 ```

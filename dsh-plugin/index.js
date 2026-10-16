@@ -476,7 +476,9 @@ export function apply(ctx, rawConfig) {
 		const live = ctx.agents.get(sessionId)
 		if (live) return live
 		const controllers = sessionControllers()
-		const short = String(sessionId).slice(0, 8)
+		// 取会话id **尾部** 8 位（`…-7f92ee43`）：全库小日志都用这个口径；以前写成
+		// `slice(0, 8)` ⇒ 每行都只剩 `session-`（前缀把 id 吃光了，多会话时没法归因）。
+		const short = String(sessionId).slice(-8)
 
 		// ① 契约入口：resolveAgent（带上模型与预设；就是 dsh 自己恢复冷会话那条路）。
 		for (const { label, value } of controllers) {
@@ -994,7 +996,9 @@ export function apply(ctx, rawConfig) {
 				try {
 					goals.resume(agent, { id: view.id, revision: view.revision })
 					resumed += 1
-					const short = String(view.id).slice(0, 8)
+					// 目标id也取尾部 8 位（`goal-3a6cac77-…-2023cad69bb0` → `cad69bb0`）：
+					// 以前 `slice(0, 8)` 得到的是 `goal-3a6`，只剩 3 位十六进制，区分不了目标。
+					const short = String(view.id).slice(-8)
 					state.note(`目标被这次打断关掉了，已重新武装：${short} rev ${view.revision}（phase=${view.phase}）`)
 					logger.info?.('已重新武装被打断的目标', { sessionId: agent.id, phase: view.phase, revision: view.revision })
 				} catch (error) {
