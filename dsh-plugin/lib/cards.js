@@ -871,10 +871,24 @@ function renderQuestionCard({ callId, questions, indices, answers, customFor, ca
 		} else if (custom) {
 			lines.push(`**其他**：${custom}`)
 		}
-		if (question.multiSelect) lines.push('> 本题可多选：点多个字母，再点「提交」。')
+		// 每道题**都要**写明单选/多选（用户反馈：单选题时完全没有提示，看不出能不能多选）。
+		if (question.multiSelect) {
+			lines.push('> 本题**多选**：点多个字母（再点一次可取消该选项），选完点「提交」。')
+		} else {
+			lines.push('> 本题**单选**：点一个字母即可；再点同一个字母可取消选择。选「其他」会自动清掉字母，反之亦然。')
+		}
 		lines.push('')
 
-		buttons.push(callbackButton('其他', data.question(callId, qIndex, 'custom')))
+		// 「其他」按钮的样式要如实反映"选没选"：以前不传 style 就走了 callbackButton
+		// 的默认值 1（蓝）⇒ 没选也一直是蓝的（用户反馈）。现在**选中/正在等输入才蓝**。
+		// 「其他」按钮的样式要如实反映"选没选"：以前不传 style 就走了 callbackButton
+		// 的默认值 1（蓝）⇒ 没选也一直是蓝的（用户反馈）。现在**选中/正在等输入才蓝**。
+		const otherActive = Boolean(custom) || customFor === qIndex
+		buttons.push(
+			callbackButton('其他', data.question(callId, qIndex, 'custom'), {
+				style: otherActive ? BUTTON_STYLE.primary : BUTTON_STYLE.neutral,
+			}),
+		)
 		blocks.push(lines.join('\n'))
 	})
 

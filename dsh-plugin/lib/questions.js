@@ -166,11 +166,23 @@ export function createQuestionBridge({ state, outbox, config, logger, io }) {
 		entry.resolve?.(result)
 	}
 
+	/**
+	 * 规范化一道题的答案（写成 dsh 的语义）：
+	 *   - 多选题：`selected` 与 `custom` **可以并存**（dsh 类型定义明确允许）；
+	 *   - 单选题：两者**互斥** —— 有 `custom` 就把 `selected` 清空，且最多留一个字母
+	 *     （"Selected option labels. May accompany custom text for a multi-select question."）。
+	 */
+	function normalizeAnswer(question, answer) {
+		const raw = Array.isArray(answer?.selected) ? [...answer.selected] : []
+		const custom = typeof answer?.custom === 'string' && answer.custom.trim() ? answer.custom.trim() : undefined
+		if (question?.multiSelect === true) return { selected: raw, custom }
+		const selected = custom ? [] : raw.slice(0, 1)
+		return { selected, custom }
+	}
+
 	function finalAnswers(entry) {
 		return entry.questions.map((question, index) => {
-			const answer = entry.answers[index] ?? {}
-			const selected = Array.isArray(answer.selected) ? [...answer.selected] : []
-			const custom = typeof answer.custom === 'string' && answer.custom.trim() ? answer.custom.trim() : undefined
+			const { selected, custom } = normalizeAnswer(question, entry.answers[index] ?? {})
 			// 没选也没填 = 跳过（selected 为空、无 custom，与 dsh 的 skipped 语义一致）
 			return custom ? { id: question.id, selected, custom } : { id: question.id, selected }
 		})
@@ -197,6 +209,12 @@ export function createQuestionBridge({ state, outbox, config, logger, io }) {
 		try {
 			if (action === 'custom') {
 				entry.customFor = parsed.questionIndex
+				// 单选题：「其他」与字母互斥 ⇒ 一点「其他」就把字母清掉（状态立刻可见，
+				// 与 dsh 语义一致；多选题保持并存，因为 dsh 明确允许）。
+				if (question?.multiSelect !== true) {
+					const custom = entry.answers[parsed.questionIndex]?.custom
+					entry.answers[parsed.questionIndex] = custom ? { custom } : {}
+				}
 			} else if (action === 'submit') {
 				const answers = finalAnswers(entry)
 				await recallAndSettle(entry)
@@ -212,7 +230,10 @@ export function createQuestionBridge({ state, outbox, config, logger, io }) {
 					else selected.add(label)
 					entry.answers[parsed.questionIndex] = { ...current, selected: [...selected] }
 				} else {
-					entry.answers[parsed.questionIndex] = { ...current, selected: [label] }
+					// 单选题：**再点同一个字母 = 取消选择**（用户要求）；点别的字母则换成它。
+					// 选字母时把「其他」清掉（单选语义下两者互斥）。
+					const only = (current.selected ?? []).length === 1 && current.selected[0] === label
+					entry.answers[parsed.questionIndex] = only ? {} : { selected: [label] }
 				}
 				if (entry.customFor === parsed.questionIndex) entry.customFor = null
 			} else {
@@ -259,7 +280,11 @@ export function createQuestionBridge({ state, outbox, config, logger, io }) {
 			})
 		}
 		if (index < 0) index = 0
-		entry.answers[index] = { ...(entry.answers[index] ?? { selected: [] }), custom: content }
+		const question = entry.questions[index]
+		const previous = entry.answers[index] ?? { selected: [] }
+		// 多选：`selected` 与 `custom` 可并存（dsh 允许）；单选：打「其他」就清掉字母。
+		entry.answers[index] =
+			question?.multiSelect === true ? { ...previous, custom: content } : { selected: [], custom: content }
 		entry.customFor = null
 		logger?.info?.('收到提问的「其他」答案', { callId: entry.callId, question: index })
 		await render(entry, cardIndexOfQuestion(entry, index))

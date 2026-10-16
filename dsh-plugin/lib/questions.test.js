@@ -45,6 +45,12 @@ function setup(config = {}) {
 
 const tick = () => new Promise((resolve) => setImmediate(resolve))
 
+/** 取一张已发卡片里某个按钮的 style（0=灰，1=蓝）。 */
+function styleOf(card, label) {
+	const button = card.keyboard.content.rows.flatMap((row) => row.buttons).find((b) => b.render_data.label === label)
+	return button?.render_data.style
+}
+
 test('提问：发卡片 → 点选项 → 撤回旧卡重发 → 打字填「其他」→ 提交结算', async () => {
 	const { bridge, sent, recalled } = setup()
 	const answers = bridge.ask({ callId: 'call-1', questions: QUESTIONS, openid: 'U1', sessionId: 'session-1' })
@@ -55,6 +61,11 @@ test('提问：发卡片 → 点选项 → 撤回旧卡重发 → 打字填「�
 	assert.match(sent[0].content, /> 影响面小/)
 	const labels = sent[0].keyboard.content.rows.flatMap((row) => row.buttons.map((b) => b.render_data.label))
 	assert.deepEqual(labels, ['A', 'B', '其他', '提交'])
+	// 单选题也要写明模式（用户反馈：以前单选题完全没提示，看不出能不能多选）
+	assert.match(sent[0].content, /本题\*\*单选\*\*/)
+	// 「其他」按钮没选中时必须是灰色（0）：以前不传 style 走了默认值 1（蓝），
+	// 未选择时也是蓝的（用户反馈）。
+	assert.equal(styleOf(sent[0], '其他'), 0, '未选「其他」时按钮应为灰')
 
 	// 点 A：撤回上一张卡片并重发（显示已选）
 	const clicked = await bridge.handleCallback({ kind: 'question', callId: 'call-1', questionIndex: 0, action: 'opt-0' }, { openid: 'U1' })
@@ -62,19 +73,78 @@ test('提问：发卡片 → 点选项 → 撤回旧卡重发 → 打字填「�
 	assert.equal(sent.length, 2, '每次选择都重发一张卡片')
 	assert.equal(recalled.length, 1, '每次选择都先撤回上一张卡片')
 	assert.match(sent[1].content, /✅ 直接上线/)
+	assert.equal(styleOf(sent[1], 'A'), 1, '选中的字母是蓝的')
+	assert.equal(styleOf(sent[1], '其他'), 0, '选了字母后「其他」仍是灰的')
 
-	// 打字 = 「其他」
+	// 打字 = 「其他」：单选题里它与字母**互斥**（dsh 只允许多选题二者并存）
 	assert.equal(await bridge.handleText('U1', '我想先本地跑一周'), true)
 	assert.equal(sent.length, 3)
 	assert.match(sent[2].content, /我想先本地跑一周/)
+	assert.doesNotMatch(sent[2].content, /✅ 直接上线/, '单选：填了「其他」就该把字母清掉')
+	assert.equal(styleOf(sent[2], '其他'), 1, '填写后「其他」变蓝')
 
-	// 提交
+	// 提交：单选 + 「其他」⇒ selected 必须为空
 	const submitted = await bridge.handleCallback({ kind: 'question', callId: 'call-1', questionIndex: 0, action: 'submit' }, { openid: 'U1' })
 	assert.equal(submitted.code, 0)
 
 	const result = await answers
-	assert.deepEqual(result, [{ id: 'q1', selected: ['直接上线'], custom: '我想先本地跑一周' }])
+	assert.deepEqual(result, [{ id: 'q1', selected: [], custom: '我想先本地跑一周' }])
 	assert.equal(bridge.pendingCount(), 0)
+})
+
+test('提问：单选题可以取消选择；字母与「其他」互斥（两个方向都清得掉）', async () => {
+	const { bridge, sent } = setup()
+	const answers = bridge.ask({ callId: 'call-single', questions: QUESTIONS, openid: 'U1', sessionId: 'session-1' })
+	await tick()
+	const click = (action) => bridge.handleCallback({ kind: 'question', callId: 'call-single', questionIndex: 0, action }, { openid: 'U1' })
+
+	// 点 A → 选中；再点 A → **取消选择**（用户要求）
+	await click('opt-0')
+	assert.match(sent.at(-1).content, /✅ 直接上线/)
+	await click('opt-0')
+	assert.doesNotMatch(sent.at(-1).content, /✅ 直接上线/, '再点同一个字母应取消')
+	assert.equal(styleOf(sent.at(-1), 'A'), 0, '取消后按钮回到灰色')
+
+	// 点 A → 点「其他」：字母立刻被清掉（单选互斥，状态可见）
+	await click('opt-0')
+	await click('custom')
+	assert.doesNotMatch(sent.at(-1).content, /✅ 直接上线/, '点「其他」应清掉字母')
+	assert.match(sent.at(-1).content, /请直接发一条消息/)
+	assert.equal(styleOf(sent.at(-1), '其他'), 1, '等待输入时「其他」应是蓝的')
+
+	// 填「其他」→ 再点字母：custom 要被清掉（另一个方向）
+	await bridge.handleText('U1', '先本地跑一周')
+	assert.match(sent.at(-1).content, /先本地跑一周/)
+	await click('opt-1')
+	assert.doesNotMatch(sent.at(-1).content, /先本地跑一周/, '选字母应清掉「其他」')
+	assert.match(sent.at(-1).content, /✅ 先灰度/)
+	assert.equal(styleOf(sent.at(-1), '其他'), 0, '清掉「其他」后按钮回到灰色')
+
+	await click('submit')
+	assert.deepEqual(await answers, [{ id: 'q1', selected: ['先灰度'] }], '互斥后不会同时提交字母与「其他」')
+})
+
+test('提问：多选题可以同时保留选项与「其他」（dsh 明确允许）', async () => {
+	const { bridge, sent } = setup()
+	const questions = [
+		{
+			id: 'q-multi-both',
+			question: '都要哪几个？',
+			multiSelect: true,
+			options: [{ label: '甲' }, { label: '乙' }],
+		},
+	]
+	const answers = bridge.ask({ callId: 'call-multi-both', questions, openid: 'U1', sessionId: 'session-1' })
+	await tick()
+	assert.match(sent[0].content, /本题\*\*多选\*\*/, '多选题要标出来（用户反馈看不到多选提示）')
+
+	const click = (action) => bridge.handleCallback({ kind: 'question', callId: 'call-multi-both', questionIndex: 0, action }, { openid: 'U1' })
+	await click('opt-0')
+	await bridge.handleText('U1', '再加一个自定义的')
+	assert.match(sent.at(-1).content, /✅ 甲/, '多选题里选项与「其他」可以并存')
+	assert.match(sent.at(-1).content, /再加一个自定义的/)
+	await click('submit')
+	assert.deepEqual(await answers, [{ id: 'q-multi-both', selected: ['甲'], custom: '再加一个自定义的' }])
 })
 
 test('提问：不选任何选项直接提交 = 跳过（空选项、无 custom）', async () => {
@@ -87,7 +157,7 @@ test('提问：不选任何选项直接提交 = 跳过（空选项、无 custom�
 	assert.equal(sent.length, 1)
 })
 
-test('提问：多选可切换，单选覆盖', async () => {
+test('提问：多选题可逐项切换，再点一次同一个选项 = 取消它', async () => {
 	const { bridge } = setup()
 	const questions = [
 		{
