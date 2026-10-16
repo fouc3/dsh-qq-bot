@@ -284,6 +284,26 @@ test('renderProgress：没有活 agent（snapshot=null）也照样给会话/模�
 	assert.match(partial, /> 模型：（读不到）/)
 })
 
+// 线上反馈（2026-10-16）：`状态` 卡的模型对没点过选择器的会话一直是「（读不到）」。
+// 现在由 `models.effective()` 补两级兜底；这里钉住**显示**：兜底到部署默认时必须注明。
+test('renderProgress：模型兜底到布局默认时要注明「部署默认」，别把预测值说成会话自己的模型', () => {
+	const viaLog = renderProgress({
+		label: 'x(session-1)',
+		sessionId: 'session-1',
+		snapshot: null,
+		model: { provider: 'apple-tokenplan', model: 'deepseek-v4.1-flash', source: 'log' },
+	})
+	assert.match(viaLog, /\n> 模型：apple-tokenplan \/ deepseek-v4\.1-flash\n/, '日志里读到的直接写，不加注')
+
+	const viaDefault = renderProgress({
+		label: 'x(session-1)',
+		sessionId: 'session-1',
+		snapshot: null,
+		model: { provider: 'f', model: 'deepseek-v4.1-flash', source: 'default' },
+	})
+	assert.match(viaDefault, /> 模型：f \/ deepseek-v4\.1-flash（部署默认）/, '部署默认要标出来')
+})
+
 // 用户要求（2026-10-16）：把 dsh web 会话底部那块「统计」也搬进 QQ。
 // 这里的数字就用用户贴过来的那一份（587分28秒 / 63分12秒 / 8.6秒 / 191 tok/s /
 // 929,074,071 / 99% / 10,314,436 / 916,849,920 / 1,909,715 / 54% ~540K / 1M /

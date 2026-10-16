@@ -31,9 +31,20 @@ const GROUPS = [
  * @param {boolean} [options.throwOnCatalog] 读目录是否抛
  * @param {object} [options.projections] sessionId → `model/selection` 投影值
  * @param {string} [options.selectError] selectModel 抛错的文本
+ * @param {object} [options.events] sessionId → 会话日志事件数组（`inspect()` 的返回）
+ * @param {boolean} [options.inspectThrows] `inspect()` 是否抛
+ * @param {object} [options.defaultModel] 部署默认模型（`agentDefaultModel.currentSelection()`）
  */
-function fakeCtx({ present = true, throwOnCatalog = false, projections = {}, selectError = '' } = {}) {
-	const calls = { set: [], projections: [] }
+function fakeCtx({
+	present = true,
+	throwOnCatalog = false,
+	projections = {},
+	selectError = '',
+	events = {},
+	inspectThrows = false,
+	defaultModel = null,
+} = {}) {
+	const calls = { set: [], projections: [], inspect: [] }
 	const service = {
 		async modelCatalog() {
 			if (throwOnCatalog) throw new Error('目录炸了')
@@ -55,8 +66,26 @@ function fakeCtx({ present = true, throwOnCatalog = false, projections = {}, sel
 			if (value === undefined) return null
 			return { asOfSeq: 7, values: { 'model/selection': value } }
 		},
+		async inspect(sessionId) {
+			calls.inspect.push(sessionId)
+			if (inspectThrows) throw new Error('日志读不了')
+			const list = events[sessionId]
+			return { meta: { id: sessionId }, events: list === undefined ? [] : list }
+		},
 	}
-	return { ctx: { get: (name) => (present && name === 'sessionController' ? service : undefined) }, calls }
+	const ctx = {
+		get: (name) => {
+			if (present && name === 'sessionController') return service
+			if (defaultModel && name === 'agentDefaultModel') return { currentSelection: () => defaultModel }
+			return undefined
+		},
+	}
+	return { ctx, calls }
+}
+
+/** 造一条 `request/header` 事件（模型藏在 `data.header.config` 里，与真实日志一致）。 */
+function headerEvent(provider, model) {
+	return { type: 'request/header', seq: 1, data: { header: { config: { provider, model, maxTokens: 384000 } } } }
 }
 
 test('模型：读目录（归一化 + 失败提供商如实带上），没有服务时退化成"用不了"', async () => {
@@ -99,6 +128,59 @@ test('模型：当前模型取 pending 优先、其次 lastUsed；读不到就�
 	assert.equal(await models.current('session-none'), null, '没有投影就是 null（卡片不标当前）')
 	assert.equal(await models.current(''), null)
 	assert.ok(calls.projections.includes('session-a'))
+})
+
+// 线上反馈：`状态` 卡的「模型」对没点过模型选择器的会话一直显示「（读不到）」。
+// `effective()` 补两级兜底：会话日志里**真正用过**的（冷会话也能读）→ 部署默认（标注出来）。
+test('模型：effective 依次取 选择 → 会话日志里用过的 → 部署默认，不会因为没选过就"读不到"', async () => {
+	const { ctx, calls } = fakeCtx({
+		projections: { 'session-chosen': { lastUsed: { provider: 'openai', model: 'gpt-5.2' }, pending: null } },
+		events: {
+			// 只有历史请求头、没有选择投影 —— 目标链里长期在跑的会话就是这样
+			'session-used': [
+				headerEvent('deepseek', 'deepseek-chat'),
+				{ type: 'turn/start', seq: 2, data: { turn: 1 } },
+				headerEvent('apple-tokenplan', 'deepseek-v4.1-flash'),
+			],
+			// 从没跑过（连请求头都没有）的会话
+			'session-fresh': [{ type: 'session/start', seq: 1, data: {} }],
+		},
+		defaultModel: { provider: 'f', model: 'deepseek-v4.1-flash' },
+	})
+	const models = createModels({ ctx })
+
+	assert.deepEqual(await models.effective('session-chosen'), {
+		provider: 'openai',
+		model: 'gpt-5.2',
+		source: 'selection',
+	})
+	assert.deepEqual(
+		await models.effective('session-used'),
+		{ provider: 'apple-tokenplan', model: 'deepseek-v4.1-flash', source: 'log' },
+		'取最后一次请求头（最新那个），不是第一次',
+	)
+	assert.deepEqual(
+		await models.effective('session-fresh'),
+		{ provider: 'f', model: 'deepseek-v4.1-flash', source: 'default' },
+		'还没跑过就报部署默认（卡片会注明）',
+	)
+	assert.equal(await models.effective(''), null)
+	assert.ok(calls.inspect.includes('session-used'), '兜底真的读了会话日志（inspect）')
+})
+
+test('模型：effective 的每一级失败都不致命（inspect 抛错 / 没有默认 / 没有服务 → null）', async () => {
+	// inspect 抛错：仍然可以退到部署默认
+	const throwing = fakeCtx({ inspectThrows: true, defaultModel: { provider: 'f', model: 'x' } })
+	const modelsA = createModels({ ctx: throwing.ctx })
+	assert.deepEqual(await modelsA.effective('session-1'), { provider: 'f', model: 'x', source: 'default' })
+
+	// 什么都读不到（没有默认、日志空）→ null（卡片才会写「读不到」）
+	const bare = fakeCtx()
+	assert.equal(await createModels({ ctx: bare.ctx }).effective('session-1'), null)
+
+	// 连服务都没有 → null，不能抛
+	const none = fakeCtx({ present: false })
+	assert.equal(await createModels({ ctx: none.ctx }).effective('session-1'), null)
 })
 
 test('模型：解析 `提供商/模型名字`（id/显示名/序号都认）', async () => {

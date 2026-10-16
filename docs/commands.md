@@ -121,14 +121,21 @@
 进度 ...                           → 同上（`进度` 是旧名，仍认，见 commands.js 的 ALIASES）
 ```
 
-**只读**：只走 `ctx.agents.get` + 会话事件日志（`session.eventAt`）**加上两条 durable 会话投影**
-（`model/selection`、`permissions`），**不 resume、不 cancel、不发消息**——正在跑的 AI 不受任何影响。
-因为读的是投影，**冷会话（没有活 agent）也照样给得出模型与权限**（读不到就写「（读不到）」）。
+**只读**：只走 `ctx.agents.get` + `sessionController` 的**只读**读取（`projections`/`inspect`），
+**不 resume、不 cancel、不发消息**——正在跑的 AI 不受任何影响。
+因为是只读投影/日志，**冷会话（没有活 agent）也照样给得出模型与权限**（读不到就写「（读不到）」）。
 
 抬头四行（用户要求）：
 
 - `> 会话：<标题(会话id)>`；
-- `> 模型：<provider> / <model>`；
+- `> 模型：<provider> / <model>`；取值顺序（`lib/models.js` 的 `effective()`，线上反馈修过）：
+  1. 会话自己的 `model/selection` 投影 —— "以后会用哪个"（用户显式选过才有）；
+  2. 会话日志里**最后一次** `request/header` 的 `data.header.config.{provider,model}` ——
+     "这一轮真正用过哪个"（**冷会话也能读**：`sessionController.inspect()` 只读、不激活 agent）；
+  3. 部署默认模型（`agentDefaultModel.currentSelection()`）—— 还没跑过的会话将来会用哪个，
+     此时卡片会注明 **`（部署默认）`**，免得把"预测值"说成"这个会话的模型"。
+  > 修因（用户 2026-10-16 反馈）：以前只看第 1 条 —— 很多会话（比如目标链里长期在跑的 Memos 会话）
+  > 从没点过模型选择器，投影是空的，于是 `状态` 卡一直显示「模型：（读不到）」。
 - `> 权限：<当前权限的中文显示名>`（同 `权限` 卡片那套名字，如「工作区内修改」）；
 - `> 状态：运行中（第 N 轮，已跑 X）` / `空闲（没在跑，下面是最近一轮的情况）` /
   `没有活跃的 agent（这一轮没在跑）`。

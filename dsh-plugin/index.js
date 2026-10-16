@@ -1246,7 +1246,9 @@ export function apply(ctx, rawConfig) {
 		progress: async ({ sessionId }) => {
 			const label = sessions.get(sessionId) ? sessions.label(sessionId) : sessionId
 			const agent = ctx.agents.get(sessionId)
-			const model = await models.current(sessionId)
+			// 用 `effective`（选择 → 会话日志里真正用过的 → 部署默认）：很多会话从没点过模型选择器，
+			// 只看 `model/selection` 会一直显示「（读不到）」（线上反馈）。仍然只读、不 resume。
+			const model = await models.effective(sessionId)
 			const permission = permissions.nameOf(await permissions.currentForId(sessionId))
 			const stats = await sessionStats.read(sessionId)
 			const snapshot = agent ? snapshotProgress(agent) : null

@@ -158,6 +158,71 @@ export function createModels({ ctx, logger }) {
 	}
 
 	/**
+	 * 从会话日志里最后一次 `request/header` 取**真正用过**的模型（只读，冷会话也行）。
+	 *
+	 * 形状：`{ type:'request/header', data:{ header:{ config:{ provider, model, maxTokens } } } }`。
+	 * 用 `sessionController.inspect()`：它读的是已存会话 / 内存快照，**不会 resume、不激活 agent**。
+	 */
+	async function modelFromLog(sessionId) {
+		if (typeof service()?.inspect !== 'function') return null
+		try {
+			const observed = await service().inspect(sessionId, signal())
+			const events = observed?.events
+			if (!Array.isArray(events)) return null
+			// 从最新往回扫，遇到第一个带模型配置的 request/header 就收工（不拷贝整条日志）。
+			for (let index = events.length - 1; index >= 0; index -= 1) {
+				const event = events[index]
+				if (event?.type !== 'request/header') continue
+				const config = event.data?.header?.config ?? {}
+				const provider = typeof config.provider === 'string' ? config.provider.trim() : ''
+				const model = typeof config.model === 'string' ? config.model.trim() : ''
+				if (provider && model) return { provider, model }
+			}
+		} catch (error) {
+			logger?.debug?.('从会话日志读取模型失败（忽略）', { sessionId, error: String(error) })
+		}
+		return null
+	}
+
+	/** 部署默认模型（拿不到服务或没配就 null）。 */
+	function defaultModel() {
+		try {
+			const owner = ctx.get?.('agentDefaultModel') ?? ctx.agentDefaultModel ?? null
+			const selection = owner?.currentSelection?.()
+			const provider = typeof selection?.provider === 'string' ? selection.provider.trim() : ''
+			const model = typeof selection?.model === 'string' ? selection.model.trim() : ''
+			if (provider && model) return { provider, model }
+		} catch (error) {
+			logger?.debug?.('读取部署默认模型失败（忽略）', { error: String(error) })
+		}
+		return null
+	}
+
+	/**
+	 * 这个会话**实际会用/刚用过**的模型 —— 给「状态」卡这类只读展示用，**绝不 resume**。
+	 *
+	 * 线上反馈：`状态` 卡的「模型」对某些会话一直是「（读不到）」。因为这里以前只看
+	 * `model/selection` 投影（用户**显式选过**才有）——很多会话（比如目标链里长期在跑的）
+	 * 从没点过选择器，投影就是空的。顺序改成：
+	 *   1. `model/selection`：以后会用哪个（用户显式选过）；
+	 *   2. 会话日志最后一次 `request/header`：这一轮**真正用过**哪个（冷会话也能读）；
+	 *   3. 部署默认模型：还没跑过的会话将来会用哪个 —— 标成 `default`，卡片上注明"部署默认"，
+	 *      免得把"预测值"说成"这个会话的模型"。
+	 *
+	 * @param {string} sessionId
+	 * @returns {Promise<{provider:string, model:string, source:'selection'|'log'|'default'}|null>}
+	 */
+	async function effective(sessionId) {
+		if (!sessionId) return null
+		const chosen = await current(sessionId)
+		if (chosen) return { ...chosen, source: 'selection' }
+		const used = await modelFromLog(sessionId)
+		if (used) return { ...used, source: 'log' }
+		const fallback = defaultModel()
+		return fallback ? { ...fallback, source: 'default' } : null
+	}
+
+	/**
 	 * 把 `提供商/模型名字` 解析成具体的一对 id。
 	 *
 	 * 认：提供商 id 或显示名、模型 id 或显示名、卡片里的序号（`2/3`）；
@@ -247,5 +312,5 @@ export function createModels({ ctx, logger }) {
 		return `**${group.name} / ${model.name}**（\`${group.id}/${model.id}\`）`
 	}
 
-	return { available, catalog, current, resolveToken, set, describe }
+	return { available, catalog, current, effective, resolveToken, set, describe }
 }

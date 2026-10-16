@@ -226,7 +226,9 @@ function stepDistanceTag(step, snapshot) {
  * @param {string} input.label 会话显示名（标题(会话id)）
  * @param {string} [input.sessionId] 兜底显示
  * @param {object|null} [input.snapshot] `snapshotProgress(agent)` 的结果；**没有活 agent 时传 null**
- * @param {{provider:string, model:string}|null} [input.model] 会话当前模型（读不到就 null）
+ * @param {{provider:string, model:string, source?:'selection'|'log'|'default'}|null} [input.model]
+ *   会话当前模型（`models.effective()` 的结果；读不到就 null）。`source='default'` 时会注明
+ *   "部署默认" —— 那是"这个会话以后会用哪个"的预测，不是它自己选过的。
  * @param {string} [input.permission] 会话当前权限的显示名（读不到就空串）
  * @param {object|null} [input.stats] `createSessionStats().read()` 的结果（四个投影，缺就是 null）
  */
@@ -240,10 +242,14 @@ export function renderProgress({
 }) {
 	// 「几秒前」按**采样时刻**算，而不是渲染时刻：渲染可能晚很多，口径要一致。
 	const takenAt = Number.isFinite(snapshot?.takenAt) ? snapshot.takenAt : Date.now()
+	const modelText =
+		model?.provider && model?.model
+			? `${model.provider} / ${model.model}${model.source === 'default' ? '（部署默认）' : ''}`
+			: '（读不到）'
 	const lines = [
 		'**状态**',
 		`> 会话：${label ?? sessionId}`,
-		`> 模型：${model?.provider && model?.model ? `${model.provider} / ${model.model}` : '（读不到）'}`,
+		`> 模型：${modelText}`,
 		`> 权限：${permission || '（读不到）'}`,
 		`> 状态：${describeStatus(snapshot)}`,
 		...statsLines(stats),
