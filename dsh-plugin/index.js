@@ -28,6 +28,7 @@ import { buildReplyTool } from './lib/reply-tool.js'
 import { ATTACHMENT_TOOL_NAME, buildAttachmentTool } from './lib/attachment-tool.js'
 import { DEFAULT_MAX_ATTACHMENT_BYTES, DEFAULT_MAX_FETCH_BYTES, createInbox, formatBytes } from './lib/inbox.js'
 import { createPermissions } from './lib/permissions.js'
+import { createPresets } from './lib/presets.js'
 import { createModels, splitOnce } from './lib/models.js'
 import { createSessionStats } from './lib/session-stats.js'
 import {
@@ -38,6 +39,7 @@ import {
 	buildModelProviderCard,
 	buildModelSessionPromptCard,
 	buildPermissionCard,
+	buildPresetCard,
 	buildInboxResult,
 	buildMkdirPromptCard,
 	buildNewSessionCard,
@@ -180,6 +182,10 @@ export function apply(ctx, rawConfig) {
 	const inbox = createInbox({ state, attachments: ctx.attachments, config, logger })
 	// 权限预设（就是 Web 里那个 仅可查看/工作区内修改/完全权限 选择器）：可选服务。
 	const permissions = createPermissions({ ctx, logger })
+	// 角色预设（agent preset）：切会话的「生存模式 / 冒险模式…」那几个 —— 卡片逻辑与权限卡同款。
+	// `agentFor` 注入进去是因为 dsh 的 `select(agent, id)` 要 **agent 对象**：冷会话得按标准路径
+	// 拉起来（走 `sessionController.resolveAgent`，带模型与预设组合）。
+	const presets = createPresets({ ctx, logger, agentFor })
 	// 模型目录与切换（就是 Web 里那个模型选择器）：可选服务，见 lib/models.js。
 	const models = createModels({ ctx, logger })
 	// 会话统计（Web 会话底部那块）：读 dsh 的四个会话投影，见 lib/session-stats.js。
@@ -240,6 +246,49 @@ export function apply(ctx, rawConfig) {
 		const result = permissions.set(agent.session, resolved.value)
 		if (!result.ok) return result
 		return { ok: true, value: result.value, text: permissions.describe(result.value) }
+	}
+
+	/**
+	 * 角色预设卡片（用户要求：**用权限卡片同款的卡片逻辑**）。
+	 *
+	 * 列出 dsh 的 agent preset（生存/冒险/旁观…），点一下切**当前会话**的。
+	 * 与权限卡的区别只有两点：每项可带「默认」标记（只进正文），以及卡片上写明 dsh 的限制 ——
+	 * **只有还没开跑过轮次的会话**才能中途换预设（`agent-preset/locked`）。
+	 *
+	 * @returns {Promise<{content:string, keyboard:object}|null>}
+	 */
+	async function showPresetCard({ openid, sessionId, replyContext = {} }) {
+		const options = await presets.catalog()
+		if (options.length === 0) {
+			await sendText({
+				openid,
+				content: '这个部署没有角色预设服务（`ctx.agentPresets`），看不了预设。',
+				markdown: true,
+				context: replyContext,
+			})
+			return null
+		}
+		const card = buildPresetCard({
+			// 「默认」= 部署默认预设，只写在正文列表里（按钮 label 要短）。
+			options: options.map((item) => ({ ...item, tag: item.isDefault ? '默认' : '' })),
+			current: await presets.currentForId(sessionId),
+			sessionId,
+			label: sessions.label(sessionId),
+		})
+		await io.sendCard({ openid, content: card.content, keyboard: card.keyboard, context: replyContext })
+		return card
+	}
+
+	/**
+	 * 把某个会话的角色预设切成 tokens 指定的那个（认 id / 显示名 / 序号）。
+	 * @returns {Promise<{ok:boolean, text?:string, error?:string, locked?:boolean}>}
+	 */
+	async function setPresetForSession({ openid, sessionId, tokens }) {
+		const resolved = await presets.resolveToken(tokens)
+		if (!resolved.ok) return { ok: false, error: resolved.error }
+		const result = await presets.set({ sessionId, value: resolved.value })
+		if (!result.ok) return result
+		return { ok: true, value: result.value, text: await presets.describe(result.value) }
 	}
 
 	/**
@@ -1269,6 +1318,9 @@ export function apply(ctx, rawConfig) {
 		showPermissionCard: ({ openid, sessionId, replyContext }) =>
 			showPermissionCard({ openid, sessionId, replyContext }),
 		setPermission: ({ openid, sessionId, tokens }) => setPermissionForSession({ openid, sessionId, tokens }),
+		// 角色预设（卡片或直接设定），与权限同款逻辑但作用于 agent preset。
+		showPresetCard: ({ openid, sessionId, replyContext }) => showPresetCard({ openid, sessionId, replyContext }),
+		setPreset: ({ openid, sessionId, tokens }) => setPresetForSession({ openid, sessionId, tokens }),
 		// 模型卡片（提供商 → 模型两级）/ 直接切（见 lib/models.js）。
 		showModelCard: ({ openid, sessionId, replyContext }) => showModelCard({ openid, sessionId, replyContext }),
 		setModel: ({ openid, sessionId, spec }) => setModelForSession({ openid, sessionId, spec }),
@@ -1793,6 +1845,30 @@ export function apply(ctx, rawConfig) {
 				{ name: '快捷', tokens, rest: tokens.join(' ') },
 			)
 			code = 0
+		} else if (parsed.kind === 'preset') {
+			// 角色预设卡片上的按钮：切成这个预设，并把卡片重发一遍（标出新的"当前"）。
+			// 被 dsh 的守卫拒绝（会话已开跑）时如实回绝 —— 与 Web 端把 refusal 显示出来一致。
+			const ctxReply = { eventId: event.eventId, msgId: event.msgId ?? '' }
+			const bound = state.bindingOf(openid)
+			if (!bound || bound === 'none') {
+				await sendText({ openid, content: '当前没有绑定会话，先 `切换会话`。', markdown: true, context: ctxReply })
+				code = 1
+			} else {
+				const result = await setPresetForSession({ openid, sessionId: bound, tokens: [parsed.value] })
+				if (!result?.ok) {
+					await sendText({ openid, content: result?.error ?? '切换角色预设失败。', markdown: true, context: ctxReply })
+					code = 1
+				} else {
+					await sendText({
+						openid,
+						content: `已把 **${sessions.describe(bound)}** 的角色预设切成 ${result.text}。`,
+						markdown: true,
+						context: ctxReply,
+					})
+					await showPresetCard({ openid, sessionId: bound, replyContext: ctxReply })
+					code = 0
+				}
+			}
 		} else if (parsed.kind === 'perm') {
 			// 权限卡片上的级别按钮：切成这个预设，并把卡片重发一遍（标出新的"当前"）。
 			const ctxReply = { eventId: event.eventId, msgId: event.msgId ?? '' }

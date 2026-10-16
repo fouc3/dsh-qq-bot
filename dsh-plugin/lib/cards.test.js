@@ -15,6 +15,7 @@ import {
 	buildNewSessionCard,
 	buildNoticeCard,
 	buildPermissionCard,
+	buildPresetCard,
 	buildQuestionCard,
 	buildQuestionCards,
 	buildQuestionResult,
@@ -621,6 +622,40 @@ test('开始通知：`已开始` / 续跑带说明 / 打断卡并进"新一轮�
 		'x(s1)已结束',
 		'开始/结束互斥：没传 started 就是结束卡',
 	)
+})
+
+// 用户要求（2026-10-17）：切「角色预设」（agent preset：生存/冒险/旁观…），
+// **用权限卡片同款的卡片逻辑** —— 所以这条用例与权限卡那条成对，断言同一套排版与按钮规则。
+test('角色预设卡片：与权限卡同款排版与按钮逻辑（当前档蓝、其余灰，「默认」只进正文）', () => {
+	const options = [
+		{ value: 'survival', name: '生存模式', description: '离线自给自足', tag: '默认' },
+		{ value: 'adventure', name: '冒险模式', description: '探索优先' },
+		{ value: 'spectator', name: '旁观模式', description: '只读审查' },
+	]
+	const card = buildPresetCard({ options, current: 'adventure', sessionId: 'session-1', label: '项目甲(session-1)' })
+	assert.match(card.content, /^\*\*角色预设\*\*/)
+	assert.match(card.content, /> 会话：项目甲\(session-1\)/)
+	assert.match(card.content, /> 当前：\*\*冒险模式\*\*/)
+	assert.match(card.content, /1\. \*\*生存模式\*\*（默认） — 离线自给自足/, '「默认」标记只进正文列表')
+	assert.match(card.content, /dsh 只允许/, '正文要写明 dsh 的限制（只有没开跑过的会话能换）')
+
+	const buttons = card.keyboard.content.rows.flatMap((row) => row.buttons)
+	assert.deepEqual(buttons.map((b) => b.render_data.label), ['生存模式', '冒险模式', '旁观模式'])
+	assert.deepEqual(buttons.map((b) => b.action.data), ['qqb:ps:survival', 'qqb:ps:adventure', 'qqb:ps:spectator'])
+	assert.equal(buttons[1].render_data.style, 1, '当前那一档蓝')
+	assert.equal(buttons[0].render_data.style, 0, '其余灰')
+	assert.equal(buttons[1].render_data.visited_label, '当前')
+	// 与权限卡同款：每行按钮数自适应（3 项 → 2/行）
+	assert.deepEqual(
+		card.keyboard.content.rows.map((row) => row.buttons.length),
+		[2, 1],
+	)
+})
+
+test('回调 data：preset 与 perm 互不干扰', () => {
+	assert.deepEqual(parseCallback(data.preset('survival')), { kind: 'preset', value: 'survival' })
+	assert.deepEqual(parseCallback(data.perm('read-only')), { kind: 'perm', value: 'read-only' })
+	assert.equal(parseCallback('qqb:ps'), null)
 })
 
 test('权限卡片：每行两个按钮（放不下就加宽），当前项标记出来', () => {

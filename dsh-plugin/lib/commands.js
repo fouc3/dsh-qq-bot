@@ -122,6 +122,19 @@ export const COMMANDS = [
 		usageAlt: '模型 <提供商>/<模型名字>             # 直接切（默认当前会话）',
 		usageAlt2: '模型 <提供商>/<模型名字> <会话id>    # 切给指定会话',
 	},
+	{
+		name: '角色预设',
+		desc: '看/切角色预设（生存/冒险…）',
+		purpose:
+			'切换**当前会话**的角色预设（dsh 的 agent preset —— 就是 Web 输入框旁边那个「预设」座位：' +
+			'生存模式 / 冒险模式 / 旁观模式 / 极限模式 / 数据模式 / 角色扮演…）。' +
+			'发 `角色预设`（不带参数）回一张卡片（**与 `权限` 同款的卡片逻辑**），点一下就切；' +
+			'也可以 `角色预设 <名字>` 直接切（认 id、显示名、卡片上的序号）。\n' +
+			'> ⚠️ dsh 只允许**还没开跑过轮次**的会话中途换预设（`agent-preset/locked`，原文 "This session has already started"）——' +
+			'已经聊过的会话会被拒绝，那种情况得在新建会话时就选好。',
+		usage: '角色预设',
+		usageAlt: '角色预设 <名字|序号>             # 直接切（默认当前会话）',
+	},
 ]
 
 const BY_NAME = new Map(COMMANDS.map((cmd) => [cmd.name, cmd]))
@@ -132,7 +145,7 @@ const BY_NAME = new Map(COMMANDS.map((cmd) => [cmd.name, cmd]))
  * 为什么留：桥里**认不出的文本会被当成普通消息投给 AI** —— 手滑按老习惯发 `进度`，
  * 就等于往会话里扔一条"进度"；留别名没有这个坑。指令面板与菜单里只列新名（`状态`）。
  */
-const ALIASES = { 进度: '状态' }
+const ALIASES = { 进度: '状态', 预设: '角色预设' }
 
 /**
  * 解析一条消息是不是命令。
@@ -201,7 +214,7 @@ const MENU_LAYOUT = [
 	// 顶层已满（7 平铺 + 本二级菜单 + 2 个 dsh 子菜单 = 10），新命令只能进二级菜单。
 	// 「运行中会话」放这里：它的主入口是「切换会话」卡片里那个按钮（用户要求），
 	// 菜单里给一条兜底入口即可，不值得为它把谁挤下去。
-	{ name: '管理', children: ['停止', '归档', '权限', '运行中会话'] },
+	{ name: '管理', children: ['停止', '归档', '权限', '运行中会话', '角色预设'] },
 ]
 
 /**
@@ -287,6 +300,8 @@ export function createCommandRunner(deps) {
 				return permissionMode(context, parsed)
 			case '模型':
 				return modelMode(context, parsed)
+			case '角色预设':
+				return presetMode(context, parsed)
 			default:
 				return { handled: false }
 		}
@@ -357,7 +372,8 @@ export function createCommandRunner(deps) {
 		return { handled: true }
 	}
 
-	async function switchSession({ openid, replyContext }, parsed) {		if (parsed.tokens.length === 0) {
+	async function switchSession({ openid, replyContext }, parsed) {
+		if (parsed.tokens.length === 0) {
 			// 不带参数 = 会话选择命令
 			await deps.showSessionCard({ openid, replyContext })
 			return { handled: true }
@@ -908,6 +924,44 @@ export function createCommandRunner(deps) {
 	 *
 	 * 作用对象是**当前绑定会话**（dsh 的权限预设是 per-session 的）。
 	 */
+	/**
+	 * 角色预设（用户要求）：无参发卡片（**权限卡同款逻辑**）；带参数直接切。
+	 *
+	 * 与 `权限` 的唯一区别：预设是 **agent preset**，dsh 只允许还没开跑过轮次的会话中途换，
+	 * 被拒绝时把原话回给用户（`setPreset` 里已经友好了，这里只负责渲染）。
+	 */
+	async function presetMode({ openid, replyContext }, parsed) {
+		const sessionId = currentSessionId(openid)
+		if (!sessionId || sessionId === 'none') {
+			await deps.reply({
+				openid,
+				content: '当前没有绑定会话。先 `切换会话`，再发 `角色预设` 看这台的预设卡片。',
+				markdown: true,
+				replyContext,
+			})
+			return { handled: true }
+		}
+		if (parsed.tokens.length === 0) {
+			await deps.showPresetCard?.({ openid, sessionId, replyContext })
+			return { handled: true }
+		}
+		// 带参数：直接设定（认 id / 显示名 / 序号）
+		const result = await deps.setPreset?.({ openid, sessionId, tokens: parsed.tokens })
+		if (!result) {
+			await deps.reply({ openid, content: usageText('角色预设'), replyContext })
+			return { handled: true }
+		}
+		await deps.reply({
+			openid,
+			content: result.ok
+				? `已把 **${sessions.describe(sessionId)}** 的角色预设切成 ${result.text}。`
+				: `${result.error}\n\n${usageText('角色预设')}`,
+			markdown: true,
+			replyContext,
+		})
+		return { handled: true }
+	}
+
 	async function permissionMode({ openid, replyContext }, parsed) {
 		const sessionId = currentSessionId(openid)
 		if (!sessionId || sessionId === 'none') {

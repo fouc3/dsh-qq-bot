@@ -49,6 +49,8 @@ function makeRunner({ seed = {}, modelResult = { ok: true, text: '**DeepSeek / D
 		models: [],
 		shortcutCards: [],
 		runningCards: [],
+		presetCards: [],
+		presets: [],
 	}
 	const state = createState({ seed })
 	const runner = createCommandRunner({
@@ -59,6 +61,11 @@ function makeRunner({ seed = {}, modelResult = { ok: true, text: '**DeepSeek / D
 		showSessionCard: async ({ openid, dir }) => calls.cards.push({ openid, dir }),
 		showShortcutCard: async ({ openid }) => calls.shortcutCards.push({ openid, items: state.shortcutsOf(openid) }),
 		showRunningCard: async ({ openid, page = 1 }) => calls.runningCards.push({ openid, page }),
+		showPresetCard: async ({ openid, sessionId }) => calls.presetCards.push({ openid, sessionId }),
+		setPreset: async ({ openid, sessionId, tokens }) => {
+			calls.presets.push({ openid, sessionId, tokens })
+			return { ok: true, value: 'adventure', text: '**冒险模式** — 探索优先' }
+		},
 		showModelCard: async ({ openid, sessionId }) => calls.modelCards.push({ openid, sessionId }),
 		setModel: async ({ openid, sessionId, spec }) => {
 			calls.models.push({ openid, sessionId, spec })
@@ -112,7 +119,7 @@ test('需要参数的命令无参时回作用与用法', () => {
 
 test('面板条目与菜单条目都由同一张命令表派生', () => {
 	const items = panelItems()
-	assert.equal(items.length, 11)
+	assert.equal(items.length, 12)
 	assert.deepEqual(items.map((i) => i.name), [
 		'切换会话',
 		'运行中会话',
@@ -125,8 +132,9 @@ test('面板条目与菜单条目都由同一张命令表派生', () => {
 		'延迟发送',
 		'权限',
 		'模型',
+		'角色预设',
 	])
-	assert.equal(items.at(-1).desc, '看/切模型（提供商/模型）')
+	assert.equal(items.at(-1).desc, '看/切角色预设（生存/冒险…）')
 
 	// 自定义菜单：顶层仍只有 8 项（7 个平铺 + 1 个「管理」二级菜单）——
 	// 平台顶层最多 10，得给 dsh 命令的二级菜单留位，所以新命令进「管理」。
@@ -140,7 +148,7 @@ test('面板条目与菜单条目都由同一张命令表派生', () => {
 	assert.equal(manage.name, '管理')
 	assert.deepEqual(
 		manage.children.map((it) => it.sendMessage),
-		['停止', '归档', '权限', '运行中会话'],
+		['停止', '归档', '权限', '运行中会话', '角色预设'],
 	)
 	// 每条命令都还在菜单里（平铺或二级菜单），不能因为收编而消失
 	const shown = new Set([
@@ -176,7 +184,39 @@ test('运行中会话：无参发卡片；带会话id 直接切（复用 switchS
 	assert.equal(calls.runningCards[0].page, 3, '重发要留在第 3 页，不能跳回第一页')
 })
 
-test('切换会话：无参=会话选择；带会话id=绑定；none=解绑', async () => {	const { runner, calls, state: s } = makeRunner({ seed: boundSeed() })
+// 用户要求（2026-10-17）：`角色预设` —— 无参发卡片（与权限卡同款逻辑）；带参数直接切；别名 `预设` 也认。
+test('角色预设：无参发卡片；带参数直接切；没绑定会话先提示切换；别名 预设 认', async () => {
+	const { runner, calls } = makeRunner({ seed: boundSeed() })
+
+	const carded = await runner.run({ openid: 'U1', quote: '', replyContext: {} }, { name: '角色预设', tokens: [], rest: '' })
+	assert.equal(carded.handled, true)
+	assert.deepEqual(calls.presetCards, [{ openid: 'U1', sessionId: 'session-1' }], '无参 = 发卡片（作用于当前绑定会话）')
+
+	const set = await runner.run(
+		{ openid: 'U1', quote: '', replyContext: {} },
+		{ name: '角色预设', tokens: ['冒险模式'], rest: '冒险模式' },
+	)
+	assert.equal(set.handled, true)
+	assert.deepEqual(calls.presets, [{ openid: 'U1', sessionId: 'session-1', tokens: ['冒险模式'] }], '带参 = 直接切')
+	assert.ok(
+		calls.replies.some((r) => /已把/.test(r.content) && /角色预设切成/.test(r.content)),
+		'要有切过去的回执',
+	)
+
+	// 没绑定会话：先提示 `切换会话`（与 `权限` 一致），不发卡片
+	const { runner: unbound, calls: unboundCalls } = makeRunner({ seed: {} })
+	const hint = await unbound.run({ openid: 'U1', quote: '', replyContext: {} }, { name: '角色预设', tokens: [], rest: '' })
+	assert.equal(hint.handled, true)
+	assert.equal(unboundCalls.presetCards.length, 0)
+	assert.match(unboundCalls.replies.at(-1).content, /先 `切换会话`/)
+
+	// 别名：`预设` → `角色预设`
+	assert.equal(parseCommand('预设')?.name, '角色预设')
+	assert.deepEqual(parseCommand('角色预设 生存模式')?.tokens, ['生存模式'])
+})
+
+test('切换会话：无参=会话选择；带会话id=绑定；none=解绑', async () => {
+	const { runner, calls, state: s } = makeRunner({ seed: boundSeed() })
 
 	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('切换会话'))
 	assert.equal(calls.cards.length, 1)

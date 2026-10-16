@@ -200,6 +200,11 @@ function makeCtx({ sessionSummaries = [], live = {}, commands = null } = {}) {
 					values: {
 						...(value ? { 'model/selection': { lastUsed: value, pending: null } } : {}),
 						permissions: { currentValue: ctx.permissionPresets.currentValue },
+						// 角色预设：dsh 注册的投影 key 就是 `agentPreset`（由 agent-preset/selected 事件推进）。
+						agentPreset: ctx.agentPresets.valueFor(sessionId),
+						// `turnBoundary`：dsh 用它判断"这个会话开跑过没有"（换预设的守卫）。
+						// 默认不给（= 没开跑过，能换）；需要"已锁"的用例自己摆一个。
+						...(ctx.sessionController.turnBoundary ? { turnBoundary: ctx.sessionController.turnBoundary } : {}),
 						...(ctx.sessionController.stats ?? {}),
 					},
 				}
@@ -253,6 +258,37 @@ function makeCtx({ sessionSummaries = [], live = {}, commands = null } = {}) {
 				if (!known.includes(value)) throw new Error(`unknown preset '${value}'`)
 				ctx.permissionPresets.currentValue = value
 				ctx.permissionPresets.setCalls.push({ sessionId: session?.id, value })
+			},
+		},
+		// dsh 的角色预设服务（`ctx.agentPresets`，@deepseek-ai/dsh-agent-preset-registry）：
+		// 与真实契约同形 —— `remoteExportList()` 带 isDefault（Web 读的就是它）、`list()` 是基础行、
+		// `select(agent, id)` 换预设（**入参是 agent 对象**，不是会话id）。
+		agentPresets: {
+			values: {},
+			selectCalls: [],
+			valueFor(sessionId) {
+				return ctx.agentPresets.values[sessionId] ?? ctx.agentPresets.defaultValue ?? ''
+			},
+			defaultValue: 'survival',
+			async remoteExportList() {
+				return {
+					presets: [
+						{ id: 'survival', name: '生存模式', description: '离线自给自足', isDefault: true },
+						{ id: 'adventure', name: '冒险模式', description: '探索优先', isDefault: false },
+						{ id: 'spectator', name: '旁观模式', description: '只读审查', isDefault: false },
+					],
+				}
+			},
+			async select(agent, agentPreset) {
+				const known = ['survival', 'adventure', 'spectator']
+				if (!known.includes(agentPreset)) {
+					const error = new Error(`Unknown agent preset: ${agentPreset}`)
+					error.code = 'agent-preset/not-found'
+					throw error
+				}
+				ctx.agentPresets.selectCalls.push({ sessionId: agent?.id, agentPreset })
+				ctx.agentPresets.values[agent?.id] = agentPreset
+				return agentPreset
 			},
 		},
 		// dsh 的目标服务（`ctx.goals`）：打断后桥要按"打断前是不是运行中"决定要不要重新武装。
@@ -522,16 +558,17 @@ test('register → panel：白名单快照 + 十条命令的面板定义（只�
 		'延迟发送',
 		'权限',
 		'模型',
+		'角色预设',
 	])
 	// 扁平键 menuItems：与 Go 侧 PanelDefinition.MenuItems 对齐（大小写不敏感匹配）
-	// 顶层 8 项 = 7 个平铺 + 1 个「管理」二级菜单（停止/归档/权限/运行中会话）+ 2 个 dsh 命令二级菜单 = 10（平台上限）。
+	// 顶层 8 项 = 7 个平铺 + 1 个「管理」二级菜单（停止/归档/权限/运行中会话/角色预设）+ 2 个 dsh 命令二级菜单 = 10（平台上限）。
 	assert.equal(panel.value.menuItems.length, 8)
 	assert.equal(panel.value.menuItems[0].name, '切换会话')
 	assert.equal(panel.value.menuItems[0].sendMessage, '切换会话')
 	assert.equal(panel.value.menuItems[1].sendMessage, '快捷')
 	const manageGroup = panel.value.menuItems.find((item) => item.type === 'menu')
 	assert.equal(manageGroup.name, '管理')
-	assert.deepEqual(manageGroup.children.map((child) => child.name), ['停止', '归档', '权限', '运行中会话'])
+	assert.deepEqual(manageGroup.children.map((child) => child.name), ['停止', '归档', '权限', '运行中会话', '角色预设'])
 	assert.equal(panel.value.menu, undefined)
 
 	// 白名单落了盘（插件重启后仍能门守）
@@ -650,6 +687,68 @@ test('端到端：运行中会话翻页 —— 12 个一页，第 5 行「下一
 	assert.equal(page2.args.keyboard.content.rows[0].buttons.length, 2, '第 2 页只剩 2 个')
 	assert.deepEqual(page2.args.keyboard.content.rows[0].buttons.map((b) => b.render_data.label), ['1', '2'])
 	assert.deepEqual(page2.args.keyboard.content.rows[1].buttons.map((b) => b.render_data.label), ['上一页'])
+
+	boot.dispose()
+})
+
+// 用户要求（2026-10-17）：切「角色预设」（dsh 的 agent preset：生存/冒险/旁观…），
+// **卡片逻辑与权限卡同款**（列表 + 当前档高亮 + 点一下切）。
+test('端到端：角色预设 —— 卡片列出预设、点一下切（重发标出新的当前）；已开跑的会话被拒且不再调 select', async (t) => {
+	const agent = makeAgent('session-1')
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': agent } })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M0' })
+	await drainFor(boot.socketPath, 60)
+
+	// ① 命令 → 卡片：当前档来自会话投影 `agentPreset`，「默认」只写在正文
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '角色预设', msgId: 'M1' })
+	const card = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /\*\*角色预设\*\*/.test(String(c.args.content))) ?? null
+	})
+	assert.match(String(card.args.content), /> 当前：\*\*生存模式\*\*/)
+	assert.match(String(card.args.content), /\*\*生存模式\*\*（默认） — 离线自给自足/)
+	const buttons = card.args.keyboard.content.rows.flatMap((row) => row.buttons)
+	assert.deepEqual(buttons.map((b) => b.action.data), ['qqb:ps:survival', 'qqb:ps:adventure', 'qqb:ps:spectator'])
+	assert.equal(buttons[0].render_data.style, 1, '当前档蓝色')
+	assert.equal(buttons[1].render_data.style, 0, '其余灰色')
+
+	// ② 点「冒险模式」→ 调 select（入参是 agent 对象）+ 回执 + 重发卡片标出新的当前
+	//    （回执与重发的卡片可能落在同一批 drain 里，所以跨批次收集后再断言，别开两个 waitFor 互相排空）
+	const target = buttons.find((b) => b.action.data === 'qqb:ps:adventure')
+	await rpc(boot.socketPath, 'event', {
+		kind: 'interaction',
+		openid: 'U1',
+		buttonData: target.action.data,
+		eventId: 'INT-PS',
+		msgId: 'CARD-PS',
+	})
+	const seen = []
+	await waitFor(async () => {
+		seen.push(...(await drainFor(boot.socketPath, 80)))
+		const hasReply = seen.some((c) => c.kind === 'send_c2c' && /角色预设切成/.test(String(c.args.content)))
+		const hasCard = seen.some((c) => c.kind === 'send_c2c' && /\*\*角色预设\*\*/.test(String(c.args.content)))
+		return hasReply && hasCard ? true : null
+	})
+	assert.ok(
+		seen.some((c) => c.kind === 'respond_interaction' && c.args.code === 0),
+		'要回应互动（code=0）',
+	)
+	assert.deepEqual(boot.ctx.agentPresets.selectCalls, [{ sessionId: 'session-1', agentPreset: 'adventure' }])
+	const again = seen.find((c) => c.kind === 'send_c2c' && /\*\*角色预设\*\*/.test(String(c.args.content)))
+	assert.match(String(again.args.content), /> 当前：\*\*冒险模式\*\*/, '重发的卡片要标出新的当前')
+
+	// ③ 已经开跑过的会话：dsh 的守卫不允许换 —— 如实回绝，且不再调 select
+	boot.ctx.sessionController.turnBoundary = { lastTurn: 3, openTurnStartSeq: null }
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '角色预设 生存模式', msgId: 'M2' })
+	const refused = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => /已经开跑过轮次/.test(String(c.args.content))) ?? null
+	})
+	assert.ok(refused, '要如实回绝（并带上 dsh 的原话）')
+	assert.match(String(refused.args.content), /already started/)
+	assert.equal(boot.ctx.agentPresets.selectCalls.length, 1, '被锁就不该再调 select')
 
 	boot.dispose()
 })

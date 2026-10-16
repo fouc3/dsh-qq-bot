@@ -135,6 +135,9 @@ export const data = {
 	rmdirYes: (path) => `${DATA_PREFIX}:rmdir2:${path}`,
 	// 权限卡片：切成某个预设（value 是 dsh 的预设 key，如 danger-full-access）
 	perm: (value) => `${DATA_PREFIX}:perm:${value}`,
+	// 角色预设卡片：切成某个 agent preset（value 是预设 id，如 survival）——
+	// 与权限卡片**同款排版与按钮逻辑**（用户要求）。
+	preset: (value) => `${DATA_PREFIX}:ps:${value}`,
 	// 快捷卡片：go（切到某条，arg = 编号）/ add（把当前会话加进来）
 	shortcut: (action, arg = '') => `${DATA_PREFIX}:sc:${action}${arg === '' ? '' : `:${arg}`}`,
 	// 模型卡片：page（提供商翻页）/ enter（进提供商看模型）/ mpage（提供商内翻页）/
@@ -174,6 +177,9 @@ export function parseCallback(raw) {
 	}
 	if (raw.startsWith(`${DATA_PREFIX}:mkx:`)) {
 		return { kind: 'mkcancel', path: raw.slice(`${DATA_PREFIX}:mkx:`.length) }
+	}
+	if (raw.startsWith(`${DATA_PREFIX}:ps:`)) {
+		return { kind: 'preset', value: raw.slice(`${DATA_PREFIX}:ps:`.length) }
 	}
 	if (raw.startsWith(`${DATA_PREFIX}:perm:`)) {
 		return { kind: 'perm', value: raw.slice(`${DATA_PREFIX}:perm:`.length) }
@@ -535,31 +541,78 @@ export function buildNoticeCard({
 }
 
 /**
- * 权限卡片：一行一个级别的回调按钮（点了就切换）。
+ * 「选项卡」共用排版：**权限卡与角色预设卡同一套逻辑**（用户要求"用权限卡片同款的卡片逻辑"）。
  *
- * 用户要求"每行尽可能放两个按钮；放不下（会超平台行数）就扩大，比如每行三个"：
- * 所以先按 2 个/行排，如果行数超上限就依次加宽（3、4、5），确保整卡合法。
+ * 版式：标题 → 会话 → 当前那一档 → 一句说明 → 逐项 `序号. **名字**（标记）— 说明`；
+ * 按钮用回调（点了当场切），**当前那一档蓝色(1)、其余灰色(0)**，按钮上不写"当前"、写别的；
+ * 每行按钮数按项数自适应（`buttonsPerRowFor`：先 2 个/行，超行数上限就加宽，保证整卡合法）。
+ *
+ * @param {{title:string, label?:string, sessionId?:string, current?:string, intro:string,
+ *   options?:Array<{value:string, name:string, description?:string, tag?:string}>,
+ *   dataOf:(value:string)=>string}} input
  */
-export function buildPermissionCard({ options = [], current = '', sessionId = '', label = '' }) {
-	const lines = ['**权限**', `> 会话：${label || sessionId || '（当前会话）'}`]
+function buildChoiceCard({ title, label = '', sessionId = '', current = '', intro, options = [], dataOf }) {
+	const lines = [`**${title}**`, `> 会话：${label || sessionId || '（当前会话）'}`]
 	if (current) {
 		const now = options.find((item) => item.value === current)
 		lines.push(`> 当前：**${now?.name ?? current}**`)
 	}
-	lines.push('', '点下面的级别即可切换（作用于当前会话）。')
+	lines.push('', intro)
 	for (const [index, item] of options.entries()) {
-		lines.push(`${index + 1}. **${item.name}**${item.description ? ` — ${item.description}` : ''}`)
+		// `tag` 只出现在正文列表里（如「默认」），不进按钮 label —— 按钮要短。
+		lines.push(
+			`${index + 1}. **${item.name}**${item.tag ? `（${item.tag}）` : ''}${item.description ? ` — ${item.description}` : ''}`,
+		)
 	}
 
 	const perRow = buttonsPerRowFor(options.length)
 	const buttons = options.map((item) =>
-		callbackButton(item.name, data.perm(item.value), {
+		callbackButton(item.name, dataOf(item.value), {
 			// 当前那一档用蓝色（主色），其余灰色；不再用 style 4（客户端会渲染成白色）。
 			style: item.value === current ? BUTTON_STYLE.primary : BUTTON_STYLE.neutral,
 			visited: item.value === current ? '当前' : item.name,
 		}),
 	)
 	return { content: lines.join('\n'), keyboard: keyboardOf(clampRows(rowsOf(buttons, perRow))) }
+}
+
+/**
+ * 权限卡片：一行一个级别的回调按钮（点了就切换）。
+ *
+ * 用户要求"每行尽可能放两个按钮；放不下（会超平台行数）就扩大，比如每行三个"：
+ * 所以先按 2 个/行排，如果行数超上限就依次加宽（3、4、5），确保整卡合法。
+ */
+export function buildPermissionCard({ options = [], current = '', sessionId = '', label = '' }) {
+	return buildChoiceCard({
+		title: '权限',
+		label,
+		sessionId,
+		current,
+		intro: '点下面的级别即可切换（作用于当前会话）。',
+		options,
+		dataOf: data.perm,
+	})
+}
+
+/**
+ * 角色预设卡片（用户要求：切 agent preset，**用权限卡片同款的卡片逻辑**）。
+ *
+ * 与权限卡的两点不同（都只是为了说清楚）：
+ *   - 每项可带 `tag`（如「默认」= 部署默认预设），只写在正文列表里；
+ *   - 说明里点出 dsh 的限制：**只有还没开跑过轮次的会话能中途换预设**。
+ */
+export function buildPresetCard({ options = [], current = '', sessionId = '', label = '' }) {
+	return buildChoiceCard({
+		title: '角色预设',
+		label,
+		sessionId,
+		current,
+		intro:
+			'点下面的预设即可切换（作用于当前会话）。\n' +
+			'> dsh 只允许**还没开跑过轮次**的会话中途换预设；已经跑过的会话会被拒绝（`agent-preset/locked`）。',
+		options,
+		dataOf: data.preset,
+	})
 }
 
 /** 选一个"每行几个按钮"：默认 2，行数不够就加宽到 5 为止。 */
