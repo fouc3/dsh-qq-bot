@@ -139,14 +139,18 @@ function makeCtx({ sessionSummaries = [], live = {}, commands = null } = {}) {
 				sessionSummaries.push({ sessionId, cwd, updatedAt: Date.now(), running: false })
 				return { sessionId }
 			},
-			// 冷会话恢复：dsh 的控制器版本会带上 agentOptions（模型）与 setup（预设=工具），
-			// 所以插件必须走这条路（裸 agents.resume 会造出没有模型/工具的 agent）。
-			resumedVia: [],
-			async resume(sessionId) {
-				ctx.sessionController.resumedVia.push(sessionId)
+			// 冷会话恢复：**和真实契约同形** —— `@deepseek-ai/dsh-api-session-controller`
+			// 注册的 `sessionController` 服务面（≈ `ctx.remote.session`）只有 `resolveAgent`，
+			// **没有** `resume`（`resume` 是内部 `ApiSessionAgentController` 的方法）。
+			// 控制器恢复时会带上 agentOptions（模型）与 setup（预设=工具），所以插件必须走这条路
+			// （裸 agents.resume 会造出没有模型/工具的 agent）。需要"只有 resume"的嵌入方式时，
+			// 由测试自己临时挂一个（见「内部 resume」那条）。
+			resolvedVia: [],
+			async resolveAgent(sessionId) {
+				ctx.sessionController.resolvedVia.push(sessionId)
 				const agent = liveAgents.get(sessionId) ?? makeAgent(sessionId)
 				liveAgents.set(sessionId, agent)
-				return agent
+				return { agent }
 			},
 			// 模型：与 dsh 的 SessionController 同形（modelCatalog / selectModel / projections）。
 			selectedModels: [],
@@ -866,13 +870,16 @@ test('端到端：开始通知（普通消息发；打断时并进被打断卡�
 	boot.dispose()
 })
 
-// 线上事故（2026-10-15）：插件自己 `ctx.agents.resume({resumeSessionId})` 唤醒冷会话，
-// 造出的 agent **没有模型、没有预设/工具** → 系统提示词里 `{{model}}` 取不到值
+// 线上事故（2026-10-15，10-16 又踩两次）：插件自己 `ctx.agents.resume({resumeSessionId})`
+// 唤醒冷会话，造出的 agent **没有模型、没有预设/工具** → 系统提示词里 `{{model}}` 取不到值
 // （`prompt variable "{{model}}" has no value for this assembly (section "deployment:persona-prefix")`）
-// 且"标准模式的工具全没了"。dsh 自己的控制器恢复时会带上 agentOptions 与 setup：
+// 且"编码工具全没了"（bash/Edit/Read…）。dsh 自己的控制器恢复时会带上 agentOptions 与 setup：
 //   ctx.agents.resume({ resumeSessionId, agentOptions, setup: composition.setup })
-// 所以插件必须走 `sessionController.resume`。
-test('冷会话恢复必须走 sessionController（带上模型与预设），不能裸 agents.resume', async (t) => {
+// **真根因**：公开契约里没有 `sessionController.resume` —— 服务面只有 `resolveAgent` /
+// `inspect` / `selectModel` / `prompt` / …（`resume` 是内部 `ApiSessionAgentController` 的方法），
+// 所以旧代码 `typeof controller.resume === 'function'` 恒为假，**每一条** QQ 冷唤醒都掉进裸恢复兜底。
+// 现在的默认 fake 与真实契约同形（只有 resolveAgent、没有 resume），这条测试就是那个回归。
+test('冷会话恢复：契约面（只有 resolveAgent、没有 resume）必须走 resolveAgent，不能裸 agents.resume', async (t) => {
 	const boot = bootPlugin(t, { sessions: SUMMARIES, live: {} })
 	await waitFor(() => existsSync(boot.socketPath))
 	await rpc(boot.socketPath, 'register', {
@@ -887,21 +894,30 @@ test('冷会话恢复必须走 sessionController（带上模型与预设），�
 
 	const agent = await waitFor(() => boot.ctx.agents.get('session-2') ?? null)
 	await waitFor(() => agent.followed.length > 0)
-	assert.ok(boot.ctx.sessionController.resumedVia.includes('session-2'), '冷会话要走控制器的 resume')
+	assert.equal(typeof boot.ctx.sessionController.resume, 'undefined', '前置条件：契约面**没有** resume（真实 dsh 就是这样）')
+	assert.ok(boot.ctx.sessionController.resolvedVia.includes('session-2'), '冷会话要走控制器的 resolveAgent')
 	assert.deepEqual(boot.ctx.agents.rawResumeCalls, [], '绝不能退回裸 agents.resume（会造出没模型/没工具的 agent）')
 	assert.equal(agent.followed.at(-1).content[0].text, '冷会话消息', '恢复出来的 agent 要真的收到消息')
 	assert.equal(agent.followed.at(-1).source.kind, 'user')
+	const notes = await waitFor(() => {
+		try {
+			return JSON.parse(readFileSync(boot.stateFile, 'utf8')).notes.find((line) => /resolveAgent ✓/.test(line)) ?? null
+		} catch {
+			return null
+		}
+	})
+	assert.match(notes, /sessio/i, '小日志要记一笔走了哪条恢复入口（插件日志进不了 journald）')
 
 	boot.dispose()
 })
 
-// 线上事故（2026-10-16，第二次踩）：控制器的 `resume` **抛错**时，老代码会回退到裸
+// 线上事故（2026-10-16，第二次踩）：恢复入口**抛错**时，老代码会回退到裸
 // `ctx.agents.resume` —— 造出的坏 agent 被当成活 agent 缓存，于是**每条**后续消息都继续
-// 报 `{{model}}` 那个错，直到用户手动切一次模型。现在：控制器**有** resume 却失败 → 不回退，
+// 报 `{{model}}` 那个错，直到用户手动切一次模型。现在：恢复入口失败 → 不回退，
 // 如实回一句"打不开"，并把失败写进小日志。
-test('冷会话恢复：控制器 resume 抛错时**不许**回退裸恢复（那会造出没模型的坏 agent）', async (t) => {
+test('冷会话恢复：控制器 resolveAgent 抛错时**不许**回退裸恢复（那会造出没模型的坏 agent）', async (t) => {
 	const boot = bootPlugin(t, { sessions: SUMMARIES, live: {} })
-	boot.ctx.sessionController.resume = async () => {
+	boot.ctx.sessionController.resolveAgent = async () => {
 		throw new Error('boom: resume failed')
 	}
 	await waitFor(() => existsSync(boot.socketPath))
@@ -933,8 +949,42 @@ test('冷会话恢复：控制器 resume 抛错时**不许**回退裸恢复（�
 	boot.dispose()
 })
 
-test('冷会话恢复：控制器没有 resume 时可回退到裸 agents.resume（保底不瘫）', async (t) => {
+// 某些嵌入方式把**内部**控制器的 `resume` 直接暴露出来（服务面上没有，但对象上有）：
+// 那条路同样带模型与预设，是安全的，可以用。
+test('冷会话恢复：只有内部 resume、没有 resolveAgent 时，走 resume（仍不许裸 agents.resume）', async (t) => {
 	const boot = bootPlugin(t, { sessions: SUMMARIES, live: {} })
+	boot.ctx.sessionController.resolveAgent = undefined
+	boot.ctx.sessionController.resumedVia = []
+	boot.ctx.sessionController.resume = async (sessionId) => {
+		boot.ctx.sessionController.resumedVia.push(sessionId)
+		const agent = boot.ctx.agents.get(sessionId) ?? makeAgent(sessionId)
+		boot.ctx.agents.adopt(agent)
+		return agent
+	}
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', {
+		openids: [{ openid: 'U1' }],
+		panel: { enabled: true, users: ['U1'] },
+		menu: { enabled: true },
+	})
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-2', msgId: 'M1' })
+	await drainFor(boot.socketPath, 60)
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '内部 resume 消息', msgId: 'M2' })
+
+	const agent = await waitFor(() => boot.ctx.agents.get('session-2') ?? null)
+	await waitFor(() => agent.followed.length > 0)
+	assert.deepEqual(boot.ctx.sessionController.resumedVia, ['session-2'], '走内部控制器的 resume')
+	assert.deepEqual(boot.ctx.agents.rawResumeCalls, [], '依然不许裸 agents.resume')
+	assert.equal(agent.followed.at(-1).content[0].text, '内部 resume 消息')
+
+	boot.dispose()
+})
+
+// 真根因回归的"探针方向"：如果**两个**恢复入口都没有，以前会掉进裸恢复（造坏 agent + 毒死会话）；
+// 现在必须什么都不恢复 —— 如实回"打不开"，绝不留坏 agent。
+test('冷会话恢复：没有任何控制器恢复入口时**绝不**裸恢复（如实报打不开）', async (t) => {
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: {} })
+	boot.ctx.sessionController.resolveAgent = undefined
 	boot.ctx.sessionController.resume = undefined
 	await waitFor(() => existsSync(boot.socketPath))
 	await rpc(boot.socketPath, 'register', {
@@ -944,12 +994,23 @@ test('冷会话恢复：控制器没有 resume 时可回退到裸 agents.resume�
 	})
 	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-2', msgId: 'M1' })
 	await drainFor(boot.socketPath, 60)
-	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '保底消息', msgId: 'M2' })
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '没有入口的消息', msgId: 'M2' })
 
-	const agent = await waitFor(() => boot.ctx.agents.get('session-2') ?? null)
-	await waitFor(() => agent.followed.length > 0)
-	assert.deepEqual(boot.ctx.agents.rawResumeCalls, ['session-2'], '没有控制器 resume 时才回退')
-	assert.equal(agent.followed.at(-1).content[0].text, '保底消息')
+	const reply = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /打不开/.test(String(c.args.content))) ?? null
+	})
+	assert.match(String(reply.args.content), /打不开/)
+	assert.deepEqual(boot.ctx.agents.rawResumeCalls, [], '没有恢复入口时也**绝不能**裸恢复')
+	assert.equal(boot.ctx.agents.get('session-2'), undefined, '不该留下半死的坏 agent')
+	const note = await waitFor(() => {
+		try {
+			return JSON.parse(readFileSync(boot.stateFile, 'utf8')).notes.find((line) => /没有可用的恢复入口/.test(line)) ?? null
+		} catch {
+			return null
+		}
+	})
+	assert.match(note, /sessio/i, '小日志要记一笔（插件日志进不了 journald）')
 
 	boot.dispose()
 })

@@ -203,33 +203,53 @@ level=WARN msg="已丢弃非白名单用户的私聊" openid=2A3B4C… text_len=
 
 ---
 
-## 冷会话恢复：必须走会话控制器（别再踩）
+## 冷会话恢复：走 `resolveAgent`，**不是** `resume`、更不是裸 `agents.resume`（别再踩）
 
-QQ 消息要投给一个**没有活 agent** 的会话时，插件会先"唤起"它。这一步**必须**用
-`ctx.sessionController.resume(sessionId)`：dsh 的控制器恢复时会带上 `agentOptions`（模型选择）
+QQ 消息要投给一个**没有活 agent** 的会话时，插件会先"唤起"它。入口只有
+`ctx.sessionController.resolveAgent(sessionId)`（返回 `{ agent }` 或 `{ error }`）：
+它内部就是 dsh 的 `ApiSessionAgentController.resume`，恢复时带上 `agentOptions`（模型选择）
 与 `setup`（预设组合 —— **工具就是从预设组合来的**）：
 
 ```js
 this.ctx.agents.resume({ resumeSessionId, agentOptions: this.agentOptions(), setup: composition.setup })
 ```
 
-**踩过的坑（2026-10-15 线上事故）**：插件以前直接裸调 `ctx.agents.resume({ resumeSessionId })`，
-造出来的 agent **没有模型、没有预设/工具**，于是：
+**真根因（2026-10-16 查实，解释了 10-15 起反复踩的三次）**：`sessionController` 的**公开契约里
+没有 `resume` 这个方法** —— 服务面（= `ctx.remote.session`；`@deepseek-ai/dsh-tool-cordis` 的
+api-catalog 与 Inspect 的 Service 目录都这么登记）只有 `resolveAgent` / `inspect` / `selectModel` /
+`prompt` / `list` / `page` / `follow` / `projections` / `cancel` / …，`resume` 是内部
+`ApiSessionAgentController` 的方法，**没挂到服务上**。而插件旧代码判的是
+`typeof controller.resume === 'function'` —— 恒为假（被当成"老部署"），于是**每一条** QQ 冷唤醒
+都掉进"裸 `ctx.agents.resume`"兜底。dsh Web 端自己恢复冷会话走的是 `resolveAgent`/`selectModel`，
+所以只有 **QQ 拉起的冷会话**中招；手工在 Web 里点一次模型就"好了"——那一下顺带把模型选择装进了
+那个坏 agent，但**工具永远回不来**，只有重启才能换掉这个实例（现场：session-ca96b214 的
+turn 121/124/125/126 全在 `session/end-seed` 后第一条 turn 就 `reason=error`）。
+
+裸恢复为什么不能做：造出的 agent **没有模型、没有预设/工具** ——
 
 - `agent.options.model` 为空 → 系统提示词里 `{{model}}` 取不到值 → 本轮直接失败：
   `prompt variable "{{model}}" has no value for this assembly (section "deployment:persona-prefix")`；
-- 预设没组合 → **标准模式的工具全都不在**（bash/文件工具全没了，AI 只剩"嘴"）。
+- 预设没组合 → **编码工具全没**（bash/Edit/Read…，AI 只剩"嘴"）；
+- 更糟：它会被 dsh 当成**活 agent 缓存住**，之后**每一条**消息（QQ 的、Web 的）都继续失败。
 
-症状是"报错 + 工具全没"一起出现，只有**冷会话**第一次被 QQ 唤起时中招（重启之后、或当时没有
-活 agent 的会话），重启 dsh 或显式切一次模型才会消失。
+现在 `agentFor()` 的顺序：① `resolveAgent`（契约入口；`{ error }` 或没给 agent 都如实失败并记小日志）
+→ ② 认"某些嵌入方式把内部 `resume` 暴露出来"（同样带模型与预设，安全）→ ③ 两个都没有时
+**绝不裸恢复**：如实回一句"会话打不开"，小日志记 `冷会话没有可用的恢复入口（不裸恢复）…`。
+每次冷恢复都记下走的是哪条入口（`冷会话恢复：resolveAgent ✓ <会话前 8 位>（<来自哪个 ctx>）`）——
+插件日志进不了 journald，状态文件小日志是唯一可观测通道。
 
-**补票（2026-10-16，第二次踩）**：光"优先走控制器"还不够 —— 控制器**抛错**时若回退到裸
-`agents.resume`，那个坏 agent 会被 dsh 当成**活 agent 缓存住**，于是**每一条**后续消息都继续
-报同一个错（现场：重启后第一条 QQ 消息失败，用户手动切一次模型才恢复）。现在只在控制器
-**根本没有** `resume` 这个方法（老部署）时才回退；控制器**有**却失败时**不回退**：这一条消息
-如实回一句"会话打不开"，并把失败写进状态文件的小日志（`冷会话恢复失败（不回退裸恢复）…`）。
-—— `lib/plugin.test.js`「冷会话恢复必须走 sessionController」「控制器 resume 抛错时**不许**回退
-裸恢复」（探针验证：把回退行为放回去，第二条会失败）「控制器没有 resume 时才回退」。
+—— `lib/plugin.test.js`「契约面（只有 `resolveAgent`、没有 `resume`）必须走 `resolveAgent`，
+不能裸 `agents.resume`」（测试双件已改成与真实契约同形，这条就是回归）「`resolveAgent` 抛错时
+**不许**回退裸恢复」「只有内部 `resume` 时走 `resume`」「没有任何恢复入口时**绝不**裸恢复」
+（探针验证：换回旧判据 / 放回裸恢复兜底，对应测试各会失败）。
+
+复核"服务面上到底有没有 `resume`"（一行，读的是**装着的那个包**）：
+
+```sh
+node -e "import('@deepseek-ai/dsh-api-session-controller').then((m)=>console.log(Object.getOwnPropertyNames(m.default.prototype).filter((n)=>typeof m.default.prototype[n]==='function').sort().join(', ')))"
+# … attachment, cancel, control, create, follow, fork, inspect, list, modelCatalog, page,
+#    projections, prompt, rename, resolveAgent, search, selectModel, … —— 没有 resume
+```
 
 ---
 

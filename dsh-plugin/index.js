@@ -412,52 +412,114 @@ export function apply(ctx, rawConfig) {
 	}
 
 	/**
-	 * 拉一个活 agent：先查在册，冷会话再恢复（会话不存在则返回 null）。
+	 * 拿"会话控制器"的候选句柄（按顺序找可用的恢复入口）。
 	 *
-	 * **冷会话必须优先走 `ctx.sessionController.resume`**（线上事故，2026-10-15）：
-	 * dsh 的会话控制器恢复时会带上 `agentOptions`（模型选择）与 `setup`（预设组合，工具从这里来）：
+	 * 正常部署里 `ctx.sessionController`（插件 `inject` 注入的实例）与
+	 * `ctx.get('sessionController')` 是同一个对象；但**暴露面**可能不同（有的宿主只给契约面，
+	 * 或者 `ctx.get` 拿到的是 `ctx.remote.session` 那种代理），所以两个都留着。
+	 */
+	function sessionControllers() {
+		const found = []
+		const push = (label, value) => {
+			if (value === undefined || value === null || typeof value !== 'object') return
+			if (found.some((item) => item.value === value)) return
+			found.push({ label, value })
+		}
+		try {
+			push('ctx.sessionController', ctx.sessionController)
+		} catch {
+			// 这个部署没注入该服务
+		}
+		try {
+			push("ctx.get('sessionController')", ctx.get?.('sessionController'))
+		} catch {
+			// 这个部署没有该服务
+		}
+		return found
+	}
+
+	/** 报错文本（状态小日志/日志用；别把 `[object Object]` 写进去）。 */
+	function describeError(error) {
+		if (error === undefined || error === null) return '未知原因'
+		return String(error.message ?? error)
+	}
+
+	/**
+	 * 拉一个活 agent：先查在册，冷会话交给 dsh 的会话控制器恢复（恢复不了返回 null）。
+	 *
+	 * **冷会话的恢复入口只有契约里的 `resolveAgent` 值得信**（线上事故 2026-10-15 / 10-16）：
+	 * dsh 恢复冷会话时会带上 `agentOptions`（模型选择）与 `setup`（预设组合，工具从这里来），
+	 * 它内部的实现就是 `ApiSessionAgentController.resume`：
 	 *   `this.ctx.agents.resume({ resumeSessionId, agentOptions: this.agentOptions(), setup: composition.setup })`
-	 * 而我们以前直接 `ctx.agents.resume({ resumeSessionId })` —— 那会造出一个**没有模型、没有预设/工具**
-	 * 的"裸 agent"：
-	 *   - `agent.options.model` 是空的 → 系统提示词里 `{{model}}` 取不到值 → 本轮直接
-	 *     `prompt variable "{{model}}" has no value for this assembly (section "deployment:persona-prefix")`；
-	 *   - 预设没组合 → **标准模式的工具全都不在**（bash/文件工具全没）。
-	 * 现场症状就是"报错 + 工具全没"一起出现，而且只有**冷会话**（重启之后、或当前没有活 agent
-	 * 的会话）第一次被 QQ 唤起时中招；显式切一次模型或重启 dsh 才会消失。
+	 * 而**公开契约里根本没有 `resume` 这个方法** —— `@deepseek-ai/dsh-api-session-controller`
+	 * 注册的 `sessionController` 服务面（也就是 `ctx.remote.session` 那套）只有
+	 * `resolveAgent` / `inspect` / `selectModel` / `prompt` / `list` / `page` / `projections` / …
+	 * （`resume` 是内部的 `ApiSessionAgentController` 的方法，没挂到服务上）。所以：
 	 *
-	 * **补充（2026-10-16）**：即使走控制器，只要它**抛错**就绝不能回退到裸恢复 —— 那次失败的
-	 * 恢复会被 dsh 当成"活 agent"缓存住，于是**每一条**后续消息都继续报同一个错。
-	 * 现在只在控制器**没有**这个方法（老部署）时才回退。
+	 *   ① `sessionController.resolveAgent(sessionId)` ← **唯一正确的冷会话唤醒入口**
+	 *      （返回 `{ agent }` 或 `{ error }`）。dsh Web 端自己唤醒冷会话也走它。
+	 *   ② 某些嵌入方式会把内部控制器的 `resume` 直接暴露出来；也带模型与预设，安全的。
+	 *   ③ **绝不再裸 `ctx.agents.resume({ resumeSessionId })`**：它没有 `agentOptions`/`setup`，
+	 *      造出的 agent **没有模型、没有预设工具**：
+	 *        - `agent.options.model` 为空 → 系统提示词里 `{{model}}` 取不到值 → 本轮直接
+	 *          `prompt variable "{{model}}" has no value for this assembly (section "deployment:persona-prefix")`；
+	 *        - 预设没组合 → **编码工具全没**（bash/Edit/Read…）；
+	 *        - 更糟：这个坏 agent 会被 dsh 当成**活 agent 缓存住**，之后每条消息都继续失败。
+	 *      宁可这一条消息如实失败（调用方回一句"会话打不开"），也不要造一个坏 agent。
+	 *
+	 * 为什么以前一直踩：旧代码判的是 `typeof controller.resume === 'function'` —— 契约里没有它，
+	 * 这个判断**永远为假**，于是**每一条** QQ 冷唤醒都掉进 ③ 的兜底（症状就是"只有 QQ 拉起的
+	 * 冷会话中招，手工在 Web 里切一次模型就'好了'"：Web 端恢复走 `resolveAgent`/`selectModel`）。
 	 */
 	async function agentFor(sessionId) {
 		const live = ctx.agents.get(sessionId)
 		if (live) return live
-		const controller = ctx.get?.('sessionController') ?? ctx.sessionController ?? null
-		if (typeof controller?.resume === 'function') {
+		const controllers = sessionControllers()
+		const short = String(sessionId).slice(0, 8)
+
+		// ① 契约入口：resolveAgent（带上模型与预设；就是 dsh 自己恢复冷会话那条路）。
+		for (const { label, value } of controllers) {
+			if (typeof value.resolveAgent !== 'function') continue
 			try {
-				const agent = await controller.resume(sessionId)
-				if (agent) return agent
+				const found = await value.resolveAgent(sessionId)
+				const agent = found?.agent ?? null
+				if (agent) {
+					state.note(`冷会话恢复：resolveAgent ✓ ${short}（${label}）`)
+					return agent
+				}
+				state.note(`冷会话恢复：resolveAgent 没给出 agent ${short}（${label}）:: ${describeError(found?.error)}`)
+				logger.warn?.('会话控制器没给出 agent', { sessionId, via: label, error: describeError(found?.error) })
+				return null
 			} catch (error) {
-				// 控制器**有** resume、这次却失败：**绝不退回裸 `ctx.agents.resume`** —— 那条路造出来的
-				// agent 没有模型/没有预设（症状：`prompt variable "{{model}}" has no value for this
-				// assembly (section "deployment:persona-prefix")`、标准模式工具全没），而且**会被当成
-				// 活 agent 缓存起来**，之后每条消息都继续失败（2026-10-15、2026-10-16 各踩一次：
-				// 上次是插件直接裸调，这次是控制器恢复抛错后回退）。宁可这一条消息如实失败
-				// （调用方回一句"会话打不开"），也不要造一个坏 agent。
-				state.note(`冷会话恢复失败（不回退裸恢复）：${String(sessionId).slice(0, 8)} :: ${String(error?.message ?? error)}`)
-				logger.warn?.('会话控制器恢复失败（不回退裸恢复）', { sessionId, error: String(error) })
+				state.note(`冷会话恢复失败（不回退裸恢复）：${short}（${label}） :: ${describeError(error)}`)
+				logger.warn?.('会话控制器恢复失败（不回退裸恢复）', { sessionId, via: label, error: describeError(error) })
+				return null
+			}
+		}
+
+		// ② 某些嵌入方式把内部控制器的 resume 暴露出来了：同样带模型与预设，安全的。
+		for (const { label, value } of controllers) {
+			if (typeof value.resume !== 'function') continue
+			try {
+				const agent = await value.resume(sessionId)
+				if (agent) {
+					state.note(`冷会话恢复：resume ✓ ${short}（${label}）`)
+					return agent
+				}
+			} catch (error) {
+				state.note(`冷会话恢复失败（不回退裸恢复）：${short}（${label}） :: ${describeError(error)}`)
+				logger.warn?.('会话控制器恢复失败（不回退裸恢复）', { sessionId, via: label, error: describeError(error) })
 				return null
 			}
 			return null
 		}
-		// 控制器**没有** resume（老部署）：只能裸恢复，至少别让桥整个瘫掉。
-		try {
-			const handle = await ctx.agents.resume({ resumeSessionId: sessionId })
-			return handle?.agent ?? null
-		} catch (error) {
-			logger.warn?.('恢复会话失败', { sessionId, error: String(error) })
-			return null
-		}
+
+		// ③ 没有任何控制器恢复入口：**绝不裸恢复** —— 裸恢复救不了这一条消息，反而会把这个会话毒死。
+		state.note(
+			`冷会话没有可用的恢复入口（不裸恢复）：${short}（候选：${controllers.map((item) => item.label).join(' / ') || '无'}）`,
+		)
+		logger.warn?.('这个部署没有会话控制器恢复入口，冷会话唤不醒', { sessionId })
+		return null
 	}
 
 	// ── 对 QQ 的发送封装（全部走出站队列） ───────────────────────────────────
