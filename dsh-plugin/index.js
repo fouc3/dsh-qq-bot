@@ -639,7 +639,7 @@ export function apply(ctx, rawConfig) {
 	 * 「不指定会话」之间也放一个入口按钮。`running` 取的是**会话级**状态
 	 * （`api-session/status` 事件维护），不是"有没有活 agent"。
 	 */
-	async function showRunningCard({ openid, replyContext = {} }) {
+	async function showRunningCard({ openid, page = 1, replyContext = {} }) {
 		const bound = state.bindingOf(openid)
 		const items = sessions.runningSessions().map((session) => {
 			const agent = ctx.agents.get(session.sessionId)
@@ -654,9 +654,10 @@ export function apply(ctx, rawConfig) {
 		const card = buildRunningCard({
 			items,
 			currentLabel: bound && bound !== 'none' ? sessions.label(bound) : '',
+			page,
 		})
 		await io.sendCard({ openid, content: card.content, keyboard: card.keyboard, context: replyContext })
-		logger.info?.('已发运行中会话卡片', { count: items.length })
+		logger.info?.('已发运行中会话卡片', { count: items.length, page })
 	}
 
 	/**
@@ -1762,14 +1763,20 @@ export function apply(ctx, rawConfig) {
 			}
 		} else if (parsed.kind === 'run') {
 			// 「运行中会话」：空 arg = 打开那张卡片；带会话id = **直接切过去**。
-			// 语义全在 commands.js（`运行中会话`），这里只把按钮翻译成等价的命令文本。
+			// 语义全在 commands.js（`运行中会话`），这里只把按钮翻译成等价的命令文本；
+			// `page` 走 context 带过去，切完重发卡片才不会跳回第一页。
 			// `fromCard: true` 让命令侧切完把卡片重发一遍（标出新的「当前会话」）。
 			const ctxReply = { eventId: event.eventId, msgId: event.msgId ?? '' }
 			const tokens = parsed.sessionId ? [parsed.sessionId] : []
 			await commands.run(
-				{ openid, replyContext: ctxReply, quote: '', fromCard: true },
+				{ openid, replyContext: ctxReply, quote: '', fromCard: true, page: parsed.page },
 				{ name: '运行中会话', tokens, rest: tokens.join(' ') },
 			)
+			code = 0
+		} else if (parsed.kind === 'runpage') {
+			// 翻页：直接重发那张卡片（和目录卡片的翻页同款做法）。
+			const ctxReply = { eventId: event.eventId, msgId: event.msgId ?? '' }
+			await showRunningCard({ openid, page: parsed.page, replyContext: ctxReply })
 			code = 0
 		} else if (parsed.kind === 'shortcut') {
 			// 快捷卡片：go（点某条 = 直接切过去）/ add（把当前会话加进来）。

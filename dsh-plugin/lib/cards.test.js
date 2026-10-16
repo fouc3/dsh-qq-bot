@@ -256,7 +256,7 @@ test('会话卡片：「返回上级」+「运行中会话」+「不指定会话
 	// 用户要求（2026-10-16）：「运行中会话」夹在「返回上级」与「不指定会话」之间。
 	assert.deepEqual(labels, ['返回上级', '运行中会话', '不指定会话'], '导航行顺序：返回上级 → 运行中会话 → 不指定会话')
 	assert.equal(nav.buttons[0].action.data, data.dir('/home'))
-	assert.equal(nav.buttons[1].action.data, 'qqb:run:', '「运行中会话」是回调按钮（点开那张卡），不是填命令')
+	assert.equal(nav.buttons[1].action.data, 'qqb:run:?page=1', '「运行中会话」是回调按钮（点开那张卡），不是填命令')
 	assert.equal(nav.buttons[1].action.type, 1, '回调按钮 type=1')
 	assert.equal(nav.buttons[2].action.type, 2, '「不指定会话」仍是指令按钮（填 `切换会话 none`）')
 
@@ -273,43 +273,71 @@ test('会话卡片：「返回上级」+「运行中会话」+「不指定会话
 	assert.deepEqual(rootNav, ['运行中会话', '不指定会话'])
 })
 
-// 用户要求（2026-10-16）：新增「运行中会话」——看正在跑的会话，点一下**直接切过去**。
-test('运行中会话卡片：每条一个回调按钮（点了就切），一个都没有时明说', () => {
-	const card = buildRunningCard({
-		items: [
-			{ sessionId: 'session-a', label: '甲项目', status: '运行中（第 3 轮，已跑 12 秒）', current: true },
-			{ sessionId: 'session-b', label: '乙项目', status: '运行中（第 1 轮，已跑 2 秒）' },
+// 用户要求（2026-10-16）：新增「运行中会话」——正文看具体运行状况，**按钮只写编号**；
+// 每行 3 个、满 4 行（12 个）一页，**第 5 行留给翻页**。
+test('运行中会话卡片：正文写详情、按钮只写编号；3/行、12 个一页、第 5 行翻页', () => {
+	const items = Array.from({ length: 14 }, (_, i) => ({
+		sessionId: `s-${i + 1}`,
+		label: `会${i + 1}`,
+		status: `运行中（第 ${i + 1} 轮，已跑 ${i} 秒）`,
+		current: i === 0,
+	}))
+	const card = buildRunningCard({ items, currentLabel: '会1(s-1)' })
+	const rows = card.keyboard.content.rows
+	assert.equal(rows.length, 5, '4 行内容 + 1 行翻页')
+	assert.deepEqual(
+		rows.slice(0, 4).map((row) => row.buttons.map((b) => b.render_data.label)),
+		[
+			['1', '2', '3'],
+			['4', '5', '6'],
+			['7', '8', '9'],
+			['10', '11', '12'],
 		],
-		currentLabel: '甲项目(session-a)',
-	})
-	const buttons = card.keyboard.content.rows.flatMap((row) => row.buttons)
-	assert.deepEqual(buttons.map((b) => b.render_data.label), ['甲项目', '乙项目'])
-	assert.deepEqual(buttons.map((b) => b.action.data), ['qqb:run:session-a', 'qqb:run:session-b'])
-	assert.equal(buttons[0].action.type, 1, '回调按钮：点一下当场切（不用再按发送，这就是"快速切换"）')
-	assert.equal(buttons[0].render_data.style, 1, '当前会话高亮')
-	assert.equal(buttons[1].render_data.style, 0, '其它会话是灰的')
+		'按钮只写编号，每行 3 个，一页 12 个',
+	)
+	assert.deepEqual(rows[4].buttons.map((b) => b.render_data.label), ['下一页'], '第 5 行翻页')
+	assert.equal(rows[0].buttons[0].action.data, 'qqb:run:s-1?page=1', '编号点一下直接切（带当前页）')
+	assert.equal(rows[0].buttons[0].action.type, 1, '回调按钮：点一下当场切')
+	assert.equal(rows[0].buttons[0].render_data.style, 1, '当前会话的编号是蓝的')
+	assert.equal(rows[0].buttons[1].render_data.style, 0, '其余灰的')
+
+	// 正文：具体运行状况在上面（编号 + 标题 + 会话id + 第 N 轮/已跑多久）
 	assert.match(card.content, /^\*\*运行中会话\*\*/)
-	assert.match(card.content, /当前会话：`甲项目\(session-a\)`/)
-	assert.match(card.content, /共 2 个正在跑/)
-	assert.match(card.content, /● \*\*甲项目\*\*/)
-	assert.match(card.content, /第 3 轮，已跑 12 秒/)
+	assert.match(card.content, /当前会话：`会1\(s-1\)`/)
+	assert.match(card.content, /共 14 个正在跑 · 第 1\/2 页（每页 12 个）/)
+	assert.match(card.content, /^1\. ● \*\*会1\*\*/m)
+	assert.match(card.content, /`s-1`/)
+	assert.match(card.content, /第 1 轮，已跑 0 秒/)
+	assert.doesNotMatch(card.content, /^13\. /m, '第 13 个在第 2 页')
+
+	// 第 2 页：正文列剩下的，按钮从 1 重新编号，翻页行给「上一页」
+	const page2 = buildRunningCard({ items, currentLabel: '会1(s-1)', page: 2 })
+	const rows2 = page2.keyboard.content.rows
+	assert.equal(rows2[0].buttons.length, 2, '第 2 页只剩 2 个')
+	assert.deepEqual(rows2[0].buttons.map((b) => b.render_data.label), ['1', '2'])
+	assert.equal(rows2[0].buttons[0].action.data, 'qqb:run:s-13?page=2', '第 2 页的 1 号 = 第 13 个会话')
+	assert.deepEqual(rows2[1].buttons.map((b) => b.render_data.label), ['上一页'])
+	assert.match(page2.content, /^1\. ● \*\*会13\*\*/m)
+	assert.match(page2.content, /第 2\/2 页/)
+
+	// 正好 12 个：不需要翻页行（只占 4 行）
+	const exact = buildRunningCard({ items: items.slice(0, 12) })
+	assert.equal(exact.keyboard.content.rows.length, 4)
+	assert.match(exact.content, /第 1\/1 页/)
 
 	// 一个都没有：不给按钮，明说一句（别发一张空卡片让人猜）
 	const empty = buildRunningCard({ items: [], currentLabel: '' })
 	assert.equal(empty.keyboard.content.rows.length, 0)
 	assert.match(empty.content, /没有正在跑的会话/)
 	assert.match(empty.content, /`none`（未绑定）/)
-
-	// 超过按钮容量：正文全列（信息全），按钮只放得下的那些并明说
-	const many = buildRunningCard({ items: Array.from({ length: 20 }, (_, i) => ({ sessionId: `s-${i}`, label: `会${i}` })) })
-	assert.equal(many.keyboard.content.rows.length, 4, '按钮最多 4 行')
-	assert.match(many.content, /按钮只放了前 12 个/)
 })
 
-test('回调 data：run 空参=打开卡片、带会话id=直接切；解析回来对得上', () => {
-	assert.equal(data.run(), 'qqb:run:')
-	assert.deepEqual(parseCallback(data.run()), { kind: 'run', sessionId: '' })
-	assert.deepEqual(parseCallback(data.run('session-9')), { kind: 'run', sessionId: 'session-9' })
+test('回调 data：run 带页码（切完不回第一页）、runPage 翻页；解析回来对得上', () => {
+	assert.equal(data.run(), 'qqb:run:?page=1')
+	assert.deepEqual(parseCallback(data.run()), { kind: 'run', sessionId: '', page: 1 })
+	assert.deepEqual(parseCallback(data.run('session-9', 3)), { kind: 'run', sessionId: 'session-9', page: 3 })
+	assert.equal(data.runPage(2), 'qqb:runp:2')
+	assert.deepEqual(parseCallback(data.runPage(2)), { kind: 'runpage', page: 2 })
 	assert.equal(parseCallback('qqb:run'), null, '缺冒号的残缺 data 不该被认')
 })
 

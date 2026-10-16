@@ -569,14 +569,16 @@ test('端到端：运行中会话 —— 只列正在跑的；点按钮直接切
 	assert.match(String(card.args.content), /共 2 个正在跑/)
 	assert.doesNotMatch(String(card.args.content), /proj-b/, '空闲会话不该出现在"运行中"卡片里')
 	const buttons = card.args.keyboard.content.rows.flatMap((row) => row.buttons)
-	assert.deepEqual(buttons.map((b) => b.action.data).sort(), ['qqb:run:session-1', 'qqb:run:session-3'])
+	assert.deepEqual(buttons.map((b) => b.action.data).sort(), ['qqb:run:session-1?page=1', 'qqb:run:session-3?page=1'])
+	assert.deepEqual(buttons.map((b) => b.render_data.label).sort(), ['1', '2'], '按钮只写编号（用户要求）')
 	assert.equal(buttons[0].action.type, 1, '回调按钮：点一下当场切')
 
-	// ② 点 session-3：绑定切过去 + 回执 + 回应互动
+	// ② 点 session-3（第 2 个编号）：绑定切过去 + 回执 + 回应互动
+	const target = buttons.find((b) => b.action.data.startsWith('qqb:run:session-3'))
 	await rpc(boot.socketPath, 'event', {
 		kind: 'interaction',
 		openid: 'U1',
-		buttonData: 'qqb:run:session-3',
+		buttonData: target.action.data,
 		eventId: 'INT-RUN',
 		msgId: 'CARD-RUN',
 	})
@@ -608,6 +610,46 @@ test('端到端：运行中会话 —— 只列正在跑的；点按钮直接切
 	assert.equal(nav[0], '返回上级', '顺序：返回上级 → 运行中会话 → 不指定会话')
 	assert.equal(nav[1], '运行中会话')
 	assert.equal(nav[2], '不指定会话')
+
+	boot.dispose()
+})
+
+test('端到端：运行中会话翻页 —— 12 个一页，第 5 行「下一页」，翻过去只列剩下的', async (t) => {
+	const sessions = Array.from({ length: 14 }, (_, i) => ({
+		sessionId: `session-${i + 1}`,
+		cwd: `/home/u/p${i + 1}`,
+		updatedAt: 100 - i,
+		running: true,
+	}))
+	const boot = bootPlugin(t, { sessions, live: {} })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	await drainFor(boot.socketPath, 60)
+
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '运行中会话', msgId: 'M1' })
+	const page1 = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /\*\*运行中会话\*\*/.test(String(c.args.content))) ?? null
+	})
+	assert.match(String(page1.args.content), /共 14 个正在跑 · 第 1\/2 页（每页 12 个）/)
+	const rows1 = page1.args.keyboard.content.rows
+	assert.equal(rows1.length, 5, '4 行编号 + 1 行翻页（平台 5 行上限）')
+	assert.equal(rows1[4].buttons[0].render_data.label, '下一页')
+
+	await rpc(boot.socketPath, 'event', {
+		kind: 'interaction',
+		openid: 'U1',
+		buttonData: rows1[4].buttons[0].action.data,
+		eventId: 'INT-P2',
+		msgId: 'CARD-P1',
+	})
+	const page2 = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'send_c2c' && /第 2\/2 页/.test(String(c.args.content))) ?? null
+	})
+	assert.equal(page2.args.keyboard.content.rows[0].buttons.length, 2, '第 2 页只剩 2 个')
+	assert.deepEqual(page2.args.keyboard.content.rows[0].buttons.map((b) => b.render_data.label), ['1', '2'])
+	assert.deepEqual(page2.args.keyboard.content.rows[1].buttons.map((b) => b.render_data.label), ['上一页'])
 
 	boot.dispose()
 })

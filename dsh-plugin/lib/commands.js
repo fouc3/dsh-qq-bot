@@ -411,14 +411,14 @@ export function createCommandRunner(deps) {
 	 * 为什么值得有：`切换会话` 卡片的会话按钮是**指令按钮**（填命令、还得自己按发送），
 	 * 挂在目标链上一跑几十分钟的会话想切过去，得先翻目录再按发送；这里的按钮点了就切。
 	 */
-	async function showRunning({ openid, replyContext, fromCard = false }, parsed) {
+	async function showRunning({ openid, replyContext, fromCard = false, page = 1 }, parsed) {
 		if (parsed.tokens.length > 0) {
 			const result = await switchSession({ openid, replyContext }, parsed)
-			// 从卡片上点过来的：切完把卡片重发一遍，标出新的「当前会话」。
-			if (fromCard) await deps.showRunningCard?.({ openid, replyContext })
+			// 从卡片上点过来的：切完把卡片重发一遍（标出新的「当前会话」，**留在原来那一页**）。
+			if (fromCard) await deps.showRunningCard?.({ openid, replyContext, page })
 			return result
 		}
-		await deps.showRunningCard({ openid, replyContext })
+		await deps.showRunningCard({ openid, replyContext, page })
 		return { handled: true }
 	}
 

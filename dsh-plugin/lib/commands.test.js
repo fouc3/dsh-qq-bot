@@ -58,7 +58,7 @@ function makeRunner({ seed = {}, modelResult = { ok: true, text: '**DeepSeek / D
 		reply: async ({ openid, content }) => calls.replies.push({ openid, content }),
 		showSessionCard: async ({ openid, dir }) => calls.cards.push({ openid, dir }),
 		showShortcutCard: async ({ openid }) => calls.shortcutCards.push({ openid, items: state.shortcutsOf(openid) }),
-		showRunningCard: async ({ openid }) => calls.runningCards.push({ openid }),
+		showRunningCard: async ({ openid, page = 1 }) => calls.runningCards.push({ openid, page }),
 		showModelCard: async ({ openid, sessionId }) => calls.modelCards.push({ openid, sessionId }),
 		setModel: async ({ openid, sessionId, spec }) => {
 			calls.models.push({ openid, sessionId, spec })
@@ -157,6 +157,7 @@ test('运行中会话：无参发卡片；带会话id 直接切（复用 switchS
 	const carded = await runner.run({ openid: 'U1', quote: '' }, { name: '运行中会话', tokens: [], rest: '' })
 	assert.equal(carded.handled, true)
 	assert.equal(calls.runningCards.length, 1, '无参 = 发那张卡片')
+	assert.equal(calls.runningCards[0].page, 1, '默认第一页')
 
 	// 带会话id：直接切过去（等价 `切换会话 <id>`，不重复实现）
 	const switched = await runner.run({ openid: 'U1', quote: '' }, { name: '运行中会话', tokens: ['session-2'], rest: 'session-2' })
@@ -164,11 +165,15 @@ test('运行中会话：无参发卡片；带会话id 直接切（复用 switchS
 	assert.equal(s.bindingOf('U1'), 'session-2', '点一下就该切过去')
 	assert.ok(calls.replies.some((r) => /已接入/.test(r.content)), '要有切过去的回执')
 
-	// 从卡片上点过来（fromCard）：切完把卡片重发一遍，标出新的「当前会话」
+	// 从卡片上点过来（fromCard）：切完把卡片重发一遍，标出新的「当前会话」，**留在原来那一页**
 	calls.runningCards.length = 0
-	await runner.run({ openid: 'U1', quote: '', fromCard: true }, { name: '运行中会话', tokens: ['session-1'], rest: 'session-1' })
+	await runner.run(
+		{ openid: 'U1', quote: '', fromCard: true, page: 3 },
+		{ name: '运行中会话', tokens: ['session-1'], rest: 'session-1' },
+	)
 	assert.equal(s.bindingOf('U1'), 'session-1')
 	assert.equal(calls.runningCards.length, 1, '卡片上点过来要重发卡片（更新"当前"）')
+	assert.equal(calls.runningCards[0].page, 3, '重发要留在第 3 页，不能跳回第一页')
 })
 
 test('切换会话：无参=会话选择；带会话id=绑定；none=解绑', async () => {	const { runner, calls, state: s } = makeRunner({ seed: boundSeed() })
