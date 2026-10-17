@@ -470,6 +470,49 @@ test('快捷：裸发=帮助（不是卡片）；`列出`/`list`/`l` 才发卡�
 	assert.match(calls.replies.at(-1).content, /已经在快捷里/)
 })
 
+// 用户 2026-10-17：「同一个文件夹会话咋还误判 / 哦，你没支持填写 session 吗，加下」
+// 以前 `快捷 加` 只认**当前绑定会话**，后面跟的会话id被整串当成备注 ⇒ 往同一条上改，
+// 看起来就像"同一个文件夹的两个会话被误判成同一条"。现在末尾写会话id就存指定的那个。
+test('快捷 加 [备注] <会话id>：存**指定的**会话（不同会话各自一条，不再并进当前那条）', async () => {
+	const { runner, calls, state: s } = makeRunner({ seed: boundSeed() }) // U1 绑 session-1
+
+	// ① 指定 session-2（不是当前绑定的）→ 新增一条，前面那段是备注
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 加 proj-b session-2'))
+	assert.deepEqual(s.shortcutsOf('U1').map((i) => [i.id, i.sessionId, i.name]), [[1, 'session-2', 'proj-b']])
+	assert.match(calls.replies.at(-1).content, /已加入快捷/)
+	assert.equal(s.bindingOf('U1'), 'session-1', '加条目不该改当前绑定')
+
+	// ② 再加另一个会话 → 必须是**新编号**（用户报的就是这里：以前并进同一条）
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 加 proj-c session-3'))
+	assert.deepEqual(s.shortcutsOf('U1').map((i) => [i.id, i.sessionId, i.name]), [
+		[1, 'session-2', 'proj-b'],
+		[2, 'session-3', 'proj-c'],
+	])
+	assert.match(calls.replies.at(-1).content, /#2/)
+
+	// ③ 同一个会话再加一次（带新备注）→ 还是原来那条，只改备注
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 加 新备注 session-2'))
+	assert.deepEqual(s.shortcutsOf('U1').map((i) => [i.id, i.sessionId, i.name]), [
+		[1, 'session-2', '新备注'],
+		[2, 'session-3', 'proj-c'],
+	])
+	assert.match(calls.replies.at(-1).content, /已经在快捷里/)
+
+	// ④ 只写会话id（不带备注）也认；备注里带空格的老写法不受影响
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 加 session-1'))
+	assert.deepEqual(s.shortcutsOf('U1').map((i) => [i.id, i.sessionId, i.name]), [
+		[1, 'session-2', '新备注'],
+		[2, 'session-3', 'proj-c'],
+		[3, 'session-1', ''],
+	])
+
+	// ⑤ 认不出会话id时报错（说"找不到会话"，而不是"没有绑定会话"——用户明明绑着），也不能悄悄当备注存进去
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 加 某个备注 session-nope'))
+	const after = s.shortcutsOf('U1')
+	assert.equal(after.length, 3, '认不出会话就不能新增条目')
+	assert.match(calls.replies.at(-1).content, /找不到会话/, '要说清楚是"找不到那个会话"')
+})
+
 test('快捷：英文缩写与中文等价（add/a、delete/d、list/l、rename/r，大小写不敏感）', async () => {
 	const { runner, calls, state: s } = makeRunner({ seed: boundSeed() })
 	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 add 前端'))

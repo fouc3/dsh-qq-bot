@@ -31,7 +31,7 @@ export const COMMANDS = [
 		purpose: '把常用会话存成快捷入口（每条自带 `#编号`，可配自定义备注）。',
 		usage: '快捷 #编号 [<消息>]',
 		usageAlt: '快捷 <会话id|备注> [<消息>]',
-		usageAlt2: '快捷 加 [备注] | 删 #编号 | 备注 #编号 <新备注> | 列出',
+		usageAlt2: '快捷 加 [备注] [会话id] | 删 #编号 | 备注 #编号 <新备注> | 列出',
 		// 通用排版（一段 `作用` + 一行 `用法：A 或 B 或 C`）在快捷这里读起来很乱（用户提过）：
 		// 它有三类动作、还叠着"带消息不切换"的细节，所以单独给一份**分节**的说明，
 		// 由 usageText() 原样返回（命令表仍是唯一来源）。
@@ -45,6 +45,7 @@ export const COMMANDS = [
 			'',
 			'**管条目**',
 			'- `快捷 加 [备注]` 把当前会话存成一条（自带 `#编号`）',
+			'- `快捷 加 [备注] <会话id>` 存**指定的**会话（不用先切过去；末尾写会话id即可，前面是备注）',
 			'- `快捷 列出` 看卡片，点按钮直接切',
 			'- `快捷 删 #2` / `快捷 备注 #2 <新备注>`',
 			'',
@@ -531,7 +532,10 @@ export function createCommandRunner(deps) {
 			await deps.showShortcutCard?.({ openid: context.openid, replyContext: context.replyContext })
 			return { handled: true }
 		}
-		if (SHORTCUT_ADD.has(word)) return addShortcut(context, tokens.slice(1).join(' ').trim())
+		if (SHORTCUT_ADD.has(word)) {
+			const { name, target } = parseShortcutAdd(tokens.slice(1))
+			return addShortcut(context, name, target)
+		}
 		if (SHORTCUT_DEL.has(word)) return dropShortcut(context, tokens.slice(1))
 		if (SHORTCUT_RENAME.has(word)) return renameShortcut(context, tokens.slice(1))
 		return goShortcut(context, parsed)
@@ -568,20 +572,53 @@ export function createCommandRunner(deps) {
 	 *
 	 * 同一个会话只留一条：已经在列表里就只更新备注（不会攒出两条指向同一会话）。
 	 */
-	async function addShortcut({ openid, replyContext, fromCard }, name) {
+	/**
+	 * `快捷 加 [备注] [会话id]` 的解析。
+	 *
+	 * 用户 2026-10-17：「同一个文件夹会话咋还误判 / 哦，你没支持填写 session 吗，加下」——
+	 * 以前 `快捷 加` 只认**当前绑定会话**，后面写的会话id被整串当成备注，于是往同一条 #1 上改，
+	 * 看起来像"同文件夹的两个会话被误判成同一条"。
+	 *
+	 * 规则：**末尾那个 token** 只要像会话引用（`session-…` 或能查到），就当作目标会话，
+	 * 前面剩下的才是备注（备注里带空格的写法继续有效）。像不像会话引用不猜标题，
+	 * 只认 `session-` 前缀与**已知会话id**——备注是自由文本，不能靠"叫得像"来判定。
+	 */
+	function parseShortcutAdd(tokens) {
+		const list = (tokens ?? []).map((token) => String(token ?? '').trim()).filter(Boolean)
+		if (list.length === 0) return { name: '', target: '' }
+		const last = list[list.length - 1]
+		const looksLikeRef = last.startsWith('session-') || Boolean(sessions.get(last))
+		if (!looksLikeRef) return { name: list.join(' '), target: '' }
+		return { name: list.slice(0, -1).join(' '), target: last }
+	}
+
+	async function addShortcut({ openid, replyContext, fromCard }, name, target = '') {
 		const bad = shortcutNameError(name)
 		if (bad) {
 			await deps.reply({ openid, content: `${bad}\n\n${usageText('快捷')}`, replyContext })
 			await refreshShortcutCard({ openid, replyContext, fromCard })
 			return { handled: true }
 		}
-		const sessionId = currentSessionId(openid)
+		// 指定了会话就用那个（认 `session-…` 前缀与完整id），否则用当前绑定会话。
+		const bound = currentSessionId(openid)
+		const sessionId = target ? (sessions.resolveRef([target])?.sessionId ?? '') : bound
+		if (target && !sessionId) {
+			// 指定了会话却认不出来：别把"没有绑定会话"混进来（用户明明绑着）
+			await deps.reply({
+				openid,
+				content: `找不到会话 \`${target}\`，没法加。发 \`切换会话\` 看看有哪些会话id。`,
+				markdown: true,
+				replyContext,
+			})
+			await refreshShortcutCard({ openid, replyContext, fromCard })
+			return { handled: true }
+		}
 		if (!sessionId || sessionId === 'none') {
 			await deps.reply({
 				openid,
 				content:
 					'当前没有绑定会话，没法加。先 `切换会话 <会话id>`（或发 `切换会话` 选一个），' +
-					'再发 `快捷 加 [备注]`。',
+					'再发 `快捷 加 [备注]`；也可以 `快捷 加 [备注] <会话id>` 直接指定会话。',
 				markdown: true,
 				replyContext,
 			})
