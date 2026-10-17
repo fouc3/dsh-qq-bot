@@ -1,5 +1,6 @@
 // Package bridge 实现与 dsh 插件之间的本地通道客户端：
-// UNIX domain socket + 换行分隔 JSON（NDJSON），见 docs/protocol.md。
+// 换行分隔 JSON（NDJSON）跑在本地通道上——POSIX 是 UNIX domain socket，
+// Windows 是命名管道（见 endpoint.go）；协议细节见 docs/protocol.md。
 package bridge
 
 import (
@@ -11,9 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"os"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
@@ -52,7 +51,8 @@ func IsCode(err error, code string) bool {
 
 // Options 是通道客户端设置。
 type Options struct {
-	// Token 为空表示不做握手，仅靠 socket 文件权限（0600）认证。
+	// Token 为空表示不做握手：POSIX 上靠 socket 文件权限（0600）认证，
+	// Windows 的命名管道没有权限位可依，那边 token 必须填。
 	Token string
 	// DialTimeout 是拨号与握手的超时。
 	DialTimeout time.Duration
@@ -68,14 +68,19 @@ type Options struct {
 // 只有 outbox 长轮询独占一条长连接。这样无需多路复用，也不会出现
 // 一帧响应串到另一个请求上的问题。
 type Client struct {
-	path string
-	opts Options
-	log  *slog.Logger
-	seq  atomic.Uint64
+	endpoint Endpoint
+	// parseErr 是构造时解析地址留下的错误：构造不失败，留到第一次使用时返回。
+	parseErr error
+	opts     Options
+	log      *slog.Logger
+	seq      atomic.Uint64
 }
 
 // New 构造通道客户端。
-func New(path string, opts Options, log *slog.Logger) *Client {
+//
+// 地址支持 `unix:<路径>`（或直接写路径，等价）与 `pipe:<名字>`（Windows 命名管道）。
+// 解析失败不会 panic，错误留到第一次使用时返回，方便启动阶段把话讲清楚。
+func New(address string, opts Options, log *slog.Logger) *Client {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -88,33 +93,26 @@ func New(path string, opts Options, log *slog.Logger) *Client {
 	if opts.PollWait <= 0 {
 		opts.PollWait = 25 * time.Second
 	}
-	return &Client{path: path, opts: opts, log: log}
+	endpoint, parseErr := ParseEndpoint(address)
+	return &Client{endpoint: endpoint, parseErr: parseErr, opts: opts, log: log}
 }
 
-// Path 返回通道 socket 路径。
-func (c *Client) Path() string { return c.path }
+// Path 返回通道地址（管道只返回名字那部分，便于日志）。
+func (c *Client) Path() string { return c.endpoint.String() }
 
-// VerifySocket 在拨号前校验 socket 的属主与权限位。
+// Endpoint 返回解析后的通道地址。
+func (c *Client) Endpoint() Endpoint { return c.endpoint }
+
+// VerifySocket 在拨号前做平台侧的地址校验。
 //
-// 这是"仅限当前账户可访问"这一要求的客户端侧检查：如果 socket 被放宽权限，
-// 我们宁可拒绝连接并明确报错，也不默默降级。
+// POSIX 上这是「仅限当前账户可访问」的客户端侧检查：socket 被放宽权限就拒绝连接、
+// 明确报错，不默默降级；Windows 的命名管道没有权限位，那边只做地址类型校验，
+// 认证交给 token 握手（见 transport_windows.go）。
 func (c *Client) VerifySocket() error {
-	info, err := os.Lstat(c.path)
-	if err != nil {
-		return fmt.Errorf("本地通道不可用（%s）：%w", c.path, err)
+	if c.parseErr != nil {
+		return c.parseErr
 	}
-	if info.Mode()&os.ModeSocket == 0 {
-		return fmt.Errorf("本地通道路径不是 socket：%s", c.path)
-	}
-	if perm := info.Mode().Perm(); perm&0o077 != 0 {
-		return fmt.Errorf("本地通道 socket 权限过宽（%04o，应为 0600）：%s", perm, c.path)
-	}
-	if st, ok := info.Sys().(*syscall.Stat_t); ok {
-		if uid := os.Getuid(); int(st.Uid) != uid {
-			return fmt.Errorf("本地通道 socket 属主不是当前用户（uid=%d，期望 %d）：%s", st.Uid, uid, c.path)
-		}
-	}
-	return nil
+	return verifyEndpoint(c.endpoint)
 }
 
 // Call 执行一次请求/响应。
@@ -226,11 +224,11 @@ func (c *Client) Poll(ctx context.Context, fn func(context.Context, []Command) e
 	}
 }
 
+// dial 拨通本地通道：网络类型的分发在 dialEndpoint（按平台编译期择一）。
 func (c *Client) dial(ctx context.Context) (net.Conn, error) {
-	dialer := &net.Dialer{Timeout: c.opts.DialTimeout}
-	conn, err := dialer.DialContext(ctx, "unix", c.path)
+	conn, err := dialEndpoint(ctx, c.endpoint, c.opts.DialTimeout)
 	if err != nil {
-		return nil, fmt.Errorf("连接本地通道失败（%s）：%w", c.path, err)
+		return nil, fmt.Errorf("连接本地通道失败（%s）：%w", c.endpoint, err)
 	}
 	return conn, nil
 }

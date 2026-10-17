@@ -7,7 +7,11 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 )
 
-require github.com/gorilla/websocket v1.5.3 // indirect
+require (
+	github.com/Microsoft/go-winio v0.6.4 // indirect
+	github.com/gorilla/websocket v1.5.3 // indirect
+	golang.org/x/sys v0.49.0 // indirect
+)
 
 // 本机开发用本地 SDK 实体（同机目录）。切回发布版：
 //
