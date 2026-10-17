@@ -1,9 +1,10 @@
 /**
- * 本地通道服务端：UNIX domain socket + 换行分隔 JSON（NDJSON）。
+ * 本地通道服务端：换行分隔 JSON（NDJSON）跑在本地通道上。
  *
- * 与 HTTP 不同，这里的认证靠**文件权限**：目录 0700、socket 文件 0600，
- * 只有与 dsh 同账户的进程能连上；需要额外加固时再叠一层 token 握手。
- * 协议细节见 docs/protocol.md。
+ * POSIX 用 UNIX domain socket：与 HTTP 不同，这里的认证靠**文件权限**——
+ * 目录 0700、socket 文件 0600，只有与 dsh 同账户的进程能连上；需要额外加固时再叠一层 token 握手。
+ * Windows 只能用**命名管道**（libuv 的 pipe 就是 NPFS 管道，建不出 AF_UNIX）：那边没有权限位可依，
+ * 所以 token 在 Windows 上是必填项。两种地址都由 parseEndpoint() 归一，协议细节见 docs/protocol.md。
  */
 import { chmodSync, existsSync, mkdirSync, unlinkSync } from 'node:fs'
 import { connect, createServer } from 'node:net'
@@ -13,12 +14,52 @@ import { timingSafeEqual } from 'node:crypto'
 /** 单帧上限（与 Go 侧一致）。 */
 export const MAX_FRAME_BYTES = 1 << 20
 
+/** Windows 命名管道的固定前缀。 */
+const PIPE_PREFIX = '\\\\.\\pipe\\'
+
 /** 协议错误：会被序列化成 { ok:false, error:{ code, message } }。 */
 export class FrameError extends Error {
 	constructor(code, message) {
 		super(message)
 		this.code = code
 	}
+}
+
+/**
+ * 解析通道地址（与 Go 侧 internal/bridge 的 ParseEndpoint 同一套语义）。
+ *
+ *   `/run/dsh/bridge.sock` / `unix:/run/dsh/bridge.sock`  → { kind: 'unix',  target: 路径 }
+ *   `pipe:名字` / `pipe:\\.\pipe\名字`                      → { kind: 'pipe',  target: '\\.\pipe\名字' }
+ *
+ * 只认这两个**短**方案：`C:\…` 冒号前是单个字母，不会被当成方案名（仍按 unix 路径处理）。
+ *
+ * @param {string} raw
+ * @returns {{kind: 'unix'|'pipe', target: string, label: string}}
+ */
+export function parseEndpoint(raw) {
+	const value = String(raw ?? '').trim()
+	if (!value) throw new Error('通道 socketPath 不能为空')
+	const match = /^(unix|pipe):([\s\S]*)$/i.exec(value)
+	if (!match) return { kind: 'unix', target: value, label: value }
+	const scheme = match[1].toLowerCase()
+	const rest = match[2].trim()
+	if (!rest) {
+		throw new Error(
+			scheme === 'pipe'
+				? `通道地址 ${JSON.stringify(raw)} 缺少管道名（应为 pipe:<名字>）`
+				: `通道地址 ${JSON.stringify(raw)} 缺少路径（应为 unix:<路径>）`,
+		)
+	}
+	if (scheme === 'pipe') {
+		const name = hasPipePrefix(rest) ? rest.slice(PIPE_PREFIX.length) : rest
+		return { kind: 'pipe', target: `${PIPE_PREFIX}${name}`, label: `pipe:${name}` }
+	}
+	return { kind: 'unix', target: rest, label: rest }
+}
+
+/** 判断是否已带 `\\.\pipe\` 前缀（Windows 的路径不区分大小写）。 */
+function hasPipePrefix(value) {
+	return value.slice(0, PIPE_PREFIX.length).toLowerCase() === PIPE_PREFIX.toLowerCase()
 }
 
 function safeEqual(a, b) {
@@ -87,16 +128,38 @@ async function clearStaleSocket(path, logger, { waitMs = 3000, pollMs = 20, sett
 }
 
 /**
+ * 命名管道的"抢占"处理。
+ *
+ * 命名管道没有文件、也没有 unlink：进程一死名字就没了，所以**不需要清理**。
+ * 唯一要处理的是热重载那个窗口——老实例可能还在应答（或刚断还在收尾），
+ * 这时照样"宁可慢一点，绝不抢名字"：等它不应答了再 listen。
+ */
+async function waitForPipeName(target, logger, { waitMs = 3000, pollMs = 20 } = {}) {
+	const deadline = Date.now() + waitMs
+	let warned = false
+	while (await probeSocket(target)) {
+		if (Date.now() >= deadline) {
+			throw new Error(`本地通道命名管道已被占用：${target}（是否起了两个 dsh 实例？）`)
+		}
+		if (!warned) {
+			logger?.warn?.('通道命名管道仍被占用，等老实例退出后接管', { target })
+			warned = true
+		}
+		await new Promise((resolve) => setTimeout(resolve, pollMs))
+	}
+}
+
+/**
  * 起一个通道服务端。
  *
  * @param {object} options
- * @param {string} options.path socket 路径
- * @param {string} [options.token] 非空时要求首帧为 {"token":…}
+ * @param {string} options.path 通道地址：POSIX 写 socket 路径，Windows 写 `pipe:名字`
+ * @param {string} [options.token] 非空时要求首帧为 {"token":…}（Windows 命名管道上必填）
  * @param {object} options.logger
  * @param {Record<string, (args:any)=>any>} options.handlers op → 处理函数（可异步，可 throw FrameError）
  * @param {number} [options.maxFrameBytes]
  * @param {number} [options.waitMs] 接管前等老实例退出的上限（默认 3000ms；测试里会调小）
- * @returns {Promise<{close: () => Promise<void>, path: string}>}
+ * @returns {Promise<{close: () => Promise<void>, path: string, kind: string, target: string}>}
  */
 export async function createSocketServer({
 	path,
@@ -106,14 +169,18 @@ export async function createSocketServer({
 	maxFrameBytes = MAX_FRAME_BYTES,
 	waitMs,
 }) {
-	if (!path) throw new Error('通道 socketPath 不能为空')
-	mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
-	try {
-		chmodSync(dirname(path), 0o700)
-	} catch {
-		// 某些文件系统不支持，忽略
+	const endpoint = parseEndpoint(path)
+	if (endpoint.kind === 'pipe') {
+		await waitForPipeName(endpoint.target, logger, waitMs === undefined ? undefined : { waitMs })
+	} else {
+		mkdirSync(dirname(endpoint.target), { recursive: true, mode: 0o700 })
+		try {
+			chmodSync(dirname(endpoint.target), 0o700)
+		} catch {
+			// 某些文件系统不支持，忽略
+		}
+		await clearStaleSocket(endpoint.target, logger, waitMs === undefined ? undefined : { waitMs })
 	}
-	await clearStaleSocket(path, logger, waitMs === undefined ? undefined : { waitMs })
 
 	const server = createServer({ allowHalfOpen: false })
 	/** 让所有在途连接随关闭一起断开。 */
@@ -209,24 +276,28 @@ export async function createSocketServer({
 
 	await new Promise((resolve, reject) => {
 		server.once('error', reject)
-		server.listen(path, () => {
+		server.listen(endpoint.target, () => {
 			server.removeListener('error', reject)
 			resolve()
 		})
 	})
-	try {
-		chmodSync(path, 0o600)
-	} catch (error) {
-		logger?.warn?.('设置 socket 权限失败（请确认目录权限）', { path, error: String(error) })
+	if (endpoint.kind === 'unix') {
+		try {
+			chmodSync(endpoint.target, 0o600)
+		} catch (error) {
+			logger?.warn?.('设置 socket 权限失败（请确认目录权限）', { path: endpoint.label, error: String(error) })
+		}
 	}
 
 	return {
-		path,
+		path: endpoint.label,
+		kind: endpoint.kind,
+		target: endpoint.target,
 		async close() {
 			for (const socket of sockets) socket.destroy()
 			sockets.clear()
-			// 路径的清理**交给 Node/libuv**（关 UNIX server 时它自己会按绑定的名字 unlink）。
-			// 我们自己再 unlink 一次没有收益，却会参与"按名字删掉新实例路径"的竞态。
+			// 路径的清理**交给 Node/libuv**（关 UNIX server 时它自己会按绑定的名字 unlink；
+			// 命名管道没有文件可清）。我们自己再 unlink 一次没有收益，却会参与"按名字删掉新实例路径"的竞态。
 			await new Promise((resolve) => server.close(() => resolve()))
 		},
 	}

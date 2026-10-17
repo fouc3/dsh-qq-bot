@@ -5,7 +5,7 @@ import { mkdtempSync, statSync, unlinkSync, writeFileSync, existsSync } from 'no
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { createSocketServer, FrameError, MAX_FRAME_BYTES } from './socket.js'
+import { createSocketServer, FrameError, MAX_FRAME_BYTES, parseEndpoint } from './socket.js'
 
 function tmpSocketPath() {
 	return join(mkdtempSync(join(tmpdir(), 'qqbot-sock-')), 'bridge.sock')
@@ -193,4 +193,56 @@ test('关掉服务端后路径由 Node/libuv 清掉（我们不再自己 unlink�
 
 test('MAX_FRAME_BYTES 与 Go 侧约定一致（1 MiB）', () => {
 	assert.equal(MAX_FRAME_BYTES, 1 << 20)
+})
+
+// Windows 上没有 AF_UNIX 可用（libuv 的 pipe 是 NPFS 管道），所以地址多了 pipe: 写法。
+// 解析规则必须与 Go 侧 internal/bridge.ParseEndpoint 一致，否则两边认的不是同一个名字。
+test('parseEndpoint：裸路径 / unix: / pipe: 三种写法归一', () => {
+	assert.deepEqual(parseEndpoint('/run/dsh/bridge.sock'), {
+		kind: 'unix',
+		target: '/run/dsh/bridge.sock',
+		label: '/run/dsh/bridge.sock',
+	})
+	const unix = parseEndpoint('unix:/run/x.sock')
+	assert.equal(unix.kind, 'unix')
+	assert.equal(unix.target, '/run/x.sock')
+
+	const pipe = parseEndpoint('pipe:dsh-qq-bot-bridge')
+	assert.equal(pipe.kind, 'pipe')
+	assert.equal(pipe.target, '\\\\.\\pipe\\dsh-qq-bot-bridge', '要补上 \\\\.\\pipe\\ 前缀')
+	assert.equal(pipe.label, 'pipe:dsh-qq-bot-bridge', '日志里只写名字')
+
+	// 已经带前缀的不重复加，且前缀大小写不敏感
+	assert.equal(parseEndpoint('pipe:\\\\.\\pipe\\demo').target, '\\\\.\\pipe\\demo')
+	assert.equal(parseEndpoint('PIPE:\\\\.\\PIPE\\demo').target, '\\\\.\\pipe\\demo')
+
+	// Windows 盘符不算方案（否则 C: 会被当成 pipe/unix 前缀）
+	assert.equal(parseEndpoint('C:\\Users\\me\\bridge.sock').kind, 'unix')
+
+	assert.throws(() => parseEndpoint(''), /不能为空/)
+	assert.throws(() => parseEndpoint('pipe:'), /缺少管道名/)
+	assert.throws(() => parseEndpoint('unix:'), /缺少路径/)
+})
+
+// 真机行为：Windows 上 createSocketServer 走命名管道分支（没有 mkdir/chmod/unlink 那一套）。
+// 本机（Linux）只验"解析 + 跳过文件系统操作"这条路径，实际 listen 留给 Windows。
+test('命名管道：Windows 上能 listen，其他平台只验解析', async (t) => {
+	if (process.platform !== 'win32') {
+		t.skip('命名管道只在 Windows 上可 listen')
+		return
+	}
+	const name = `qqbot-test-${process.pid}-${Date.now()}`
+	const server = await createSocketServer({
+		path: `pipe:${name}`,
+		token: 'tk',
+		logger: {},
+		handlers: handlers(),
+	})
+	t.after(async () => server.close())
+	assert.equal(server.kind, 'pipe')
+	assert.equal(server.path, `pipe:${name}`)
+	assert.equal(server.target, `\\\\.\\pipe\\${name}`)
+
+	const lines = await exchange(server.target, [{ token: 'tk' }, { id: '1', op: 'health' }], { expect: 2 })
+	assert.equal(lines[1].ok, true, '命名管道要真的能收发帧')
 })
