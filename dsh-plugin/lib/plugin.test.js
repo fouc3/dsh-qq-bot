@@ -1920,6 +1920,81 @@ test('待答提问期间：桥命令优先执行，不会被当成「其他」�
 	boot.dispose()
 })
 
+// 用户 2026-10-17 报的 bug（上一条守卫没盖住的场景）：待答提问期间发**会发卡片的**命令
+// （原话里的例子是 `快捷 list`）—— 快捷卡片正常展开，**但提问卡被顺手撤掉了**
+// （"正常展开了快捷列表，但是那一个提问不见了"）。
+// 根因：`io.sendCard` 默认撤回"上一张卡片"，而上一张正是提问卡；上一条守卫用的是 `停止`
+// （只回文本、不发卡片），所以踩不到。修法：提问桥登记自己发出的卡片，
+// `recallPreviousCard` 认出它就不撤。
+test('待答提问期间发卡片类命令：提问卡不许被命令的卡片撤掉（用户报的 bug）', async (t) => {
+	const agent = makeAgent('session-1')
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': agent } })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M1' })
+	await waitFor(async () => (await pumpQueue(boot.socketPath)).length > 0)
+
+	const handler = boot.events.get('user-questions/request')?.[0]
+	assert.ok(handler, '应注册 user-questions/request 监听')
+	let nextCalled = false
+	const answer = handler(
+		{
+			agent,
+			questions: [{ id: 'q1', header: '部署方式', question: '怎么上线？', options: [{ label: '直接上线' }, { label: '先灰度' }] }],
+			signal: { aborted: false, addEventListener() {} },
+		},
+		async () => {
+			nextCalled = true
+			return { answers: [] }
+		},
+	)
+
+	const card = await waitFor(async () => {
+		const list = await pumpQueue(boot.socketPath)
+		return list.find((c) => c.kind === 'send_c2c' && /提问/.test(String(c.args.content))) ?? null
+	})
+	// state 有 200ms 防抖，等一下再读它登记的"上一张卡片"
+	const questionCardId = await waitFor(() => {
+		try {
+			return JSON.parse(readFileSync(boot.stateFile, 'utf8')).lastCard?.U1 ?? null
+		} catch {
+			return null
+		}
+	})
+	assert.ok(questionCardId, '提问卡要记成"上一张卡片"（否则这条 bug 复现不了）')
+
+	// 关键：发一条会发卡片的命令 —— 快捷卡片照常出现，但**不能撤掉提问卡**
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '快捷 list', msgId: 'M2' })
+	const seen = []
+	await waitFor(async () => {
+		seen.push(...(await pumpQueue(boot.socketPath)))
+		return seen.some((c) => c.kind === 'send_c2c' && /\*\*快捷\*\*/.test(String(c.args.content))) ? true : null
+	})
+	assert.ok(
+		!seen.some((c) => c.kind === 'recall_c2c' && c.args.messageId === questionCardId),
+		'提问卡被撤了 —— 命令的卡片不许撤待答提问的卡（用户报的正是这条）',
+	)
+	const after = await rpc(boot.socketPath, 'health')
+	assert.equal(after.value.pendingQuestions, 1, '命令之后提问仍然待答')
+
+	// 提问照样能答完（撤回 bug 不影响作答链路）
+	const letterButton = card.args.keyboard.content.rows
+		.flatMap((row) => row.buttons)
+		.find((b) => b.render_data.label === 'A')
+	const clicked = parseCallback(letterButton.action.data)
+	await rpc(boot.socketPath, 'event', { kind: 'interaction', openid: 'U1', buttonData: letterButton.action.data, eventId: 'INT-R1', msgId: 'R1' })
+	await rpc(boot.socketPath, 'event', {
+		kind: 'interaction',
+		openid: 'U1',
+		buttonData: cardData.question(clicked.callId, 0, 'submit'),
+		eventId: 'INT-R2',
+		msgId: 'R2',
+	})
+	assert.deepEqual(await answer, { answers: [{ id: 'q1', selected: ['直接上线'] }] })
+	assert.equal(nextCalled, false)
+	boot.dispose()
+})
+
 test('端到端：输入态——附件只能走卡片上的「发送」；裸发附件被丢弃并提示', async (t) => {
 	const fetchStub = stubFetch(16)
 	t.after(() => fetchStub.restore())

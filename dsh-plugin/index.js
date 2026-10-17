@@ -177,6 +177,9 @@ export function apply(ctx, rawConfig) {
 
 	const state = createState({ file: stateFile, logger })
 	const outbox = createOutbox({ logger })
+	// 提问桥比 io 晚建（`createQuestionBridge` 在下面）：`recallPreviousCard` 要问它
+	// "上一张卡是不是待答提问的卡"（见那里的注释），所以走一个引用变量，避免 TDZ。
+	let questionsRef = null
 	const sessions = createSessions({ ctx, logger, idStyle: config.idStyle })
 	// 输入态（"输入框"）：附件先进这里，点卡片上的「发送」才交给 AI。
 	const inbox = createInbox({ state, attachments: ctx.attachments, config, logger })
@@ -616,10 +619,18 @@ export function apply(ctx, rawConfig) {
 		if (state.lastCardOf(openid) === messageId) state.setLastCard(openid, null)
 	}
 
-	/** 撤回上一张卡片（失败只记日志，绝不阻塞后续发送）。 */
+	/**
+	 * 撤回上一张卡片（失败只记日志，绝不阻塞后续发送）。
+	 *
+	 * ⚠️ 例外：上一张是**待答提问的卡片**时**不许撤**。用户 2026-10-17 报的 bug：
+	 * 提问挂着的时候发 `快捷 list` 这类命令，命令自己的卡片会顺手把提问卡撤掉 ⇒
+	 * "正常展开了快捷列表，但那一个提问不见了"（提问还挂着，用户再也没法答）。
+	 * 提问桥比 io 晚建（`createQuestionBridge` 在下面），所以这里走一个引用变量，避免 TDZ。
+	 */
 	async function recallPreviousCard(openid) {
 		const previous = state.lastCardOf(openid)
 		if (!previous) return
+		if (questionsRef?.ownsCard?.(openid, previous)) return
 		await recallCard(openid, previous)
 	}
 
@@ -1302,6 +1313,8 @@ export function apply(ctx, rawConfig) {
 	)
 
 	const questions = createQuestionBridge({ state, outbox, config, logger, io })
+	// 建好就登记给 `recallPreviousCard`（见那儿：别把待答提问的卡片撤掉）。
+	questionsRef = questions
 
 	const commands = createCommandRunner({
 		sessions,

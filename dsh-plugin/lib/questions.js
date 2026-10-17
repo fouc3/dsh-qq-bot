@@ -296,6 +296,17 @@ export function createQuestionBridge({ state, outbox, config, logger, io }) {
 		handleCallback,
 		handleText,
 		hasPending: (openid) => byOpenid.has(openid),
+		/**
+		 * 这条消息 id 是不是**待答提问的卡片**（桥发别的卡片时不许把它撤掉）。
+		 *
+		 * 用户 2026-10-17 报的 bug：提问挂着的时候发 `快捷 list` 这类命令，命令自己的卡片
+		 * 会顺手撤回"上一张卡片"= 提问卡 ⇒ 提问不见了（可提问还挂着，用户没法答了）。
+		 */
+		ownsCard: (openid, messageId) => {
+			if (!messageId) return false
+			const entry = entryOfOpenid(openid)
+			return Boolean(entry && (entry.cardMsgIds ?? []).includes(messageId))
+		},
 		pendingCount: () => pending.size,
 		/** 插件卸载时把所有提问交回 dsh GUI。 */
 		dispose() {
