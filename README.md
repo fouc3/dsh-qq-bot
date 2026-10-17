@@ -7,7 +7,7 @@
 ```
 QQ 用户 ──私聊──▶ QQ 开放平台 ──WebSocket──▶ Go: dsh-qq-bot
                                               白名单门守 / 指令面板 / 统一发送与上传收口
-                                                │  UNIX domain socket（NDJSON，目录 0700 / socket 0600）
+                                                │  POSIX: UNIX socket（0700 / 0600）· Windows: 命名管道（pipe:）
                                                 ▼
                                           dsh Host 插件 @local/dsh-qq-bot（与 dsh web 同进程）
                                             ├ 会话索引 + 标题折叠
@@ -90,6 +90,46 @@ journalctl --user -u dsh-qq-bot -f          # 看日志
 
 崩了会自动拉起（`Restart=always`）。想让它在**没登录时也常驻**，需要
 `loginctl enable-linger $USER`（这是系统级设置，自己决定要不要开）。
+
+### 1.6 Windows：改用命名管道（`pipe:名字`）
+
+本地通道在 POSIX 上是 UNIX domain socket（**权限即认证**：目录 0700 / socket 0600）。
+Windows 上没有这条：dsh 插件跑在 Node 里，libuv 的 pipe 在 Windows 只能建**命名管道**（NPFS），
+而 Go 的 `net` 包不认命名管道 —— 所以 Windows 走另一条实现，**协议与帧格式完全不变**，
+只是载体换成 `\\.\pipe\名字`。
+
+两侧各改一处，值必须一致：
+
+```yaml
+# config.yaml（Go 网关侧）
+bridge:
+  socket: "pipe:dsh-qq-bot-bridge"   # 以前这里是 ~/.dsh/dsh-qq-bot/bridge.sock
+  token: "换成一串随机串"              # ⚠️ Windows 上必填，见下
+```
+
+```yaml
+# cordis.patch.yml（dsh 插件侧，或插件管理器里的 config）
+config:
+  socketPath: 'pipe:dsh-qq-bot-bridge'
+  token: '换成一串随机串'
+```
+
+**为什么 `token` 在 Windows 上必填**：命名管道没有权限位，也没有"属主是不是当前用户"可查，
+`bridge.token` 是唯一认证。所以网关启动时会拒绝「`pipe:` + 空 token」的配置（插件侧同理，
+建议照抄同一个值）。地址解析在 Go 的 `internal/bridge/endpoint.go` 与插件的 `lib/socket.js`：
+`/路径` 与 `unix:/路径` → UNIX socket；`pipe:名字` → 命名管道（`C:\…` 不会被误当成方案名）。
+
+编译：
+
+```bash
+GOOS=windows GOARCH=amd64 go build -o qqbot.exe ./cmd/qqbot
+# 或直接跑编译阀门：测试里会把 GOOS=windows（amd64/arm64）编一遍
+go test ./internal/bridge -run TestWindowsCrossBuild
+```
+
+还没做（要用的人得自己补）：`deploy/dsh-qq-bot.service` 是 systemd 单元（Windows 请用
+任务计划程序 / NSSM），`bin/qqbot` 是 Linux ELF，`deploy/*.sh` 是 bash 脚本；
+而且 **dsh 自身没有官方 Windows 支持声明** —— 这一侧只做到"代码层面理论兼容"，本机没有 Windows 真机验证。
 
 ### 2. 装 dsh 插件（必须装进你正在用的那个 profile，通常是 `web`）
 
@@ -404,8 +444,12 @@ if (this.phase.kind !== "idle") {
   —— `lib/inbox.test.js` + `lib/attachment-tool.js` + `lib/plugin.test.js`「输入态」
 - ✅ 没进输入态时直接发来的附件：丢弃 + 回一句提示（不会悄悄进会话）
   —— `lib/plugin.test.js`「输入态」
-- ✅ UNIX socket 通道：目录 0700 / socket 0600 / 可选 token / 帧上限 1 MiB / 残留 socket 清理 / health 诊断
-  —— `lib/socket.test.js` + Go `internal/bridge/socketclient_test.go`
+- ✅ 通道有两种载体：**POSIX 用 UNIX domain socket**（目录 0700 / socket 0600 / 可选 token /
+  帧上限 1 MiB / 残留 socket 清理），**Windows 用命名管道**（`pipe:名字`，没有权限位可依，
+  所以 token **必填**，启动时就拒绝空 token）。地址解析两侧同一套语义（`unix:` / `pipe:` / 裸路径，
+  `C:\…` 不算方案名）；Go 侧用编译阀门 `transport_unix.go` / `transport_windows.go` 隔开平台差异，
+  测试里还会真的 `GOOS=windows` 交叉编译一遍（`TestWindowsCrossBuild`）
+  —— `lib/socket.test.js` + `lib/socket.js` + Go `internal/bridge/{endpoint,socketclient,transport_*}.go` + `crossbuild_test.go`
 - ✅ **打断后自动恢复"运行中的目标"**：打断会让 `goal-round-driver` 把目标失能/暂停，桥在投递后用
   **当前 revision** 调 `ctx.goals.resume` 把它武装回来；没有目标 / 已暂停 / active 但已失能的
   **都不动**，用户显式 `停止` 也不恢复；恢复动作写进状态文件的小日志（插件日志进不了 journald）
@@ -445,7 +489,7 @@ if (this.phase.kind !== "idle") {
 # Go 侧（含假 QQ 平台 + 真 UNIX socket 桩）
 go vet ./... && gofmt -l . && go test -race ./...
 
-# 插件侧：语法 + 218 项（含"装配级端到端"）
+# 插件侧：语法 + 227 项（含"装配级端到端"）
 node --check dsh-plugin/index.js dsh-plugin/lib/*.js
 node --test dsh-plugin/lib/*.test.js
 ```
@@ -511,7 +555,7 @@ cmd/qqbot/            网关入口（-config、-check-config）
 internal/config/      配置加载/校验/摘要（未知键失败、${ENV} 严格展开）
 internal/logging/     slog 组装
 internal/qq/          SDK 客户端、事件、统一发送收口、撤回、富媒体、指令面板
-internal/bridge/      unix socket 客户端（NDJSON + 权限校验 + 长轮询）
+internal/bridge/      本地通道客户端（NDJSON + 权限校验 + 长轮询；unix/pipe 双实现 + 编译阀门）
 internal/executor/    出站命令执行（去重 + ack）
 dsh-plugin/           dsh Host 插件 bundle（socket 服务、会话/标题、命令与卡片、工具、轮次、提问）
 dsh-web-session-id/   dsh web 的「ID」按钮 bundle（Host 空壳 + 浏览器半边：标题栏按钮、悬浮窗、设置开关）

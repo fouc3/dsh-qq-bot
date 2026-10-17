@@ -22,12 +22,15 @@ qq:
   base_url: ""
   sandbox: false
 
-# ── 与 dsh 插件的本地通道（UNIX domain socket）────────────────────────────
+# ── 与 dsh 插件的本地通道（POSIX: UNIX socket / Windows: 命名管道）─────────
 bridge:
   # 必须与 dsh 插件 cordis.patch.yml 里的 socketPath 完全一致。
-  # 目录会被设为 0700、socket 文件 0600：权限即认证，仅当前账户可访问。
+  # POSIX：写路径（可带 ~），目录会被设为 0700、socket 文件 0600：权限即认证，仅当前账户可访问。
+  # Windows：写 `pipe:名字`（即 \\.\pipe\名字），例如 pipe:dsh-qq-bot-bridge ——
+  #          命名管道没有权限位，此时 token 必填（否则启动就报错）。
   socket: "~/.dsh/dsh-qq-bot/bridge.sock"
-  # 可选加固：非空时连接后必须先发 {"token":"…"} 握手帧（须与插件侧一致）
+  # 可选加固：非空时连接后必须先发 {"token":"…"} 握手帧（须与插件侧一致）。
+  # 命名管道（Windows）上没有 socket 权限位可依，这一项在那边是必填。
   token: ""
   dial_timeout_seconds: 10
   # outbox 长轮询的等待秒数（最长一次的等待，不是轮询间隔）

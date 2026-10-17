@@ -10,10 +10,12 @@
     - id: dsh-qq-bot
       name: '@local/dsh-qq-bot'
       config:
-        # 本地通道 socket；必须与 Go 侧 config.yaml 的 bridge.socket 完全一致。
-        # 目录会被建成 0700、socket 文件 0600：权限即认证，仅当前账户可访问。
+        # 本地通道地址；必须与 Go 侧 config.yaml 的 bridge.socket 完全一致。
+        # POSIX：写路径（可带 ~）——目录建成 0700、socket 文件 0600：权限即认证，仅当前账户可访问。
+        # Windows：写 `pipe:名字`（即 \\.\pipe\名字），例如 pipe:dsh-qq-bot-bridge；
+        #          命名管道没有权限位，那边 token 必填。
         socketPath: '~/.dsh/dsh-qq-bot/bridge.sock'
-        # 可选加固：非空时 Go 侧连接后必须先发 {"token":"…"} 握手帧。
+        # 可选加固：非空时 Go 侧连接后必须先发 {"token":"…"} 握手帧（须与 Go 侧一致）。
         token: ''
         # 绑定关系、待发消息、白名单快照等状态（原子写，0600）。
         stateFile: '~/.dsh/dsh-qq-bot/state.json'

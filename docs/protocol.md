@@ -2,9 +2,12 @@
 
 QQ 侧网关（Go，下称 **bot**）与 dsh 侧插件（`@local/dsh-qq-bot`，下称 **plugin**）之间的唯一通道。
 
-- **载体**：UNIX domain socket（不是 TCP、不是 HTTP）。
-- **默认路径**：`~/.dsh/dsh-qq-bot/bridge.sock`（两侧配置必须一致）。
+- **载体**：本地通道（不是 TCP、不是 HTTP）。POSIX 上是 UNIX domain socket；**Windows 上是命名管道**
+  （libuv 的 pipe 在 Windows 只能建 NPFS 管道，Go 用 `go-winio` 去拨）。帧格式与 op 两边完全一样，
+  只有"怎么连"不同：地址写 `pipe:名字` 即 `\\.\pipe\名字`。
+- **默认路径**：`~/.dsh/dsh-qq-bot/bridge.sock`（两侧配置必须一致）。Windows 示例：`pipe:dsh-qq-bot-bridge`。
 - **权限**：父目录 `0700`、socket 文件 `0600`、状态文件 `0600` —— **权限即认证**：只有与 dsh 同账户的进程能连上。
+  命名管道**没有权限位**（也没有属主可查），Windows 上 `token` 是唯一认证，故为必填项。
 - **编码**：UTF-8，换行分隔 JSON（NDJSON），一次请求一行、一次响应一行。
 - **上限**：单行 1 MiB；超限即断连（服务端不试图恢复）。
 - **方向**：bot 总是客户端（主动拨号）；plugin 是服务端。bot 崩溃/重启不影响 plugin 状态。
