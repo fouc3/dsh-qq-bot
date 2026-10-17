@@ -171,6 +171,14 @@ export async function createSocketServer({
 }) {
 	const endpoint = parseEndpoint(path)
 	if (endpoint.kind === 'pipe') {
+		if (process.platform !== 'win32') {
+			// 不做兜底猜测：在 Linux 上 listen 一个 `\\.\pipe\…` 名字，会真的在**当前目录**
+			// 建出一个叫 `\\.\pipe\…` 的 socket 文件，然后网关怎么都连不上。这里直接说清楚。
+			throw new Error(
+				`通道地址 ${endpoint.label} 是 Windows 命名管道，本机（${process.platform}）用不了；` +
+					'请改成 UNIX domain socket 路径（如 ~/.dsh/dsh-qq-bot/bridge.sock）',
+			)
+		}
 		await waitForPipeName(endpoint.target, logger, waitMs === undefined ? undefined : { waitMs })
 	} else {
 		mkdirSync(dirname(endpoint.target), { recursive: true, mode: 0o700 })

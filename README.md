@@ -489,7 +489,7 @@ if (this.phase.kind !== "idle") {
 # Go 侧（含假 QQ 平台 + 真 UNIX socket 桩）
 go vet ./... && gofmt -l . && go test -race ./...
 
-# 插件侧：语法 + 227 项（含"装配级端到端"）
+# 插件侧：语法 + 228 项（含"装配级端到端"）
 node --check dsh-plugin/index.js dsh-plugin/lib/*.js
 node --test dsh-plugin/lib/*.test.js
 ```

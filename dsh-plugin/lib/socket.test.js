@@ -224,8 +224,22 @@ test('parseEndpoint：裸路径 / unix: / pipe: 三种写法归一', () => {
 	assert.throws(() => parseEndpoint('unix:'), /缺少路径/)
 })
 
-// 真机行为：Windows 上 createSocketServer 走命名管道分支（没有 mkdir/chmod/unlink 那一套）。
-// 本机（Linux）只验"解析 + 跳过文件系统操作"这条路径，实际 listen 留给 Windows。
+// 不在 POSIX 上"尽力而为"：配错成 pipe: 就明确报错，而不是在当前目录建出一个
+// 叫 `\\.\pipe\…` 的 socket 文件（那会让人排查半天"为什么网关连不上"）。
+test('POSIX 上配 pipe: 直接报错', async (t) => {
+	if (process.platform === 'win32') {
+		t.skip('Windows 上管道是正常用法')
+		return
+	}
+	await assert.rejects(
+		() => createSocketServer({ path: 'pipe:demo-x', logger: {}, handlers: handlers() }),
+		/命名管道/,
+	)
+	assert.equal(existsSync('\\\\.\\pipe\\demo-x'), false, '不许在当前目录留下怪文件')
+})
+
+// 真机行为：Windows 上 createSocketServer 走命名管道分支（没有 mkdir / chmod / unlink 那一套）。
+// 本机（Linux）没法 listen 管道，所以这里整条跳过。
 test('命名管道：Windows 上能 listen，其他平台只验解析', async (t) => {
 	if (process.platform !== 'win32') {
 		t.skip('命名管道只在 Windows 上可 listen')
