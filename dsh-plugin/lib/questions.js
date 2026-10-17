@@ -4,7 +4,8 @@
  * 卡片设计（用户明确要求）：
  *   - **按钮上只写字母 A/B/C…**；
  *   - 字母对应哪个选项、选项下面的小字（description）全部写在题干与按钮之间的正文里；
- *   - 支持「其他」：用户直接发文字即作为该题的"其他"答案；
+ *   - 支持「其他」：**先点「其他」**，再发文字才是该题的"其他"答案（用户 2026-10-17 指出：
+ *     没点「其他」就把消息填进去本身就是 bug；那种情况不消费这条消息，让它走普通消息）；
  *   - 多题一次性展示；一卡放不下就**拆成多张卡片**（每张都带「提交」）；
  *   - 不选任何字母直接点「提交」= 跳过该题；
  *   - 每次选择都只撤回并重发**被点的那张卡片**，撤回失败只记 WARN。
@@ -263,7 +264,13 @@ export function createQuestionBridge({ state, outbox, config, logger, io }) {
 	}
 
 	/**
-	 * 把待答提问期间收到的普通文本当作「其他」答案。
+	 * 待答提问期间收到的普通文本 —— **只有当某一题点了「其他」**（`customFor` 已置位）时，
+	 * 才把它当作那题的答案；否则**不消费**（返回 `false`，让这条消息走"普通消息"那条路）。
+	 *
+	 * 用户 2026-10-17 明确：「未选择其他的时候，消息填入其他字段本身就是 bug」。
+	 * 以前是"自动挑第一道还没答的题当『其他』"，于是提问待答期间随便发一句话就被吃成答案，
+	 * 既看不到问题、也不知道自己答了哪一题。
+	 *
 	 * @returns {Promise<boolean>} 是否被当作答案消费掉了
 	 */
 	async function handleText(openid, text) {
@@ -272,14 +279,9 @@ export function createQuestionBridge({ state, outbox, config, logger, io }) {
 		const content = String(text ?? '').trim()
 		if (!content) return true // 空文本也算处理过：提问期间不该再走普通消息
 
-		let index = entry.customFor
-		if (index === null || index === undefined) {
-			index = entry.questions.findIndex((_, i) => {
-				const answer = entry.answers[i] ?? {}
-				return (answer.selected ?? []).length === 0 && !answer.custom
-			})
-		}
-		if (index < 0) index = 0
+		// 只有**点过「其他」**的那道题才吃这段文字（点「其他」= 用户明确表示"我要自己写"）
+		const index = entry.customFor
+		if (!Number.isInteger(index) || index < 0 || index >= entry.questions.length) return false
 		const question = entry.questions[index]
 		const previous = entry.answers[index] ?? { selected: [] }
 		// 多选：`selected` 与 `custom` 可并存（dsh 允许）；单选：打「其他」就清掉字母。

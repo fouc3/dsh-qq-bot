@@ -76,11 +76,23 @@ test('提问：发卡片 → 点选项 → 撤回旧卡重发 → 打字填「�
 	assert.equal(styleOf(sent[1], 'A'), 1, '选中的字母是蓝的')
 	assert.equal(styleOf(sent[1], '其他'), 0, '选了字母后「其他」仍是灰的')
 
-	// 打字 = 「其他」：单选题里它与字母**互斥**（dsh 只允许多选题二者并存）
+	// 没点「其他」就直接打字：**不消费**（用户 2026-10-17：「未选择其他的时候，消息填入其他
+	// 字段本身就是 bug」）—— 这条消息应该继续走"普通消息"那条路。
+	assert.equal(await bridge.handleText('U1', '这条不该变成答案'), false, '没点「其他」时文字不是答案')
+	assert.equal(sent.length, 2, '不消费就不该重发卡片')
+
+	// 点「其他」→ 再打字 = 那题的「其他」答案；单选题里它与字母**互斥**（dsh 只允许多选题二者并存）
+	const custom = await bridge.handleCallback(
+		{ kind: 'question', callId: 'call-1', questionIndex: 0, action: 'custom' },
+		{ openid: 'U1' },
+	)
+	assert.equal(custom.code, 0)
+	assert.match(sent[2].content, /请直接发一条消息/, '点「其他」后要提示"发消息填这里"')
+	assert.doesNotMatch(sent[2].content, /✅ 直接上线/, '单选：点「其他」就清掉字母')
 	assert.equal(await bridge.handleText('U1', '我想先本地跑一周'), true)
-	assert.equal(sent.length, 3)
-	assert.match(sent[2].content, /我想先本地跑一周/)
-	assert.doesNotMatch(sent[2].content, /✅ 直接上线/, '单选：填了「其他」就该把字母清掉')
+	assert.equal(sent.length, 4)
+	assert.match(sent[3].content, /我想先本地跑一周/)
+	assert.doesNotMatch(sent[3].content, /✅ 直接上线/, '单选：填了「其他」就该把字母清掉')
 	assert.equal(styleOf(sent[2], '其他'), 1, '填写后「其他」变蓝')
 
 	// 提交：单选 + 「其他」⇒ selected 必须为空
@@ -140,6 +152,9 @@ test('提问：多选题可以同时保留选项与「其他」（dsh 明确允�
 
 	const click = (action) => bridge.handleCallback({ kind: 'question', callId: 'call-multi-both', questionIndex: 0, action }, { openid: 'U1' })
 	await click('opt-0')
+	// 多选也一样：**先点「其他」**文字才算那一题的答案（2026-10-17 修复）
+	assert.equal(await bridge.handleText('U1', '没点其他时不算答案'), false)
+	await click('custom')
 	await bridge.handleText('U1', '再加一个自定义的')
 	assert.match(sent.at(-1).content, /✅ 甲/, '多选题里选项与「其他」可以并存')
 	assert.match(sent.at(-1).content, /再加一个自定义的/)
