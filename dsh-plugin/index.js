@@ -19,6 +19,7 @@ import { mkdirSync, readdirSync, rmdirSync, statSync } from 'node:fs'
 import { basename, join } from 'node:path'
 
 import { createState } from './lib/state.js'
+import { expandHome } from './lib/home.js'
 import { createSocketServer } from './lib/socket.js'
 import { createOutbox } from './lib/outbox.js'
 import { createSessions } from './lib/sessions.js'
@@ -135,13 +136,6 @@ export const HUMAN_SOURCE = { kind: 'user' }
 
 /** 插件自己写的消息（上下文注入、唤醒文本）的来源标记。 */
 export const PLUGIN_SOURCE = { kind: 'dsh-qq-bot' }
-
-function expandHome(path) {
-	if (typeof path !== 'string' || !path) return path
-	if (path === '~') return process.env.HOME ?? path
-	if (path.startsWith('~/')) return `${process.env.HOME ?? '~'}/${path.slice(2)}`
-	return path
-}
 
 export function apply(ctx, rawConfig) {
 	const config = {
@@ -791,7 +785,7 @@ export function apply(ctx, rawConfig) {
 	/** 删掉一个空目录（二次确认后才调用）。 */
 	function removeEmptyDir(dir) {
 		const path = String(dir ?? '').trim()
-		if (!path || path === '/' || path === (process.env.HOME ?? '\u0000')) {
+		if (!path || path === '/' || path === expandHome('~')) {
 			return { ok: false, error: '这个路径不允许删除。' }
 		}
 		try {

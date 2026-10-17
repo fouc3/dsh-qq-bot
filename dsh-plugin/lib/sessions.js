@@ -12,6 +12,8 @@
  */
 import { basename, dirname, sep } from 'node:path'
 
+import { expandHome } from './home.js'
+
 export function createSessions({ ctx, logger, idStyle = 'full' }) {
 	const byId = new Map()
 	const titles = new Map()
@@ -272,14 +274,8 @@ export function createSessions({ ctx, logger, idStyle = 'full' }) {
 
 function normalizeDir(dir) {
 	if (typeof dir !== 'string' || !dir) return '/'
-	let value = resolveHome(dir)
+	let value = expandHome(dir)
 	if (!value.startsWith('/')) value = `/${value}`
 	while (value.length > 1 && value.endsWith('/')) value = value.slice(0, -1)
 	return value
-}
-
-function resolveHome(dir) {
-	if (dir === '~') return process.env.HOME ?? '~'
-	if (dir.startsWith('~/')) return `${process.env.HOME ?? '~'}/${dir.slice(2)}`
-	return dir
 }
