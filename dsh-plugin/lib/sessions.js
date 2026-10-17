@@ -10,14 +10,61 @@
  *   2. summary.projections.values.title（冷会话的缓存投影）；
  *   3. 兜底：cwd 的最后一段 → 会话 id。
  */
-import { basename, dirname, sep } from 'node:path'
+import * as nodePath from 'node:path'
 
 import { expandHome } from './home.js'
 
-export function createSessions({ ctx, logger, idStyle = 'full' }) {
+/**
+ * @param {object} options
+ * @param {object} options.ctx dsh 上下文（要 sessionController.list / on / workspaceRegistry）
+ * @param {object} options.logger
+ * @param {'full'|'short'} [options.idStyle]
+ * @param {object} [options.path] 注入的 node:path（默认本平台的；测试里注入 win32 验盘符路径）
+ */
+export function createSessions({ ctx, logger, idStyle = 'full', path: pathOps = nodePath }) {
+	const sep = pathOps.sep
 	const byId = new Map()
 	const titles = new Map()
 	let refreshedAt = 0
+
+	/** 平台根：POSIX 是 `/`，Windows 是当前盘的 `C:\`。 */
+	function platformRoot() {
+		return pathOps.parse(process.cwd()).root || sep
+	}
+
+	/** 是不是某个"根"（`/` 或 `C:\`）。 */
+	function isRoot(value) {
+		return typeof value === 'string' && value !== '' && pathOps.parse(value).root === value
+	}
+
+	/** dir 是否等于 prefix 或在其之下（根后面不再补分隔符）。 */
+	function isUnder(dir, prefix) {
+		return dir === prefix || dir.startsWith(isRoot(prefix) ? prefix : `${prefix}${sep}`)
+	}
+
+	/** 拼一层子目录。 */
+	function childPath(base, name) {
+		return isRoot(base) ? `${base}${name}` : `${base}${sep}${name}`
+	}
+
+	/**
+	 * 目录归一：展开 `~`、补成绝对路径、按平台规范分隔符与结尾。
+	 *
+	 * 以前是写死的 POSIX 逻辑（不是 `/` 开头就加 `/`），Windows 上 `C:\Users\x`
+	 * 会被改成 `/C:\Users\x`，于是目录树、默认根、按目录归组全乱。
+	 */
+	function normalizeDir(dir) {
+		if (typeof dir !== 'string' || !dir) return platformRoot()
+		const value = expandHome(dir)
+		const absolute = pathOps.isAbsolute(value) ? value : `${sep}${value}`
+		// path.normalize 会把分隔符统一、但**保留结尾分隔符**（'/a/b/' 还是 '/a/b/'），
+		// 这里再按平台去掉多余的结尾（根不动）。
+		let normalized = pathOps.normalize(absolute)
+		while (normalized.length > 1 && !isRoot(normalized) && (normalized.endsWith(sep) || normalized.endsWith('/'))) {
+			normalized = normalized.slice(0, -1)
+		}
+		return normalized
+	}
 
 	function displayId(sessionId) {
 		if (idStyle === 'short') return String(sessionId).replace(/^session-/, '')
@@ -145,7 +192,7 @@ export function createSessions({ ctx, logger, idStyle = 'full' }) {
 	function describe(sessionId) {
 		const entry = byId.get(sessionId)
 		const title = titles.get(sessionId)
-		const fallback = entry?.cwd ? basename(entry.cwd) : ''
+		const fallback = entry?.cwd ? pathOps.basename(entry.cwd) : ''
 		const shown = title || fallback || ''
 		return shown ? `**${shown}**\`(${displayId(sessionId)})\`` : `\`${displayId(sessionId)}\``
 	}
@@ -153,31 +200,34 @@ export function createSessions({ ctx, logger, idStyle = 'full' }) {
 	/** 只取"标题(会话id)"这段纯文本（用于消息前缀与通知）。 */
 	function label(sessionId) {
 		const entry = byId.get(sessionId)
-		const title = titles.get(sessionId) || (entry?.cwd ? basename(entry.cwd) : '') || displayId(sessionId)
+		const title = titles.get(sessionId) || (entry?.cwd ? pathOps.basename(entry.cwd) : '') || displayId(sessionId)
 		return `${title}(${displayId(sessionId)})`
 	}
 
 	/** 只取标题（按钮 label 用：那里不该出现会话id，太占宽度）。 */
 	function titleOf(sessionId) {
 		const entry = byId.get(sessionId)
-		return titles.get(sessionId) || (entry?.cwd ? basename(entry.cwd) : '') || ''
+		return titles.get(sessionId) || (entry?.cwd ? pathOps.basename(entry.cwd) : '') || ''
 	}
 
 	/** 所有会话 cwd 的最长公共前缀：作为选择卡片的默认根目录。 */
 	function defaultRoot() {
 		const dirs = visible()
-			.map((s) => s.cwd)
-			.filter((cwd) => typeof cwd === 'string' && cwd.startsWith('/'))
+			.map((session) => session.cwd)
+			.filter((cwd) => typeof cwd === 'string' && pathOps.isAbsolute(cwd))
 			.sort()
-		if (dirs.length === 0) return '/'
+		if (dirs.length === 0) return platformRoot()
 		let prefix = dirs[0]
 		for (const dir of dirs) {
-			while (prefix && !dir.startsWith(prefix === '/' ? '/' : `${prefix}${sep}`) && dir !== prefix) {
-				prefix = dirname(prefix)
+			while (prefix && !isUnder(dir, prefix)) {
+				const parent = pathOps.dirname(prefix)
+				// 走到根了还没包住：Windows 上换盘符（C: 与 D: 没有共同前缀）就是这个情形。
+				if (!parent || parent === prefix) return platformRoot()
+				prefix = parent
 			}
-			if (!prefix) return '/'
+			if (!prefix) return platformRoot()
 		}
-		return prefix || '/'
+		return prefix || platformRoot()
 	}
 
 	/** 某目录下的子目录（只列真正含会话的那些）。 */
@@ -186,12 +236,12 @@ export function createSessions({ ctx, logger, idStyle = 'full' }) {
 		const children = new Map()
 		for (const session of visible()) {
 			const cwd = session.cwd
-			if (typeof cwd !== 'string' || !cwd.startsWith(base === '/' ? '/' : `${base}${sep}`)) continue
-			const rest = cwd.slice(base === '/' ? 1 : base.length + 1)
+			if (typeof cwd !== 'string' || !isUnder(cwd, base)) continue
+			const rest = cwd.slice(isRoot(base) ? base.length : base.length + 1)
 			if (!rest) continue
 			const [child] = rest.split(sep)
 			if (!child) continue
-			children.set(child, { name: child, path: base === '/' ? `/${child}` : `${base}${sep}${child}` })
+			children.set(child, { name: child, path: childPath(base, child) })
 		}
 		return [...children.values()].sort((a, b) => a.name.localeCompare(b.name))
 	}
@@ -211,9 +261,9 @@ export function createSessions({ ctx, logger, idStyle = 'full' }) {
 
 	function parentOf(dir) {
 		const base = normalizeDir(dir)
-		if (base === '/') return null
-		const parent = dirname(base)
-		return parent || null
+		if (isRoot(base)) return null
+		const parent = pathOps.dirname(base)
+		return parent && parent !== base ? parent : null
 	}
 
 	/**
@@ -232,10 +282,12 @@ export function createSessions({ ctx, logger, idStyle = 'full' }) {
 			return { sessionId: list[0], cwd: byId.get(list[0])?.cwd, content: list.slice(1).join(' ') }
 		}
 
-		const looksLikeDir = list[0].startsWith('/') || list[0].startsWith('~') || list[0].includes(sep)
+		const looksLikeDir =
+			list[0].startsWith('/') || list[0].startsWith('~') || list[0].includes(sep) || pathOps.isAbsolute(list[0])
 		if (looksLikeDir) {
 			if (list.length < 2) return null
-			const dir = normalizeDir(resolveHome(list[0]))
+			// normalizeDir 内部就会展开 ~，这里不用再展开一次。
+			const dir = normalizeDir(list[0])
 			if (!byId.has(list[1])) return { error: `目录 \`${list[0]}\` 下没找到会话 \`${list[1]}\`。` }
 			const entry = byId.get(list[1])
 			if (normalizeDir(entry?.cwd) !== dir) {
@@ -270,12 +322,4 @@ export function createSessions({ ctx, logger, idStyle = 'full' }) {
 		resolveRef,
 		refreshAge: () => refreshedAt,
 	}
-}
-
-function normalizeDir(dir) {
-	if (typeof dir !== 'string' || !dir) return '/'
-	let value = expandHome(dir)
-	if (!value.startsWith('/')) value = `/${value}`
-	while (value.length > 1 && value.endsWith('/')) value = value.slice(0, -1)
-	return value
 }
