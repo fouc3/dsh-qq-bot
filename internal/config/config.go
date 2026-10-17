@@ -15,8 +15,10 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime"
 	"strings"
 
+	"github.com/fouc3/dsh-qq-bot/internal/bridge"
 	"gopkg.in/yaml.v3"
 )
 
@@ -70,7 +72,9 @@ type QQ struct {
 
 // Bridge 是与 dsh 插件之间的本地通道。
 type Bridge struct {
-	Socket              string `yaml:"socket"`
+	// Socket 是通道地址：POSIX 写 socket 路径（可带 ~），Windows 写 pipe:名字。
+	Socket string `yaml:"socket"`
+	// Token 非空时要求握手帧；命名管道（Windows）上没有 socket 权限位可依，必须设置。
 	Token               string `yaml:"token"`
 	DialTimeoutSeconds  int    `yaml:"dial_timeout_seconds"`
 	PollWaitSeconds     int    `yaml:"poll_wait_seconds"`
@@ -166,6 +170,22 @@ func (c *Config) Validate() error {
 	if strings.TrimSpace(c.Bridge.Socket) == "" {
 		return errors.New("bridge.socket 不能为空（必须与 dsh 插件的 socketPath 一致）")
 	}
+	// 通道地址：POSIX 写路径，Windows 写 pipe:名字（命名管道）。
+	endpoint, err := bridge.ParseEndpoint(c.Bridge.Socket)
+	if err != nil {
+		return fmt.Errorf("bridge.socket 不合法：%w", err)
+	}
+	if endpoint.IsPipe() {
+		if runtime.GOOS != "windows" {
+			return fmt.Errorf(
+				"bridge.socket 配的是命名管道（%s），但命名管道只在 Windows 上可用；"+
+					"本机请写 UNIX domain socket 路径（如 ~/.dsh/dsh-qq-bot/bridge.sock）", endpoint)
+		}
+		if strings.TrimSpace(c.Bridge.Token) == "" {
+			return errors.New("bridge.socket 用的是命名管道：Windows 上没有 socket 权限位可依赖，" +
+				"bridge.token 必须设置（并与插件侧 token 一致），否则任何本机进程都能连上通道")
+		}
+	}
 	if c.Bridge.DialTimeoutSeconds < 1 {
 		return fmt.Errorf("bridge.dial_timeout_seconds 必须 ≥1，当前 %d", c.Bridge.DialTimeoutSeconds)
 	}
@@ -260,12 +280,29 @@ func (c *Config) IsPanelEnabled() bool { return c.Panel.Enabled == nil || *c.Pan
 // IsMenuEnabled 报告自定义菜单是否启用（缺省启用）。
 func (c *Config) IsMenuEnabled() bool { return c.Panel.MenuEnabled == nil || *c.Panel.MenuEnabled }
 
-// SocketPath 返回展开 ~ 之后的绝对 socket 路径。
+// SocketPath 返回本地通道地址。
+//
+// 支持两种写法（解析见 internal/bridge 的 ParseEndpoint）：
+//
+//	/run/dsh/bridge.sock   或   unix:/run/dsh/bridge.sock   POSIX 的 UNIX domain socket
+//	pipe:名字                                                Windows 的命名管道（＝\\.\pipe\名字）
+//
+// 不带方案前缀的路径会展开 ~ 并转成绝对路径；带前缀的原样返回——
+// `pipe:名字` 绝不能被 filepath.Abs 变成 `/当前目录/pipe:名字`。
 func (c *Config) SocketPath() string {
-	p := strings.TrimSpace(c.Bridge.Socket)
-	if p == "" {
+	raw := strings.TrimSpace(c.Bridge.Socket)
+	if raw == "" {
 		return ""
 	}
+	endpoint, err := bridge.ParseEndpoint(raw)
+	if err != nil {
+		// 解析失败时原样交给调用方：报错统一在启动阶段给。
+		return raw
+	}
+	if endpoint.IsPipe() {
+		return endpoint.String()
+	}
+	p := endpoint.Address
 	if p == "~" || strings.HasPrefix(p, "~/") {
 		if home, err := os.UserHomeDir(); err == nil {
 			p = filepath.Join(home, strings.TrimPrefix(strings.TrimPrefix(p, "~"), "/"))
@@ -301,10 +338,18 @@ func (c *Config) Summary() string {
 	}
 
 	tokenState := "未设置（仅靠 socket 权限）"
+	channelKind := "UNIX socket"
+	if endpoint, err := bridge.ParseEndpoint(c.SocketPath()); err == nil && endpoint.IsPipe() {
+		channelKind = "命名管道"
+		if c.Bridge.Token == "" {
+			// 命名管道没有权限位，token 是唯一认证：这里如实提示，别让人误以为安全。
+			tokenState = "未设置（⚠️ 命名管道必须设置 token）"
+		}
+	}
 	if c.Bridge.Token != "" {
 		tokenState = "已设置"
 	}
-	fmt.Fprintf(&b, "  本地通道       : %s（token %s）\n", c.SocketPath(), tokenState)
+	fmt.Fprintf(&b, "  本地通道       : %s（%s，token %s）\n", c.SocketPath(), channelKind, tokenState)
 	fmt.Fprintf(&b, "  通道超时       : dial=%ds poll=%ds reconnect_max=%ds\n",
 		c.Bridge.DialTimeoutSeconds, c.Bridge.PollWaitSeconds, c.Bridge.ReconnectMaxSeconds)
 

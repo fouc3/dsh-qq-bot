@@ -96,7 +96,7 @@ func run() error {
 	}
 
 	socketPath := cfg.SocketPath()
-	dedupe, err := executor.OpenDedupe(filepath.Join(filepath.Dir(socketPath), "qqbot-seen.json"), dedupeCapacity)
+	dedupe, err := executor.OpenDedupe(dedupePath(socketPath), dedupeCapacity)
 	if err != nil {
 		return err
 	}
@@ -146,6 +146,23 @@ func run() error {
 		logger.Warn("停止 QQ 长连接失败", "err", err)
 	}
 	return nil
+}
+
+// dedupePath 决定命令去重环落哪个文件。
+//
+// 以前直接取 socket 的目录：UNIX socket 时代没问题，但命名管道（Windows）的
+// 地址是 `\\.\pipe\名字`，目录 `\\.\pipe` 不是能写文件的地方。所以现在：
+//   - UNIX socket → 仍放在 socket 同目录（现有部署行为不变）；
+//   - 命名管道 → 放到 `~/.dsh/dsh-qq-bot/`（与插件侧 state.json 同一个目录）。
+func dedupePath(channelAddress string) string {
+	if endpoint, err := bridge.ParseEndpoint(channelAddress); err == nil && !endpoint.IsPipe() {
+		return filepath.Join(filepath.Dir(endpoint.Address), "qqbot-seen.json")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "qqbot-seen.json"
+	}
+	return filepath.Join(home, ".dsh", "dsh-qq-bot", "qqbot-seen.json")
 }
 
 // bridgeLoop 维护与 dsh 插件的连接：

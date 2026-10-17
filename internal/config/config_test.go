@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -113,6 +114,7 @@ func TestValidateRejectsBadValues(t *testing.T) {
 		{"富媒体上限越界", "bridge:\n  socket: \"/tmp/a.sock\"\nmedia:\n  max_upload_bytes: 999999999999\n", "media.max_upload_bytes"},
 		{"base_url 非法", "bridge:\n  socket: \"/tmp/a.sock\"\nqq:\n  base_url: \"ftp://x\"\n", "qq.base_url"},
 		{"轮询等待越界", "bridge:\n  socket: \"/tmp/a.sock\"\n  poll_wait_seconds: 9999\n", "poll_wait_seconds"},
+		{"通道地址缺管道名", "bridge:\n  socket: \"pipe:\"\n", "缺少管道名"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -189,4 +191,49 @@ func writeTemp(t *testing.T, body string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// TestSocketPathSchemes 确认带方案的地址不会被 filepath.Abs 搅成相对路径。
+func TestSocketPathSchemes(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"管道原样保留", "pipe:dsh-qq-bot-bridge", "pipe:dsh-qq-bot-bridge"},
+		{"unix 方案去掉前缀", "unix:/tmp/x/bridge.sock", "/tmp/x/bridge.sock"},
+		{"裸路径照旧转绝对", "/tmp/y/bridge.sock", "/tmp/y/bridge.sock"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{Bridge: Bridge{Socket: tc.raw}}
+			if got := cfg.SocketPath(); got != tc.want {
+				t.Fatalf("SocketPath() = %q，期望 %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestValidatePipeChannel 覆盖命名管道的两条启动期检查：
+// 非 Windows 上直接拒绝；Windows 上必须配 token（那边没有 socket 权限位可依）。
+func TestValidatePipeChannel(t *testing.T) {
+	base := func(token string) *Config {
+		cfg := &Config{Bridge: Bridge{Socket: "pipe:demo", Token: token}}
+		cfg.applyDefaults()
+		return cfg
+	}
+	if runtime.GOOS == "windows" {
+		if err := base("tk").Validate(); err != nil {
+			t.Fatalf("Windows 上带 token 的管道配置不该报错：%v", err)
+		}
+		err := base("").Validate()
+		if err == nil || !strings.Contains(err.Error(), "bridge.token 必须设置") {
+			t.Fatalf("Windows 上缺 token 应当报错，实际：%v", err)
+		}
+		return
+	}
+	err := base("tk").Validate()
+	if err == nil || !strings.Contains(err.Error(), "只在 Windows 上可用") {
+		t.Fatalf("非 Windows 上配管道应当报错，实际：%v", err)
+	}
 }
