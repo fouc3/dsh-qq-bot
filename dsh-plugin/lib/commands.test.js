@@ -513,6 +513,69 @@ test('快捷 加 [备注] <会话id>：存**指定的**会话（不同会话各�
 	assert.match(calls.replies.at(-1).content, /找不到会话/, '要说清楚是"找不到那个会话"')
 })
 
+// 需求（2026-10-17）：「把快捷 #1 的会话id 改为 <新会话>」。
+// 编号只增不重用，所以"删了再加"拿不回 #1 —— 得有一条原地改目标的命令。
+test('快捷 改 #编号 <会话id>：原地换目标，编号与备注都不动', async () => {
+	const { runner, calls, state: s } = makeRunner({ seed: boundSeed() })
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 加 memos'))
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('切换会话 session-2'))
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 加 后端'))
+	assert.deepEqual(s.shortcutsOf('U1').map((i) => [i.id, i.sessionId, i.name]), [
+		[1, 'session-1', 'memos'],
+		[2, 'session-2', '后端'],
+	])
+
+	// ① 正常改：#1 从 session-1 换成 session-3
+	const cardsBefore = calls.shortcutCards.length
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 改 #1 session-3'))
+	assert.deepEqual(
+		s.shortcutsOf('U1').map((i) => [i.id, i.sessionId, i.name]),
+		[
+			[1, 'session-3', 'memos'],
+			[2, 'session-2', '后端'],
+		],
+		'编号与备注都不动，只换指向',
+	)
+	assert.match(calls.replies.at(-1).content, /#1 memos/)
+	assert.match(calls.replies.at(-1).content, /session-3/)
+	assert.match(calls.replies.at(-1).content, /session-1/, '要告诉用户原来是哪个')
+	assert.equal(s.bindingOf('U1'), 'session-2', '改目标不该动当前绑定')
+	assert.ok(calls.shortcutCards.length >= cardsBefore, '改完逻辑不接受崩溃即可（卡片重发只在 fromCard 时）')
+
+	// ② 用备注定位也认；英文别名 set 也认
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 set 后端 session-1'))
+	assert.deepEqual(s.shortcutsOf('U1').map((i) => [i.id, i.sessionId]), [
+		[1, 'session-3'],
+		[2, 'session-1'],
+	])
+
+	// ③ 改成已经指向它的那条 → 拒绝（同一条会话不存两次）
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 改 #1 session-1'))
+	assert.deepEqual(s.shortcutsOf('U1').map((i) => [i.id, i.sessionId]), [
+		[1, 'session-3'],
+		[2, 'session-1'],
+	])
+	assert.match(calls.replies.at(-1).content, /#2 已经指向这个会话/)
+
+	// ④ 目标会话认不出来 → 报错且状态不动
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 改 #1 session-nope'))
+	assert.deepEqual(s.shortcutsOf('U1').map((i) => [i.id, i.sessionId]), [
+		[1, 'session-3'],
+		[2, 'session-1'],
+	])
+	assert.match(calls.replies.at(-1).content, /找不到会话/)
+
+	// ⑤ 本来就是这个会话 → 如实说"没改动"
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 改 #1 session-3'))
+	assert.match(calls.replies.at(-1).content, /本来就指向/)
+
+	// ⑥ 参数不全 / 没有这条 → 给用法或明确说没有
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 改 #1'))
+	assert.match(calls.replies.at(-1).content, /用法/)
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 改 #9 session-1'))
+	assert.match(calls.replies.at(-1).content, /没找到快捷/)
+})
+
 test('快捷：英文缩写与中文等价（add/a、delete/d、list/l、rename/r，大小写不敏感）', async () => {
 	const { runner, calls, state: s } = makeRunner({ seed: boundSeed() })
 	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 add 前端'))

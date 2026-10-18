@@ -352,6 +352,28 @@ export function createState({ file, logger, seed, debounceMs = 200 } = {}) {
 			})
 			return result
 		},
+		/**
+		 * 把一条快捷换成指向另一个会话（**编号、备注都不动**）。
+		 *
+		 * 为什么不是"删了再加"：编号只增不重用，删掉 `#1` 之后再加只会得到新编号，
+		 * 用户的 `#1` 就再也回不来了。会话换代（同一项目换了个新会话）时要的正是"还是 #1，指向新会话"。
+		 *
+		 * @returns {{ok:true, item:object}|{ok:false, error:string}}
+		 */
+		setShortcutSession(openid, id, sessionId) {
+			if (!openid || !sessionId) return { ok: false, error: '参数不全，改不了。' }
+			const items = data.shortcuts?.[openid]?.items
+			if (!Array.isArray(items)) return { ok: false, error: `没有 #${id} 这条快捷。` }
+			const item = items.find((entry) => Number(entry?.id) === Number(id))
+			if (!item) return { ok: false, error: `没有 #${id} 这条快捷。` }
+			const clash = items.find((entry) => Number(entry?.id) !== Number(id) && entry?.sessionId === sessionId)
+			if (clash) return { ok: false, error: `#${clash.id} 已经指向这个会话了（同一条会话不用存两次）。` }
+			this.update((s) => {
+				const target = s.shortcuts?.[openid]?.items?.find((entry) => Number(entry?.id) === Number(id))
+				if (target) target.sessionId = sessionId
+			})
+			return { ok: true, item: { ...item, sessionId } }
+		},
 		/** 改备注。找不到返回 null。 */
 		renameShortcut(openid, id, name) {
 			let found = null

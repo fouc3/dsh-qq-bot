@@ -31,7 +31,7 @@ export const COMMANDS = [
 		purpose: '把常用会话存成快捷入口（每条自带 `#编号`，可配自定义备注）。',
 		usage: '快捷 #编号 [<消息>]',
 		usageAlt: '快捷 <会话id|备注> [<消息>]',
-		usageAlt2: '快捷 加 [备注] [会话id] | 删 #编号 | 备注 #编号 <新备注> | 列出',
+		usageAlt2: '快捷 加 [备注] [会话id] | 改 #编号 <会话id> | 删 #编号 | 备注 #编号 <新备注> | 列出',
 		// 通用排版（一段 `作用` + 一行 `用法：A 或 B 或 C`）在快捷这里读起来很乱（用户提过）：
 		// 它有三类动作、还叠着"带消息不切换"的细节，所以单独给一份**分节**的说明，
 		// 由 usageText() 原样返回（命令表仍是唯一来源）。
@@ -47,9 +47,10 @@ export const COMMANDS = [
 			'- `快捷 加 [备注]` 把当前会话存成一条（自带 `#编号`）',
 			'- `快捷 加 [备注] <会话id>` 存**指定的**会话（不用先切过去；末尾写会话id即可，前面是备注）',
 			'- `快捷 列出` 看卡片，点按钮直接切',
+			'- `快捷 改 #2 <会话id>` 让 #2 **改指向**另一个会话（编号、备注都不动）',
 			'- `快捷 删 #2` / `快捷 备注 #2 <新备注>`',
 			'',
-			'> 英文缩写：`add`/`a`、`delete`/`d`、`list`/`l`、`rename`/`r`',
+			'> 英文缩写：`add`/`a`、`delete`/`d`、`list`/`l`、`rename`/`r`、`set`/`retarget`',
 			'> 备注不能有 `#`、不能是纯数字、不能重名；编号**只增不重用**',
 		].join('\n'),
 	},
@@ -458,6 +459,7 @@ export function createCommandRunner(deps) {
 	const SHORTCUT_ADD = new Set(['加', '添加', '新增', 'add', 'a'])
 	const SHORTCUT_DEL = new Set(['删', '删除', '移除', 'delete', 'del', 'd'])
 	const SHORTCUT_RENAME = new Set(['备注', '改名', '重命名', 'rename', 'r'])
+	const SHORTCUT_SET = new Set(['改', '改目标', '指向', 'retarget', 'set'])
 	const SHORTCUT_LIST = new Set(['列表', '列出', 'list', 'l', 'ls'])
 	const SHORTCUT_HELP = new Set(['帮助', '用法', 'help', 'h', '?'])
 
@@ -538,6 +540,7 @@ export function createCommandRunner(deps) {
 		}
 		if (SHORTCUT_DEL.has(word)) return dropShortcut(context, tokens.slice(1))
 		if (SHORTCUT_RENAME.has(word)) return renameShortcut(context, tokens.slice(1))
+		if (SHORTCUT_SET.has(word)) return retargetShortcut(context, tokens.slice(1))
 		return goShortcut(context, parsed)
 	}
 
@@ -688,6 +691,87 @@ export function createCommandRunner(deps) {
 		await deps.reply({
 			openid,
 			content: `已删除快捷 **#${resolved.item.id} ${shortcutLabel(resolved.item)}**（编号不补位，其它条目的编号不变）。`,
+			markdown: true,
+			replyContext,
+		})
+		await refreshShortcutCard({ openid, replyContext, fromCard })
+		return { handled: true }
+	}
+
+	/**
+	 * `快捷 改 #1 <会话id>`（`set` / `retarget` / `指向`）：把某条的**目标会话**换掉，
+	 * 编号和备注都**不动**。
+	 *
+	 * 为什么需要它：编号**只增不重用**、去重又按会话id，所以"给同一条快捷换个会话"没法用
+	 * 删了再来做——删掉 `#1` 之后再加只会拿到新编号，`#1` 永远回不来。会话换代
+	 * （同一个项目换了个新会话）时用户要的正是"还是 #1，只是指向新会话"。
+	 */
+	async function retargetShortcut({ openid, replyContext, fromCard }, tokens) {
+		if (tokens.length < 2) {
+			await deps.reply({
+				openid,
+				content:
+					'用法：`快捷 改 #1 <会话id>`（编号也可以写备注）\n' +
+					'> 只换这条指向哪个会话，**编号和备注都不变**；会话id 不记得就发 `切换会话` 看列表。',
+				markdown: true,
+				replyContext,
+			})
+			await refreshShortcutCard({ openid, replyContext, fromCard })
+			return { handled: true }
+		}
+		const resolved = resolveShortcut(openid, tokens, { headOnly: true })
+		if (!resolved || resolved.error) {
+			await deps.reply({ openid, content: shortcutMissText(openid, tokens[0]), markdown: true, replyContext })
+			await refreshShortcutCard({ openid, replyContext, fromCard })
+			return { handled: true }
+		}
+		const ref = tokens.slice(1).join(' ').trim()
+		const sessionId = sessions.resolveRef([ref])?.sessionId ?? ''
+		if (!sessionId || sessionId === 'none') {
+			await deps.reply({
+				openid,
+				content: `找不到会话 \`${ref}\`，没法改。发 \`切换会话\` 看有哪些会话id。`,
+				markdown: true,
+				replyContext,
+			})
+			await refreshShortcutCard({ openid, replyContext, fromCard })
+			return { handled: true }
+		}
+		const session = sessions.get(sessionId)
+		if (!session || sessions.isArchived(sessionId)) {
+			await deps.reply({
+				openid,
+				content: `会话 \`${sessionId}\` 不在了或已归档，不往那儿改。`,
+				markdown: true,
+				replyContext,
+			})
+			await refreshShortcutCard({ openid, replyContext, fromCard })
+			return { handled: true }
+		}
+		const before = resolved.item.sessionId
+		if (before === sessionId) {
+			await deps.reply({
+				openid,
+				content: `**#${resolved.item.id} ${shortcutLabel(resolved.item)}** 本来就指向 \`${sessionId}\`，没改动。`,
+				markdown: true,
+				replyContext,
+			})
+			await refreshShortcutCard({ openid, replyContext, fromCard })
+			return { handled: true }
+		}
+		const result = state.setShortcutSession(openid, resolved.item.id, sessionId)
+		if (!result?.ok) {
+			await deps.reply({ openid, content: result?.error ?? '改不了（状态异常），再试一次。', markdown: true, replyContext })
+			await refreshShortcutCard({ openid, replyContext, fromCard })
+			return { handled: true }
+		}
+		state.flush()
+		logger?.info?.('快捷：已改目标', { id: resolved.item.id, before, sessionId })
+		await deps.reply({
+			openid,
+			content:
+				`快捷 **#${resolved.item.id} ${shortcutLabel(result.item)}** 现在指向 \`${sessionId}\`。\n` +
+				`> 原来是 \`${before}\`；编号和备注都没动，发 \`快捷 #${resolved.item.id}\` 直接切过去。`,
 			markdown: true,
 			replyContext,
 		})
