@@ -569,11 +569,32 @@ test('快捷 改 #编号 <会话id>：原地换目标，编号与备注都不动
 	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 改 #1 session-3'))
 	assert.match(calls.replies.at(-1).content, /本来就指向/)
 
-	// ⑥ 参数不全 / 没有这条 → 给用法或明确说没有
-	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 改 #1'))
+	// ⑥ 不写会话id = 改到**当前会话**（2026-10-18 用户要求）：#2 现在是 session-1，当前绑定 session-2
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 改 #2'))
+	assert.deepEqual(s.shortcutsOf('U1').map((i) => [i.id, i.sessionId]), [
+		[1, 'session-3'],
+		[2, 'session-2'],
+	])
+	assert.match(calls.replies.at(-1).content, /当前会话/)
+
+	// ⑦ 连改哪一条都没说 → 给用法；没有这条 → 明确说没有
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 改'))
 	assert.match(calls.replies.at(-1).content, /用法/)
 	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 改 #9 session-1'))
 	assert.match(calls.replies.at(-1).content, /没找到快捷/)
+})
+
+test('快捷 改 #编号 不带会话id：当前没绑定会话就明确报错，不静默按 none 改', async () => {
+	const { runner, calls, state: s } = makeRunner({
+		seed: { shortcuts: { U1: { seq: 2, items: [{ id: 1, sessionId: 'session-1', name: 'memos' }] } } },
+	})
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 改 #1'))
+	assert.match(calls.replies.at(-1).content, /当前没有绑定会话/)
+	assert.deepEqual(
+		s.shortcutsOf('U1').map((i) => i.sessionId),
+		['session-1'],
+		'没绑定时不能改动指向',
+	)
 })
 
 test('快捷：英文缩写与中文等价（add/a、delete/d、list/l、rename/r，大小写不敏感）', async () => {

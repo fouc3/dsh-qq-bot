@@ -31,7 +31,7 @@ export const COMMANDS = [
 		purpose: '把常用会话存成快捷入口（每条自带 `#编号`，可配自定义备注）。',
 		usage: '快捷 #编号 [<消息>]',
 		usageAlt: '快捷 <会话id|备注> [<消息>]',
-		usageAlt2: '快捷 加 [备注] [会话id] | 改 #编号 <会话id> | 删 #编号 | 备注 #编号 <新备注> | 列出',
+		usageAlt2: '快捷 加 [备注] [会话id] | 改 #编号 [会话id] | 删 #编号 | 备注 #编号 <新备注> | 列出',
 		// 通用排版（一段 `作用` + 一行 `用法：A 或 B 或 C`）在快捷这里读起来很乱（用户提过）：
 		// 它有三类动作、还叠着"带消息不切换"的细节，所以单独给一份**分节**的说明，
 		// 由 usageText() 原样返回（命令表仍是唯一来源）。
@@ -48,6 +48,7 @@ export const COMMANDS = [
 			'- `快捷 加 [备注] <会话id>` 存**指定的**会话（不用先切过去；末尾写会话id即可，前面是备注）',
 			'- `快捷 列出` 看卡片，点按钮直接切',
 			'- `快捷 改 #2 <会话id>` 让 #2 **改指向**另一个会话（编号、备注都不动）',
+			'- `快捷 改 #2`（不写会话id）= 改到**当前会话**',
 			'- `快捷 删 #2` / `快捷 备注 #2 <新备注>`',
 			'',
 			'> 英文缩写：`add`/`a`、`delete`/`d`、`list`/`l`、`rename`/`r`、`set`/`retarget`',
@@ -707,11 +708,12 @@ export function createCommandRunner(deps) {
 	 * （同一个项目换了个新会话）时用户要的正是"还是 #1，只是指向新会话"。
 	 */
 	async function retargetShortcut({ openid, replyContext, fromCard }, tokens) {
-		if (tokens.length < 2) {
+		// `快捷 改` 后面什么都没有：连改哪一条都没说，只能给用法。
+		if (tokens.length < 1) {
 			await deps.reply({
 				openid,
 				content:
-					'用法：`快捷 改 #1 <会话id>`（编号也可以写备注）\n' +
+					'用法：`快捷 改 #1 <会话id>`（编号也可以写备注；**不写会话id 就是改到当前会话**）\n' +
 					'> 只换这条指向哪个会话，**编号和备注都不变**；会话id 不记得就发 `切换会话` 看列表。',
 				markdown: true,
 				replyContext,
@@ -725,8 +727,23 @@ export function createCommandRunner(deps) {
 			await refreshShortcutCard({ openid, replyContext, fromCard })
 			return { handled: true }
 		}
+		// 用户 2026-10-18：「如果改快捷不带会话ID 就改到当前」——
+		// 不写会话id 时目标就是**当前绑定会话**，省得每次去 `切换会话` 里翻 id。
 		const ref = tokens.slice(1).join(' ').trim()
-		const sessionId = sessions.resolveRef([ref])?.sessionId ?? ''
+		const current = ref === '' ? currentSessionId(openid) : ''
+		if (ref === '' && (!current || current === 'none')) {
+			await deps.reply({
+				openid,
+				content:
+					'当前没有绑定会话，没法改到"当前"。\n' +
+					'> 要么 `快捷 改 #2 <会话id>` 直接指定，要么先 `切换会话 <会话id>` 绑一个再来 `快捷 改 #2`。',
+				markdown: true,
+				replyContext,
+			})
+			await refreshShortcutCard({ openid, replyContext, fromCard })
+			return { handled: true }
+		}
+		const sessionId = ref === '' ? current : (sessions.resolveRef([ref])?.sessionId ?? '')
 		if (!sessionId || sessionId === 'none') {
 			await deps.reply({
 				openid,
@@ -770,7 +787,7 @@ export function createCommandRunner(deps) {
 		await deps.reply({
 			openid,
 			content:
-				`快捷 **#${resolved.item.id} ${shortcutLabel(result.item)}** 现在指向 \`${sessionId}\`。\n` +
+				`快捷 **#${resolved.item.id} ${shortcutLabel(result.item)}** 现在指向 \`${sessionId}\`${ref === '' ? '（当前会话）' : ''}。\n` +
 				`> 原来是 \`${before}\`；编号和备注都没动，发 \`快捷 #${resolved.item.id}\` 直接切过去。`,
 			markdown: true,
 			replyContext,
