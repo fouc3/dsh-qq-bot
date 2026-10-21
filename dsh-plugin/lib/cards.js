@@ -621,12 +621,21 @@ export function buildNoticeCard({
 	if (started) {
 		if (chain) quoted = '目标/计划续跑（沿用你从 QQ 起的那条链）'
 	} else if (failed) {
-		quoted = `错误：${oneLine(error, 160)}`
+		// 用户要求（2026-10-18）：报错**发完整**，并且放进**代码围栏**里 ——
+		// 以前是 `oneLine(error, 160)`，把 JSON 折成一行还截断（线上那条
+		// `400: {"message":"{\"code\":11128,\"msg\":\"Illegal API invocation…` 就是被截断的），
+		// 换行、转义、requestId 全丢了根本没法排查。错误原文本身就是"代码"，原样塞进围栏最好读；
+		// 也不打 `> ` 引用前缀（围栏里混引用符号会乱）。
+		quoted = ''
 	} else if (interrupted) {
 		const from = oneLine(source)
 		if (from) quoted = `打断来自：${from}`
 	}
 	if (quoted) lines.push(`> ${quoted}`)
+	if (failed) {
+		const detail = String(error).trim()
+		lines.push('', '错误：', '', '```', detail, '```')
+	}
 	// 打断卡顺手把"新一轮已开始"并进来（省一张开始卡）；命令自己已经提示过打断时不重复，
 	// 出错卡也不并（那张卡的重点是报错）。
 	if (interrupted && nextRound && !failed && !started) lines.push('> 已按这条消息开了新一轮')

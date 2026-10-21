@@ -618,7 +618,8 @@ test('结束通知：多一个「发送消息」指令按钮，填入 `发送 <�
 })
 
 // 用户要求（2026-10-16）：`reason=error` 不能再说成"被打断" —— 要写「出现错误」+ 具体报错。
-test('结束通知：出错时说「出现错误」并带上具体报错（不再混成"被打断"）', () => {
+// 用户要求（2026-10-18）：报错要**发完整**并放进**代码围栏**（以前 oneLine+160 截断，看不出原文）。
+test('结束通知：出错时说「出现错误」并把完整报错放进代码围栏（不再混成"被打断"）', () => {
 	const message =
 		'prompt variable "{{model}}" has no value for this assembly (section "deployment:persona-prefix")'
 	const card = buildNoticeCard({
@@ -628,18 +629,26 @@ test('结束通知：出错时说「出现错误」并带上具体报错（不�
 		error: message,
 		source: '打断来自某条消息（出错时不该出现）',
 	})
-	assert.equal(card.content, `项目甲(session-1)出现错误\n> 错误：${message}`)
+	assert.equal(card.content, `项目甲(session-1)出现错误\n\n错误：\n\n\`\`\`\n${message}\n\`\`\``)
+	assert.doesNotMatch(card.content, /^> 错误/m, '不再用引用行（围栏里混引用符号会乱）')
 	assert.doesNotMatch(card.content, /被打断/)
 	assert.doesNotMatch(card.content, /打断来自/)
 	// 按钮照旧（错误卡也要能点「我需要回复」）
 	assert.deepEqual(card.keyboard.content.rows[0].buttons.map((b) => b.render_data.label), ['我需要回复'])
 
-	// 超长报错要截断（平台一条消息有限长，别把整段栈塞进去）
+	// 线上那种"套了一层 JSON 字符串"的报错：**原样完整**塞进围栏，一个字符都不许少
+	const wrapped =
+		'400: {"message":"{\\"code\\":11128,\\"msg\\":\\"Illegal API invocation from an unapproved channel\\",' +
+		'\\"requestId\\":\\"1bbd84577a60224d4b6727beec958ad5\\"}","displayMsg":"…"}\n第二行也要在'
+	const wrappedCard = buildNoticeCard({ label: 'x(s1)', sessionId: 's1', error: wrapped })
+	assert.equal(wrappedCard.content, `x(s1)出现错误\n\n错误：\n\n\`\`\`\n${wrapped}\n\`\`\``)
+	assert.match(wrappedCard.content, /requestId/, 'requestId 不能被吃掉')
+	assert.match(wrappedCard.content, /\n第二行也要在\n/, '换行要保留（完整原文）')
+
+	// 长报错也不截断（用户要求"完整"；以前超 160 字就砍掉还加省略号）
 	const long = buildNoticeCard({ label: 'x(s1)', sessionId: 's1', error: 'E'.repeat(500) })
-	const quotedLine = long.content.split('\n')[1]
-	assert.ok(quotedLine.startsWith('> 错误：EEE'))
-	assert.ok(quotedLine.endsWith('…'), '截断要带省略号')
-	assert.ok(quotedLine.length <= 170, `截断后不该太长：${quotedLine.length}`)
+	assert.match(long.content, /```\nE{500}\n```/, '500 个字符要一字不少')
+	assert.doesNotMatch(long.content, /…/, '不许出现省略号')
 
 	// 空/空白 error 不算出错：退回原来的措辞
 	assert.equal(buildNoticeCard({ label: 'x(s1)', sessionId: 's1', error: '   ' }).content, 'x(s1)已结束')
@@ -675,7 +684,7 @@ test('开始通知：`已开始` / 续跑带说明 / 打断卡并进"新一轮�
 
 	// 出错 / 正常结束都不该出现"新一轮已开始"那句
 	const failed = buildNoticeCard({ label: 'x(s1)', sessionId: 's1', interrupted: true, error: 'boom', nextRound: true })
-	assert.equal(failed.content, 'x(s1)出现错误\n> 错误：boom')
+	assert.equal(failed.content, 'x(s1)出现错误\n\n错误：\n\n```\nboom\n```')
 	assert.equal(
 		buildNoticeCard({ label: 'x(s1)', sessionId: 's1', nextRound: true }).content,
 		'x(s1)已结束',

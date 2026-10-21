@@ -913,7 +913,11 @@ test('端到端：一轮以 reason=error 结束 → 通知写「出现错误」+
 		const list = await drainFor(boot.socketPath, 80)
 		return list.find((c) => c.kind === 'send_c2c' && /出现错误/.test(String(c.args.content))) ?? null
 	})
-	assert.equal(String(notice.args.content), `proj-a(session-1)出现错误\n> 错误：${failure}`)
+	// 用户要求（2026-10-18）：完整报错 + 代码围栏（以前 oneLine+160 截断，看不出原文）
+	assert.equal(
+		String(notice.args.content),
+		`proj-a(session-1)出现错误\n\n错误：\n\n\`\`\`\n${failure}\n\`\`\``,
+	)
 	assert.doesNotMatch(String(notice.args.content), /被打断/, '出错的措辞必须和"被打断"分开')
 	// 按钮照旧：错误卡也要能点「我需要回复」
 	assert.equal(notice.args.keyboard.content.rows[0].buttons[0].render_data.label, '我需要回复')
