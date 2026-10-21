@@ -20,6 +20,8 @@ import {
 	buildQuestionCards,
 	buildQuestionResult,
 	buildRunningCard,
+	buildResumeListCard,
+	buildResumeNoticeCard,
 	buildSessionCard,
 	SHORTCUT_MAX_BUTTONS,
 	buildShortcutCard,
@@ -340,6 +342,63 @@ test('回调 data：run 带页码（切完不回第一页）、runPage 翻页；
 	assert.equal(data.runPage(2), 'qqb:runp:2')
 	assert.deepEqual(parseCallback(data.runPage(2)), { kind: 'runpage', page: 2 })
 	assert.equal(parseCallback('qqb:run'), null, '缺冒号的残缺 data 不该被认')
+})
+
+// 用户要求（2026-10-18）：「继续上次的会话」**不带编号**（= 全部继续）；
+// 「查看上次运行中的会话」那张卡片**才带编号**，每个编号一键继续。
+test('上次运行被打断：提醒卡两个按钮（全部继续 / 查看打断详情），后者才带编号', () => {
+	const items = [
+		{ sessionId: 'session-1', title: 'memos', turn: 148, text: '正在写后端路由' },
+		{ sessionId: 'session-2', title: 'qq-bot', turn: 7 },
+	]
+	const notice = buildResumeNoticeCard({ items })
+	const buttons = notice.keyboard.content.rows.flatMap((row) => row.buttons)
+	assert.deepEqual(buttons.map((b) => b.render_data.label), ['全部继续', '查看会话详情'], '标签要短（默认 10 宽会截成「查看打断…」）')
+	assert.equal(buttons[0].action.data, 'qqb:rsa', '「全部继续」不编号、不带会话id')
+	assert.equal(buttons[1].action.data, 'qqb:rsv:1')
+	assert.equal(buttons[0].action.type, 1, '回调按钮：点一下当场做')
+	assert.equal(buttons[0].render_data.style, 1, '主按钮蓝')
+	assert.equal(buttons[1].render_data.style, 0, '次要灰（显式给，默认是蓝的）')
+	assert.match(notice.content, /^\*\*上次运行被打断\*\*/)
+	assert.match(notice.content, /^\d\. ● \*\*memos\*\*/m)
+	assert.match(notice.content, /第 148 轮/)
+	assert.match(notice.content, /最后：正在写后端路由/)
+	assert.match(notice.content, /全部.*接着跑/s, '要说清「全部继续」= 全跑（会花 token）')
+
+	// 详情卡：编号按钮（点哪个继续哪个）+ 第 5 行「全部继续 / 翻页」
+	const detail = buildResumeListCard({ items })
+	const rows = detail.keyboard.content.rows
+	assert.deepEqual(rows[0].buttons.map((b) => b.render_data.label), ['1', '2'])
+	assert.equal(rows[0].buttons[0].action.data, 'qqb:rs:session-1', '编号点一下只继续那一个')
+	assert.deepEqual(rows.at(-1).buttons.map((b) => b.render_data.label), ['全部继续'], '第 5 行给「全部继续」')
+	assert.equal(rows.at(-1).buttons[0].action.data, 'qqb:rsa')
+	assert.match(detail.content, /^\*\*上次运行被打断的会话\*\*/)
+	assert.match(detail.content, /共 2 个 · 第 1\/1 页/)
+
+	// 已继续过的打标记（不重复跑）
+	const doneCard = buildResumeListCard({ items: [{ sessionId: 'session-1', title: 'memos', handled: true }] })
+	assert.match(doneCard.content, /（已继续）/)
+
+	// 12 个一页：第 13 个落到第 2 页，翻页行带上「上一页」
+	const many = Array.from({ length: 13 }, (_, i) => ({ sessionId: `s-${i + 1}`, title: `会${i + 1}` }))
+	const first = buildResumeListCard({ items: many })
+	assert.equal(first.keyboard.content.rows.length, 5, '4 行内容 + 1 行翻页')
+	assert.deepEqual(first.keyboard.content.rows[4].buttons.map((b) => b.render_data.label), ['全部继续', '下一页'])
+	const second = buildResumeListCard({ items: many, page: 2 })
+	assert.deepEqual(second.keyboard.content.rows[0].buttons.map((b) => b.render_data.label), ['1'])
+	assert.equal(second.keyboard.content.rows[0].buttons[0].action.data, 'qqb:rs:s-13')
+	assert.deepEqual(second.keyboard.content.rows[1].buttons.map((b) => b.render_data.label), ['全部继续', '上一页'])
+
+	// 空：不发空卡片
+	const empty = buildResumeNoticeCard({ items: [] })
+	assert.equal(empty.keyboard.content.rows.length, 0)
+})
+
+test('回调 data：resumeall / resume（单条）/ resumeView（翻页）解析回来对得上', () => {
+	assert.deepEqual(parseCallback(data.resumeAll()), { kind: 'resumeall' })
+	assert.deepEqual(parseCallback(data.resumeItem('session-9')), { kind: 'resume', sessionId: 'session-9' })
+	assert.deepEqual(parseCallback(data.resumeView(3)), { kind: 'resumepage', page: 3 })
+	assert.deepEqual(parseCallback(data.resumePage(2)), { kind: 'resumepage', page: 2 })
 })
 
 test('新建会话卡片：只列子目录，导航行是「返回上级」+「在这里新建」', () => {

@@ -143,6 +143,11 @@ export const data = {
 	// 模型卡片：page（提供商翻页）/ enter（进提供商看模型）/ mpage（提供商内翻页）/
 	// pick（切到某个模型）/ list（回到提供商列表）；arg 是提供商 id 或 `提供商id:…`。
 	model: (action, arg = '') => `${DATA_PREFIX}:mod:${action}${arg === '' ? '' : `:${arg}`}`,
+	// 「上次运行被打断」：all（全部继续，不给编号）/ view（查看列表，带编号）/ item（继续某一条）/ page（翻页）
+	resumeAll: () => `${DATA_PREFIX}:rsa`,
+	resumeView: (page = 1) => `${DATA_PREFIX}:rsv:${Number(page) > 0 ? Number(page) : 1}`,
+	resumeItem: (sessionId) => `${DATA_PREFIX}:rs:${sessionId}`,
+	resumePage: (page) => `${DATA_PREFIX}:rsv:${Number(page) > 0 ? Number(page) : 1}`,
 }
 
 /** 解析回调 data；不是本插件的数据返回 null。 */
@@ -191,6 +196,15 @@ export function parseCallback(raw) {
 		const arg = first < 0 ? '' : rest.slice(first + 1)
 		if (!action) return null
 		return { kind: 'shortcut', action, arg }
+	}
+	if (raw.startsWith(`${DATA_PREFIX}:rsa`)) {
+		return { kind: 'resumeall' }
+	}
+	if (raw.startsWith(`${DATA_PREFIX}:rsv:`)) {
+		return { kind: 'resumepage', page: Number(raw.slice(`${DATA_PREFIX}:rsv:`.length)) || 1 }
+	}
+	if (raw.startsWith(`${DATA_PREFIX}:rs:`)) {
+		return { kind: 'resume', sessionId: raw.slice(`${DATA_PREFIX}:rs:`.length) }
 	}
 	if (raw.startsWith(`${DATA_PREFIX}:mod:`)) {
 		const rest = raw.slice(`${DATA_PREFIX}:mod:`.length)
@@ -377,6 +391,92 @@ export function buildRunningCard({
 	if (pager.length > 0) rows.push({ buttons: pager })
 
 	// 兜底：内容 4 行 + 翻页 1 行 = 5 行，正好是平台上限；真超了就截断而不是被拒收。
+	return { content: lines.join('\n').trimEnd(), keyboard: keyboardOf(rows.slice(0, KEYBOARD_MAX_ROWS)) }
+}
+
+/**
+ * 启动提醒卡（「上次运行被打断」）。
+ *
+ * 用户要求（2026-10-18）：**「继续上次的会话」不给编号 = 全部继续**；
+ * 想挑一个才点「查看上次运行中的会话」，那张卡片才带编号。
+ *
+ * @param {{items:Array<{sessionId:string,title:string,turn?:number|null,text?:string}>}} input
+ */
+export function buildResumeNoticeCard({ items = [] }) {
+	const list = Array.isArray(items) ? items.filter((item) => item?.sessionId) : []
+	if (list.length === 0) {
+		return { content: '上次没有正在跑的会话，不用恢复。', keyboard: keyboardOf([]) }
+	}
+	const lines = [
+		'**上次运行被打断**',
+		'> dsh 停止时有会话正在跑，它们可能被打断了：',
+		'',
+	]
+	list.slice(0, 4).forEach((item, index) => {
+		lines.push(`${index + 1}. ● **${item.title || item.sessionId}**`)
+		lines.push(`> \`${item.sessionId}\`${item.turn ? ` 第 ${item.turn} 轮` : ''}`)
+		if (item.text) lines.push(`> 最后：${item.text}`)
+		lines.push('')
+	})
+	if (list.length > 4) lines.push(`> …还有 ${list.length - 4} 个（点「查看」看全部）`, '')
+	lines.push(
+		'> 点「全部继续」= 这些**全部**接着跑（会真的开跑、花 token）；',
+		'> 只想挑一个就点「查看会话详情」，那张卡片才有编号。',
+	)
+	const rows = [
+		{
+			buttons: [
+				// 显式给蓝/灰：`callbackButton` 默认就是 1，不传会"没选中也是蓝的"（踩过）。
+				// 标签放宽到 14 显示宽度（默认 10 会把「查看会话详情」截成「查看打断…」）。
+				callbackButton('全部继续', data.resumeAll(), { style: BUTTON_STYLE.primary, labelLimit: 14 }),
+				callbackButton('查看会话详情', data.resumeView(1), { style: BUTTON_STYLE.neutral, labelLimit: 14 }),
+			],
+		},
+	]
+	return { content: lines.join('\n').trimEnd(), keyboard: keyboardOf(rows.slice(0, KEYBOARD_MAX_ROWS)) }
+}
+
+/**
+ * 「上次运行被打断」的列表卡（**这里才有编号**）：正文写详情，按钮只写编号，
+ * 每行 3 个、满 4 行（12 个）一页，第 5 行给「全部继续 / 上一页 / 下一页」。
+ */
+export function buildResumeListCard({ items = [], page = 1, pageSize = RUNNING_PAGE_SIZE }) {
+	const list = Array.isArray(items) ? items.filter((item) => item?.sessionId) : []
+	const size = Math.max(1, Math.min(Number(pageSize) || RUNNING_PAGE_SIZE, RUNNING_PAGE_SIZE))
+	const pages = Math.max(1, Math.ceil(list.length / size))
+	const current = Math.min(Math.max(1, page), pages)
+	const slice = list.slice((current - 1) * size, current * size)
+
+	const lines = ['**上次运行被打断的会话**']
+	if (list.length === 0) {
+		lines.push('', '没有被打断的会话。')
+		return { content: lines.join('\n'), keyboard: keyboardOf([]) }
+	}
+	lines.push(
+		`> 共 ${list.length} 个 · 第 ${current}/${pages} 页（每页 ${size} 个）`,
+		'> 点下面的**编号**只继续那一个；「全部继续」= 全部。',
+		'',
+	)
+	slice.forEach((item, index) => {
+		const handled = item.handled ? '（已继续）' : ''
+		lines.push(`${index + 1}. ● **${item.title || item.sessionId}**${handled}`)
+		lines.push(`> \`${item.sessionId}\`${item.turn ? ` 第 ${item.turn} 轮` : ''}`)
+		if (item.text) lines.push(`> 最后：${item.text}`)
+		lines.push('')
+	})
+
+	const buttons = slice.map((item, index) =>
+		callbackButton(String(index + 1), data.resumeItem(item.sessionId), {
+			style: item.handled ? BUTTON_STYLE.neutral : BUTTON_STYLE.primary,
+		}),
+	)
+	const rows = rowsOf(buttons, RUNNING_BUTTONS_PER_ROW)
+
+	const pager = [callbackButton('全部继续', data.resumeAll(), { style: BUTTON_STYLE.neutral })]
+	if (current > 1) pager.push(callbackButton('上一页', data.resumePage(current - 1)))
+	if (current < pages) pager.push(callbackButton('下一页', data.resumePage(current + 1)))
+	rows.push({ buttons: pager })
+
 	return { content: lines.join('\n').trimEnd(), keyboard: keyboardOf(rows.slice(0, KEYBOARD_MAX_ROWS)) }
 }
 

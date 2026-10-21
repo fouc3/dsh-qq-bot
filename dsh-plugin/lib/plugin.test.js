@@ -3187,3 +3187,101 @@ test('端到端：快捷的备注不能带 #（含 # 的备注必须被拒，列
 
 	boot.dispose()
 })
+
+// 用户要求（2026-10-18）：dsh 重启/崩溃之后，把「上次在跑的会话」捞回来 ——
+// 启动发一张提醒卡：「全部继续」（不带编号，全跑）+「查看会话详情」（这张才带编号，可只继续某一个）。
+test('端到端：上次运行被打断 —— 启动发提醒；「全部继续」全跑；详情卡带编号，点编号只继续那一个', async (t) => {
+	const dir = mkdtempSync(join(tmpdir(), 'dsh-qq-bot-resume-'))
+	// 「死前的最后一份快照」：这两个会话在 dsh 被停掉时正在跑
+	writeFileSync(
+		join(dir, 'running.json'),
+		JSON.stringify({
+			version: 1,
+			at: new Date().toISOString(),
+			sessions: [
+				{ sessionId: 'session-1', title: 'proj-a', cwd: '/home/u/proj-a', turn: 12, text: '正在改路由' },
+				{ sessionId: 'session-3', title: 'proj-c', cwd: '/home/u/proj-c', turn: 4 },
+			],
+		}),
+	)
+	const sessions = [
+		{ sessionId: 'session-1', cwd: '/home/u/proj-a', updatedAt: 9, running: false },
+		{ sessionId: 'session-2', cwd: '/home/u/proj-b', updatedAt: 8, running: false },
+		{ sessionId: 'session-3', cwd: '/home/u/proj-c', updatedAt: 7, running: false },
+	]
+	const first = makeAgent('session-1')
+	const third = makeAgent('session-3')
+	const boot = bootPlugin(t, {
+		sessions,
+		live: { 'session-1': first, 'session-3': third },
+		dir,
+		config: { resumeSnapshotMs: 2000 },
+	})
+	await waitFor(() => existsSync(boot.socketPath))
+	// 插件刚起来时网关还没连上 → 不发；register 成功之后才发
+	await rpc(boot.socketPath, 'register', {
+		openids: [{ openid: 'U1' }],
+		panel: { enabled: true, users: ['U1'] },
+		menu: { enabled: true },
+	})
+
+	const notice = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 120)
+		return list.find((c) => c.kind === 'send_c2c' && /上次运行被打断/.test(String(c.args.content))) ?? null
+	})
+	assert.match(String(notice.args.content), /session-1/)
+	assert.match(String(notice.args.content), /第 12 轮/)
+	const noticeButtons = notice.args.keyboard.content.rows.flatMap((row) => row.buttons)
+	assert.deepEqual(noticeButtons.map((b) => b.render_data.label), ['全部继续', '查看会话详情'])
+	assert.equal(noticeButtons[0].action.data, 'qqb:rsa', '「全部继续」不带编号（用户要求）')
+
+	// 「查看会话详情」→ 带编号的详情卡
+	await rpc(boot.socketPath, 'event', {
+		kind: 'interaction',
+		openid: 'U1',
+		buttonData: 'qqb:rsv:1',
+		eventId: 'INT-V',
+		msgId: 'CARD-R',
+	})
+	const detail = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 120)
+		return list.find((c) => c.kind === 'send_c2c' && /上次运行被打断的会话/.test(String(c.args.content))) ?? null
+	})
+	const detailButtons = detail.args.keyboard.content.rows.flatMap((row) => row.buttons)
+	assert.ok(detailButtons.some((b) => b.action.data === 'qqb:rs:session-1'), '编号 1 指向 session-1')
+	assert.ok(detailButtons.some((b) => b.action.data === 'qqb:rs:session-3'), '编号 2 指向 session-3')
+
+	// 点编号 2（session-3）：只继续它，session-1 不动
+	await rpc(boot.socketPath, 'event', {
+		kind: 'interaction',
+		openid: 'U1',
+		buttonData: 'qqb:rs:session-3',
+		eventId: 'INT-2',
+		msgId: 'CARD-R',
+	})
+	await waitFor(() => third.followed.length > 0)
+	assert.match(JSON.stringify(third.followed[0]), /接着把原来的任务做完/, '要继续原来的任务，不是只发"继续"两个字')
+	assert.equal(first.followed.length, 0, '没点的那个不许自己跑')
+
+	// 「全部继续」：剩下的 session-1 也跑起来
+	await rpc(boot.socketPath, 'event', {
+		kind: 'interaction',
+		openid: 'U1',
+		buttonData: 'qqb:rsa',
+		eventId: 'INT-A',
+		msgId: 'CARD-R',
+	})
+	await waitFor(() => first.followed.length > 0)
+	assert.match(JSON.stringify(first.followed[0]), /接着把原来的任务做完/)
+
+	// 快照被心跳改写成"当前在跑什么"（启动第一拍就清掉上一轮记录 ⇒ 不会重复提醒）
+	await waitFor(() => {
+		try {
+			const snap = JSON.parse(readFileSync(join(dir, 'running.json'), 'utf8'))
+			return Array.isArray(snap.sessions)
+		} catch {
+			return false
+		}
+	})
+	boot.dispose()
+})

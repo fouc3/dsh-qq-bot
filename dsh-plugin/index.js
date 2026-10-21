@@ -16,10 +16,11 @@
  */
 import { randomUUID } from 'node:crypto'
 import { mkdirSync, readdirSync, rmdirSync, statSync } from 'node:fs'
-import { basename, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 
 import { createState } from './lib/state.js'
 import { expandHome } from './lib/home.js'
+import { MAX_ENTRIES as RESUME_MAX_ENTRIES, clipText, createResumeStore } from './lib/resume.js'
 import { createSocketServer } from './lib/socket.js'
 import { createOutbox } from './lib/outbox.js'
 import { createSessions } from './lib/sessions.js'
@@ -41,6 +42,8 @@ import {
 	buildModelSessionPromptCard,
 	buildPermissionCard,
 	buildPresetCard,
+	buildResumeListCard,
+	buildResumeNoticeCard,
 	buildInboxResult,
 	buildMkdirPromptCard,
 	buildNewSessionCard,
@@ -160,12 +163,21 @@ export function apply(ctx, rawConfig) {
 		goalRearmWaitMs: rawConfig?.goalRearmWaitMs ?? 5000,
 		goalRearmPollMs: rawConfig?.goalRearmPollMs ?? 250,
 		sessionPageSize: rawConfig?.sessionPageSize ?? 8,
+		// 「上次运行被打断」的快照：只要有任何会话在跑，就每这么多毫秒刷一次盘（内容没变不写）。
+		// 这是唯一能在 kill -9 / 断电后留下来"死前最后一份"的方式（退出钩子跑不到）。
+		resumeSnapshotMs: rawConfig?.resumeSnapshotMs ?? 15_000,
+		// 关掉快照与启动提醒（不配就是开）。
+		resumeSnapshot: rawConfig?.resumeSnapshot ?? true,
+		// 启动提醒发给谁：留空 = 当前有绑定的那个 openid，没有绑定就发给白名单第一个人。
+		notifyOpenid: rawConfig?.notifyOpenid ?? '',
 		needReplyText: rawConfig?.needReplyText ?? '用户点了「我需要回复」。请把上一条消息对应的结果完整地回复给用户。',
 		needReplyAckText: rawConfig?.needReplyAckText ?? '已触发，正在请求回复…',
 		dshMenuLabel: rawConfig?.dshMenuLabel ?? 'dsh 命令',
 	}
 	const socketPath = expandHome(rawConfig?.socketPath ?? '~/.dsh/dsh-qq-bot/bridge.sock')
 	const stateFile = expandHome(rawConfig?.stateFile ?? '~/.dsh/dsh-qq-bot/state.json')
+	// 运行快照与 state.json 同目录（同样是 0600）：`running.json`。
+	const runningFile = expandHome(rawConfig?.runningFile ?? join(dirname(stateFile), 'running.json'))
 	const token = rawConfig?.token ?? ''
 	const logger = ctx.logger ?? console
 
@@ -983,6 +995,222 @@ export function apply(ctx, rawConfig) {
 		// 恢复被我这次打断的目标（不 await：投递不该被它拖住）。
 		if (goalBefore) void rearmGoalAfterInterrupt(agent, goalBefore)
 		return { ok: true }
+	}
+
+	// ── 「上次运行被打断」：运行快照 + 启动提醒 + 一键继续 ─────────────────────
+	//
+	// 用户要求（2026-10-18）：dsh 被重启/崩溃时，正在跑的轮次会被打断，回到 QQ 只看到
+	// 「已结束/被打断」，既不知道停在哪、也没法一键接着跑。所以：
+	//   ① 只要会话在跑，就把「谁在跑、第几轮、最后一段正文」**心跳式**落盘
+	//      （kill -9 / 断电时退出钩子跑不到，只有死前最后一份快照靠得住）；
+	//   ② 下次启动读到这份文件 → 发一张卡片：「全部继续」（不给编号，全跑）
+	//      +「查看打断详情」（这张才带编号，可只继续某一个）。
+	// 判定口径就是"快照里在跑 ⇒ 停机时被打断"——**不去读会话日志**（那要把每个会话都打开，
+	// 又慢又会把冷会话吵醒），所以卡片措辞是"可能被打断"，最终以用户点不点为准。
+	const resumeStore = createResumeStore({ file: runningFile, logger })
+	/** 启动时从快照读出来的"上次被打断的会话"；`handled` 标记谁已经继续过。 */
+	const interrupted = config.resumeSnapshot
+		? resumeStore.load().sessions.map((entry) => ({ ...entry, handled: false }))
+		: []
+	let interruptedNotified = false
+	let resumeTimer = null
+	let resumeLastWritten = null
+
+	function resumeEntries() {
+		return interrupted.filter((entry) => entry?.sessionId)
+	}
+
+	/** 当前在跑的会话 → 快照条目（第几轮与最后一段正文来自 `snapshotProgress`）。 */
+	function snapshotEntries() {
+		const now = Date.now()
+		let list = []
+		try {
+			list = sessions.runningSessions(RESUME_MAX_ENTRIES)
+		} catch (error) {
+			logger.warn?.('读取运行中会话失败（这一拍不写快照）', { error: String(error) })
+			return []
+		}
+		return list.map((item) => {
+			let snapshot = null
+			try {
+				const agent = ctx.agents?.get?.(item.sessionId) ?? null
+				snapshot = agent ? snapshotProgress(agent, { now }) : null
+			} catch (error) {
+				logger.debug?.('读取会话进度失败（快照退回标题）', { sessionId: item.sessionId, error: String(error) })
+			}
+			return {
+				sessionId: item.sessionId,
+				title: item.label || (sessions.titleOf?.(item.sessionId) ?? ''),
+				cwd: item.cwd ?? '',
+				turn: snapshot?.turn ?? null,
+				startedAt: snapshot?.startedAt ?? null,
+				text: clipText(snapshot?.lastText ?? ''),
+				at: now,
+			}
+		})
+	}
+
+	/**
+	 * 心跳：**内容变了才写**。没会话在跑时写一次空的，把上一轮的记录清掉
+	 * （启动第一拍就会写空 —— 这正是"上次那份只提醒一次"的实现）。
+	 */
+	function tickResumeSnapshot() {
+		const entries = snapshotEntries()
+		const serialized = JSON.stringify(entries)
+		if (serialized === resumeLastWritten) return
+		if (resumeStore.save(entries)) resumeLastWritten = serialized
+	}
+
+	if (config.resumeSnapshot && resumeStore.file) {
+		tickResumeSnapshot()
+		resumeTimer = setInterval(tickResumeSnapshot, Math.max(2000, Number(config.resumeSnapshotMs) || 15_000))
+		if (typeof resumeTimer.unref === 'function') resumeTimer.unref()
+		const stopTimer = () => {
+			if (!resumeTimer) return
+			clearInterval(resumeTimer)
+			resumeTimer = null
+		}
+		try {
+			ctx.on?.('dispose', stopTimer)
+		} catch {
+			// 挂不上卸载钩子也不影响：定时器已 unref，不会拖住进程退出
+		}
+	}
+
+	/** 启动提醒发给谁：配置指定 → 当前绑定的人 → 白名单第一个人。 */
+	function resumeTarget() {
+		const explicit = String(config.notifyOpenid ?? '').trim()
+		if (explicit) return explicit
+		try {
+			const data = state.get() ?? {}
+			const bindings = data.bindings ?? {}
+			const bound = Object.keys(bindings).find((key) => bindings[key])
+			if (bound) return bound
+			// 注意：白名单在状态里是**对象**（`{openids:[…]}`），不是裸数组（踩过一次）。
+			const whitelist = data.whitelist ?? {}
+			const openids = Array.isArray(whitelist)
+				? whitelist
+				: Array.isArray(whitelist.openids)
+					? whitelist.openids
+					: []
+			if (openids.length > 0) return String(openids[0])
+		} catch (error) {
+			logger.warn?.('确定启动提醒的接收者失败', { error: String(error) })
+		}
+		return ''
+	}
+
+	/** 提醒卡（「全部继续」+「查看打断详情」）。 */
+	async function showResumeNotice({ openid }) {
+		const entries = resumeEntries()
+		if (entries.length === 0) return false
+		const card = buildResumeNoticeCard({ items: entries })
+		await io.sendCard({ openid, content: card.content, keyboard: card.keyboard, context: {} })
+		state.setLastCard(openid, null)
+		return true
+	}
+
+	/** 详情卡（**这张才带编号**，点编号只继续那一个）。 */
+	async function showResumeList({ openid, page = 1, replyContext = {} }) {
+		const entries = resumeEntries()
+		if (entries.length === 0) {
+			await sendText({ openid, content: '没有被打断的会话了。', markdown: true, context: replyContext })
+			return
+		}
+		const card = buildResumeListCard({ items: entries, page })
+		await io.sendCard({ openid, content: card.content, keyboard: card.keyboard, context: replyContext })
+	}
+
+	/** 继续时投给会话的那段话（告诉模型"上次被打断，接着做，别重做副作用"）。 */
+	function continueText(entry) {
+		const where = entry?.turn ? `第 ${entry.turn} 轮` : '上一个轮次'
+		return (
+			`dsh 上次停止时，这个会话正在跑${where}（被重启打断）。` +
+			'请先看一眼最近的上下文，然后**从中断处接着把原来的任务做完**：已经完成的部分不要重做；' +
+			'提交、推送、删除这类有副作用的操作，动手前先确认当前状态，别重复执行。'
+		)
+	}
+
+	/**
+	 * 一键继续。`sessionIds` 为空 = **全部**继续（= 提醒卡上那个「全部继续」按钮，
+	 * 用户明确要求这条路不给编号）；给了就是只继续指定的那几个（详情卡上的编号按钮）。
+	 */
+	async function continueInterrupted({ openid, replyContext = {}, sessionIds = null }) {
+		const entries = resumeEntries()
+		const targets = Array.isArray(sessionIds)
+			? sessionIds.map((id) => entries.find((entry) => entry.sessionId === id)).filter(Boolean)
+			: entries.filter((entry) => !entry.handled)
+		if (targets.length === 0) {
+			await sendText({ openid, content: '没有需要继续的会话了。', markdown: true, context: replyContext })
+			return
+		}
+		const started = []
+		const skipped = []
+		for (const entry of targets) {
+			const session = sessions.get(entry.sessionId)
+			if (!session || sessions.isArchived(entry.sessionId)) {
+				// 会话没了/归档了：如实计入"跳过"，绝不硬拉起来。
+				entry.handled = true
+				skipped.push({ entry, reason: session ? '已归档' : '不在了' })
+				continue
+			}
+			const result = await deliver({
+				sessionId: entry.sessionId,
+				openid,
+				text: continueText(entry),
+				origin: 'qq',
+				context: replyContext,
+			})
+			if (result?.ok) {
+				entry.handled = true
+				started.push(entry)
+			} else {
+				skipped.push({ entry, reason: '打不开' })
+			}
+		}
+		state.note(
+			`启动恢复：继续 ${started.length}/${targets.length}` +
+				(skipped.length > 0 ? `（跳过 ${skipped.map((item) => String(item.entry.sessionId).slice(-8)).join('/')}）` : ''),
+		)
+		const lines = []
+		if (started.length > 0) {
+			lines.push(`已接着跑 ${started.length} 个会话：`)
+			for (const entry of started) lines.push(`- **${entry.title || entry.sessionId}** \`${entry.sessionId}\``)
+		}
+		if (skipped.length > 0) {
+			if (lines.length > 0) lines.push('')
+			lines.push('跳过的：')
+			for (const item of skipped) {
+				lines.push(`- \`${item.entry.sessionId}\`（${item.reason}）`)
+			}
+		}
+		if (started.length > 0) {
+			lines.push('', '> 跑完照常发「已结束」；想看进度发 `状态 <会话id>`。')
+		}
+		await sendText({ openid, content: lines.join('\n'), markdown: true, context: replyContext })
+	}
+
+	/**
+	 * 启动提醒只发一次：等网关重连（register 成功）后再调 —— 插件刚起来时通道刚建，
+	 * 早发是白发。
+	 */
+	async function notifyInterruptedOnce() {
+		if (interruptedNotified || !config.resumeSnapshot) return
+		interruptedNotified = true
+		const entries = resumeEntries().filter((entry) => !entry.handled)
+		if (entries.length === 0) return
+		const openid = resumeTarget()
+		if (!openid) {
+			state.note(`启动提醒：上次有 ${entries.length} 个会话被打断，但没有可通知的 openid`)
+			return
+		}
+		try {
+			await showResumeNotice({ openid })
+			state.note(`启动提醒：上次有 ${entries.length} 个会话被打断，已发提醒`)
+			logger.info?.('已发送「上次运行被打断」提醒', { count: entries.length })
+		} catch (error) {
+			state.note(`启动提醒发送失败：${String(error?.message ?? error)}`)
+		}
 	}
 
 	// ── 目标（goal）：打断会把它"失能"，这里负责按用户要求恢复运行中的那个 ──────
@@ -1841,6 +2069,21 @@ export function apply(ctx, rawConfig) {
 			const ctxReply = { eventId: event.eventId, msgId: event.msgId ?? '' }
 			await showRunningCard({ openid, page: parsed.page, replyContext: ctxReply })
 			code = 0
+		} else if (parsed.kind === 'resumeall') {
+			// 「全部继续」：不给编号，快照里那些**全部**接着跑（用户明确要求这条路没有编号）。
+			const ctxReply = { eventId: event.eventId, msgId: event.msgId ?? '' }
+			await continueInterrupted({ openid, replyContext: ctxReply })
+			code = 0
+		} else if (parsed.kind === 'resumepage') {
+			// 「查看打断详情」/ 翻页：重发那张带编号的详情卡。
+			const ctxReply = { eventId: event.eventId, msgId: event.msgId ?? '' }
+			await showResumeList({ openid, page: parsed.page, replyContext: ctxReply })
+			code = 0
+		} else if (parsed.kind === 'resume') {
+			// 详情卡上的编号：只继续那一个。
+			const ctxReply = { eventId: event.eventId, msgId: event.msgId ?? '' }
+			await continueInterrupted({ openid, replyContext: ctxReply, sessionIds: [parsed.sessionId] })
+			code = 0
 		} else if (parsed.kind === 'shortcut') {
 			// 快捷卡片：go（点某条 = 直接切过去）/ add（把当前会话加进来）。
 			// 语义全在 commands.js 里，这里只把按钮翻译成等价的命令文本，避免两套实现。
@@ -2011,6 +2254,8 @@ export function apply(ctx, rawConfig) {
 				} catch (error) {
 					logger.warn?.('补登记工作区失败', { error: String(error) })
 				}
+				// 网关连上了 = 现在发 QQ 才有意义：这时才做"上次被打断"的启动提醒（只发一次）。
+				void notifyInterruptedOnce()
 				return { ok: true }
 			},
 			panel: async () => {
