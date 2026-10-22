@@ -3111,7 +3111,8 @@ test('端到端：快捷 —— 裸发是帮助、列出给卡片、点按钮直
 	assert.ok(rows.length <= 5, '键盘行数不能超平台上限')
 	for (const row of rows) assert.ok(row.buttons.length <= 5, '每行按钮数不能超平台上限')
 	const buttons = rows.flatMap((row) => row.buttons)
-	const go = buttons.find((b) => b.action.data === cardData.shortcut('go', 1))
+	// go 按钮的 data 带当前页（切完留在原页，用户 2026-10-18）：`qqb:sc:go:1?page=1`
+	const go = buttons.find((b) => String(b.action.data).startsWith('qqb:sc:go:1'))
 	assert.ok(go, '每条快捷一个回调按钮')
 	assert.equal(go.action.type, 1, '快捷按钮是回调按钮（点一下当场切，不是填输入框）')
 	assert.equal(go.render_data.label, '#1 前端', '按钮上就是 `#编号 备注`')
@@ -3139,7 +3140,7 @@ test('端到端：快捷 —— 裸发是帮助、列出给卡片、点按钮直
 	assert.ok(refreshed, '点完要重发卡片')
 	const refreshedGo = refreshed.args.keyboard.content.rows
 		.flatMap((row) => row.buttons)
-		.find((b) => b.action.data === cardData.shortcut('go', 1))
+		.find((b) => String(b.action.data).startsWith('qqb:sc:go:1'))
 	assert.equal(refreshedGo.render_data.style, 1, '重发的卡片要把新的"当前"标蓝')
 
 	// 绑定与快捷条目都真的落盘了（不只是内存里对）

@@ -1049,9 +1049,11 @@ test('快捷卡片：一条一个回调按钮（点一下直接切），末行�
 	assert.equal(flat[0].render_data.style, 0, '非当前灰')
 	assert.equal(flat[1].render_data.style, 1, '当前那条标蓝')
 	assert.equal(flat[3].action.type, 1, '「加当前会话」也是回调按钮')
-	assert.deepEqual(parseCallback(flat[0].action.data), { kind: 'shortcut', action: 'go', arg: '1' })
-	assert.deepEqual(parseCallback(flat[1].action.data), { kind: 'shortcut', action: 'go', arg: '2' })
-	assert.deepEqual(parseCallback(flat[3].action.data), { kind: 'shortcut', action: 'add', arg: '' })
+	// go 按钮带上当前页（切完要留在原页，用户 2026-10-18）
+	assert.equal(flat[0].action.data, 'qqb:sc:go:1?page=1')
+	assert.deepEqual(parseCallback(flat[0].action.data), { kind: 'shortcut', action: 'go', arg: '1', page: 1 })
+	assert.deepEqual(parseCallback(flat[1].action.data), { kind: 'shortcut', action: 'go', arg: '2', page: 1 })
+	assert.deepEqual(parseCallback(flat[3].action.data), { kind: 'shortcut', action: 'add', arg: '', page: 1 })
 	// 同一张键盘里按钮 id 必须唯一（label 截断后可能撞车，编号才是真身份）
 	assert.equal(new Set(flat.map((b) => b.id)).size, flat.length)
 
@@ -1086,7 +1088,7 @@ test('快捷卡片：空列表只给「加当前会话」+ 引导；超过一页
 	)
 	const page1Buttons = page1.keyboard.content.rows.flatMap((row) => row.buttons)
 	const nextButton = page1Buttons.at(-1)
-	assert.deepEqual(parseCallback(nextButton.action.data), { kind: 'shortcut', action: 'page', arg: '2' })
+	assert.deepEqual(parseCallback(nextButton.action.data), { kind: 'shortcut', action: 'page', arg: '2', page: 1 })
 
 	const page2 = buildShortcutCard({ items: nine, currentLabel: '', page: 2 })
 	assert.match(page2.content, /第 2\/2 页/)
@@ -1098,8 +1100,10 @@ test('快捷卡片：空列表只给「加当前会话」+ 引导；超过一页
 		],
 	)
 	const page2Buttons = page2.keyboard.content.rows.flatMap((row) => row.buttons)
-	assert.deepEqual(parseCallback(page2Buttons.at(-2).action.data), { kind: 'shortcut', action: 'page', arg: '1' })
-	assert.deepEqual(parseCallback(page2Buttons.at(-1).action.data), { kind: 'shortcut', action: 'add', arg: '' })
+	assert.deepEqual(parseCallback(page2Buttons.at(-2).action.data), { kind: 'shortcut', action: 'page', arg: '1', page: 1 })
+	assert.deepEqual(parseCallback(page2Buttons.at(-1).action.data), { kind: 'shortcut', action: 'add', arg: '', page: 1 })
+	// 第 2 页的编号按钮必须带 page=2 —— 切完才不会跳回第 1 页
+	assert.equal(page2Buttons[0].action.data, 'qqb:sc:go:9?page=2')
 
 	// 正好一页（8 条）：末行只有「加当前会话」，两侧的翻页按钮都不出现
 	const exact = buildShortcutCard({

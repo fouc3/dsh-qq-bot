@@ -59,7 +59,8 @@ function makeRunner({ seed = {}, modelResult = { ok: true, text: '**DeepSeek / D
 		logger: {},
 		reply: async ({ openid, content }) => calls.replies.push({ openid, content }),
 		showSessionCard: async ({ openid, dir }) => calls.cards.push({ openid, dir }),
-		showShortcutCard: async ({ openid }) => calls.shortcutCards.push({ openid, items: state.shortcutsOf(openid) }),
+		showShortcutCard: async ({ openid, page = 1 }) =>
+			calls.shortcutCards.push({ openid, page, items: state.shortcutsOf(openid) }),
 		showRunningCard: async ({ openid, page = 1 }) => calls.runningCards.push({ openid, page }),
 		showPresetCard: async ({ openid, sessionId }) => calls.presetCards.push({ openid, sessionId }),
 		setPreset: async ({ openid, sessionId, tokens }) => {
@@ -820,6 +821,26 @@ test('快捷：卡片点进来的动作（fromCard）要把卡片重发一遍标
 	assert.equal(calls.shortcutCards.length, 1, '点卡片上的按钮做的动作要刷新卡片')
 	assert.equal(calls.shortcutCards[0].items.length, 1)
 	assert.equal(s.bindingOf('U1'), 'session-1')
+})
+
+// 用户 2026-10-18：「在第 2 页点某个编号切过去之后，重发的卡片跳回了第 1 页」——
+// 切完必须留在**原来那一页**。
+test('快捷：从卡片切换后重发的卡片留在原来那一页（不跳回第 1 页）', async () => {
+	const { runner, calls } = makeRunner({ seed: boundSeed() })
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('切换会话 session-2'))
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('切换会话 session-1'))
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 加 甲')) // #1 → session-1
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('切换会话 session-2'))
+	await runner.run(
+		{ openid: 'U1', replyContext: {}, fromCard: true, page: 2 },
+		parseCommand('快捷 #1'),
+	)
+	assert.equal(calls.shortcutCards.length, 1, 'fromCard 要重发卡片')
+	assert.equal(calls.shortcutCards[0].page, 2, '页码要原样带回去（以前缺省成第 1 页）')
+	// 命令路径（不是从卡片点的）本来就不重发，不受影响
+	calls.shortcutCards.length = 0
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 #1'))
+	assert.equal(calls.shortcutCards.length, 0, '命令路径不该自己重发卡片')
 })
 
 test('快捷：目标会话没了/已归档时如实说，并提醒清掉这一条', async () => {

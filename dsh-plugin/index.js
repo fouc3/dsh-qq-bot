@@ -2090,8 +2090,10 @@ export function apply(ctx, rawConfig) {
 		} else if (parsed.kind === 'shortcut') {
 			// 快捷卡片：go（点某条 = 直接切过去）/ add（把当前会话加进来）/ page（翻页，原地重发）。
 			// 语义全在 commands.js 里，这里只把按钮翻译成等价的命令文本，避免两套实现。
-			// `fromCard: true` 让命令侧做完把卡片重发一遍（标出新的「当前」）。
+			// `fromCard: true` 让命令侧做完把卡片重发一遍（标出新的「当前」）；
+			// `page` 一路带下去，切完**留在原来那一页**（用户 2026-10-18 要求，别再跳回第 1 页）。
 			const ctxReply = { eventId: event.eventId, msgId: event.msgId ?? '' }
+			const currentPage = Number(parsed.arg && parsed.page) || 1
 			if (parsed.action === 'page') {
 				// 翻页不是命令，直接重发那一页（和「运行中会话」的翻页同款做法）。
 				await showShortcutCard({ openid, page: Number(parsed.arg) || 1, replyContext: ctxReply })
@@ -2099,7 +2101,7 @@ export function apply(ctx, rawConfig) {
 			} else {
 				const tokens = parsed.action === 'add' ? ['加'] : [`#${parsed.arg}`]
 				await commands.run(
-					{ openid, replyContext: ctxReply, quote: '', fromCard: true },
+					{ openid, replyContext: ctxReply, quote: '', fromCard: true, page: currentPage },
 					{ name: '快捷', tokens, rest: tokens.join(' ') },
 				)
 				code = 0

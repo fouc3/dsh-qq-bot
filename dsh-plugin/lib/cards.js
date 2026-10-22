@@ -193,9 +193,17 @@ export function parseCallback(raw) {
 		const rest = raw.slice(`${DATA_PREFIX}:sc:`.length)
 		const first = rest.indexOf(':')
 		const action = first < 0 ? rest : rest.slice(0, first)
-		const arg = first < 0 ? '' : rest.slice(first + 1)
+		let arg = first < 0 ? '' : rest.slice(first + 1)
+		// 用户 2026-10-18：点编号切完之后卡片要**留在原来那一页**，所以 go 按钮的 arg 里
+		// 带一个 `?page=N`（编号是纯数字，不会有 '?'，只切第一个问号最稳）。
+		let page = 1
+		const mark = arg.indexOf('?page=')
+		if (mark >= 0) {
+			page = Number(arg.slice(mark + '?page='.length)) || 1
+			arg = arg.slice(0, mark)
+		}
 		if (!action) return null
-		return { kind: 'shortcut', action, arg }
+		return { kind: 'shortcut', action, arg, page }
 	}
 	if (raw.startsWith(`${DATA_PREFIX}:rsa`)) {
 		return { kind: 'resumeall' }
@@ -777,7 +785,7 @@ export function buildShortcutCard({ items = [], currentLabel = '', page = 1 }) {
 	}
 
 	const buttons = shown.map((item) =>
-		callbackButton(`#${item.id} ${item.label}`, data.shortcut('go', item.id), {
+		callbackButton(`#${item.id} ${item.label}`, data.shortcut('go', `${item.id}?page=${current}`), {
 			// 当前会话那条用蓝色，其余灰色；label 里已经带 `#编号`，按钮 id 只能靠编号区分。
 			style: item.current ? BUTTON_STYLE.primary : BUTTON_STYLE.neutral,
 			visited: item.current ? '当前' : `#${item.id}`,

@@ -524,19 +524,31 @@ export function createCommandRunner(deps) {
 		return null
 	}
 
-	/** 从卡片点进来的动作（切换/加）做完要把卡片重发一遍，标出新的"当前"。 */
-	async function refreshShortcutCard({ openid, replyContext, fromCard }) {
+	/**
+	 * 从卡片点进来的动作（切换/加/改/补位）做完要把卡片重发一遍，标出新的"当前"。
+	 *
+	 * 用户 2026-10-18 踩到：这条没有把 `page` 带下去，所以"在第 2 页点某个编号切过去之后，
+	 * 重发的卡片跳回了第 1 页"。现在把页码透传（`context.page` 由回调路由放进 replyContext 外层）。
+	 */
+	async function refreshShortcutCard({ openid, replyContext, fromCard, page }) {
 		if (!fromCard) return
-		await deps.showShortcutCard?.({ openid, replyContext })
+		await deps.showShortcutCard?.({ openid, replyContext, page: Number(page) > 0 ? Number(page) : 1 })
 	}
 
 	async function shortcuts(context, parsed) {
+		// `page` 由回调路由放进 context（从卡片点进来的动作）：一路带到重发卡片，
+		// 切完才**留在原来那一页**；命令路径没有这个字段，默认第 1 页（本来也不重发卡片）。
+		context.page = Number(context.page) > 0 ? Number(context.page) : 1
 		const tokens = parsed.tokens
 		// 裸发 = 帮助（用户明确要求）：记不住 `#编号/加/删/列出` 的写法时，发两个字就有说明。
 		if (tokens.length === 0 || SHORTCUT_HELP.has(shortcutWord(tokens[0]))) return shortcutHelp(context)
 		const word = shortcutWord(tokens[0])
 		if (SHORTCUT_LIST.has(word)) {
-			await deps.showShortcutCard?.({ openid: context.openid, replyContext: context.replyContext })
+			await deps.showShortcutCard?.({
+				openid: context.openid,
+				replyContext: context.replyContext,
+				page: context.page,
+			})
 			return { handled: true }
 		}
 		if (SHORTCUT_ADD.has(word)) {
@@ -558,7 +570,7 @@ export function createCommandRunner(deps) {
 	}
 
 	/** 回作用 + 用法（裸发、认不出、或需要看清楚写法时都走这里）。 */
-	async function shortcutHelp({ openid, replyContext, fromCard }) {
+	async function shortcutHelp({ openid, replyContext, fromCard, page }) {
 		const items = state.shortcutsOf(openid)
 		// 帮助在前、当前状态在后：先给读法，再告诉用户"你现在有几条"（以前提示压在最上面，
 		// 读起来像先挨一句抱怨再看说明书）。
@@ -567,7 +579,7 @@ export function createCommandRunner(deps) {
 				? '> 还没有快捷会话：发 `快捷 加 [备注]` 存第一条（也可以点卡片上的「加当前会话」）'
 				: `> 现有：${shortcutListText(items)}`
 		await deps.reply({ openid, content: `${usageText('快捷')}\n\n${state_line}`, markdown: true, replyContext })
-		await refreshShortcutCard({ openid, replyContext, fromCard })
+		await refreshShortcutCard({ openid, replyContext, fromCard, page })
 		return { handled: true }
 	}
 
@@ -601,11 +613,11 @@ export function createCommandRunner(deps) {
 		return { name: list.slice(0, -1).join(' '), target: last }
 	}
 
-	async function addShortcut({ openid, replyContext, fromCard }, name, target = '') {
+	async function addShortcut({ openid, replyContext, fromCard, page }, name, target = '') {
 		const bad = shortcutNameError(name)
 		if (bad) {
 			await deps.reply({ openid, content: `${bad}\n\n${usageText('快捷')}`, replyContext })
-			await refreshShortcutCard({ openid, replyContext, fromCard })
+			await refreshShortcutCard({ openid, replyContext, fromCard, page })
 			return { handled: true }
 		}
 		// 指定了会话就用那个（认 `session-…` 前缀与完整id），否则用当前绑定会话。
@@ -619,7 +631,7 @@ export function createCommandRunner(deps) {
 				markdown: true,
 				replyContext,
 			})
-			await refreshShortcutCard({ openid, replyContext, fromCard })
+			await refreshShortcutCard({ openid, replyContext, fromCard, page })
 			return { handled: true }
 		}
 		if (!sessionId || sessionId === 'none') {
@@ -631,13 +643,13 @@ export function createCommandRunner(deps) {
 				markdown: true,
 				replyContext,
 			})
-			await refreshShortcutCard({ openid, replyContext, fromCard })
+			await refreshShortcutCard({ openid, replyContext, fromCard, page })
 			return { handled: true }
 		}
 		const session = sessions.get(sessionId)
 		if (!session || sessions.isArchived(sessionId)) {
 			await deps.reply({ openid, content: `会话 \`${sessionId}\` 不在了或已归档，加不进去。`, markdown: true, replyContext })
-			await refreshShortcutCard({ openid, replyContext, fromCard })
+			await refreshShortcutCard({ openid, replyContext, fromCard, page })
 			return { handled: true }
 		}
 
@@ -651,7 +663,7 @@ export function createCommandRunner(deps) {
 					markdown: true,
 					replyContext,
 				})
-				await refreshShortcutCard({ openid, replyContext, fromCard })
+				await refreshShortcutCard({ openid, replyContext, fromCard, page })
 				return { handled: true }
 			}
 		}
@@ -675,12 +687,12 @@ export function createCommandRunner(deps) {
 			markdown: true,
 			replyContext,
 		})
-		await refreshShortcutCard({ openid, replyContext, fromCard })
+		await refreshShortcutCard({ openid, replyContext, fromCard, page })
 		return { handled: true }
 	}
 
 	/** `快捷 删 #3`（`delete`/`d`，也认名字）：只删快捷条目，不动绑定，也不动会话本身。 */
-	async function dropShortcut({ openid, replyContext, fromCard }, tokens) {
+	async function dropShortcut({ openid, replyContext, fromCard, page }, tokens) {
 		if (tokens.length === 0) {
 			await deps.reply({ openid, content: usageText('快捷'), replyContext })
 			return { handled: true }
@@ -688,7 +700,7 @@ export function createCommandRunner(deps) {
 		const resolved = resolveShortcut(openid, tokens, { headOnly: true })
 		if (!resolved || resolved.error) {
 			await deps.reply({ openid, content: shortcutMissText(openid, tokens[0]), markdown: true, replyContext })
-			await refreshShortcutCard({ openid, replyContext, fromCard })
+			await refreshShortcutCard({ openid, replyContext, fromCard, page })
 			return { handled: true }
 		}
 		const removed = state.removeShortcut(openid, resolved.item.id)
@@ -700,7 +712,7 @@ export function createCommandRunner(deps) {
 			markdown: true,
 			replyContext,
 		})
-		await refreshShortcutCard({ openid, replyContext, fromCard })
+		await refreshShortcutCard({ openid, replyContext, fromCard, page })
 		return { handled: true }
 	}
 
@@ -712,7 +724,7 @@ export function createCommandRunner(deps) {
 	 * 删了再来做——删掉 `#1` 之后再加只会拿到新编号，`#1` 永远回不来。会话换代
 	 * （同一个项目换了个新会话）时用户要的正是"还是 #1，只是指向新会话"。
 	 */
-	async function retargetShortcut({ openid, replyContext, fromCard }, tokens) {
+	async function retargetShortcut({ openid, replyContext, fromCard, page }, tokens) {
 		// `快捷 改` 后面什么都没有：连改哪一条都没说，只能给用法。
 		if (tokens.length < 1) {
 			await deps.reply({
@@ -723,13 +735,13 @@ export function createCommandRunner(deps) {
 				markdown: true,
 				replyContext,
 			})
-			await refreshShortcutCard({ openid, replyContext, fromCard })
+			await refreshShortcutCard({ openid, replyContext, fromCard, page })
 			return { handled: true }
 		}
 		const resolved = resolveShortcut(openid, tokens, { headOnly: true })
 		if (!resolved || resolved.error) {
 			await deps.reply({ openid, content: shortcutMissText(openid, tokens[0]), markdown: true, replyContext })
-			await refreshShortcutCard({ openid, replyContext, fromCard })
+			await refreshShortcutCard({ openid, replyContext, fromCard, page })
 			return { handled: true }
 		}
 		// 用户 2026-10-18：「如果改快捷不带会话ID 就改到当前」——
@@ -745,7 +757,7 @@ export function createCommandRunner(deps) {
 				markdown: true,
 				replyContext,
 			})
-			await refreshShortcutCard({ openid, replyContext, fromCard })
+			await refreshShortcutCard({ openid, replyContext, fromCard, page })
 			return { handled: true }
 		}
 		const sessionId = ref === '' ? current : (sessions.resolveRef([ref])?.sessionId ?? '')
@@ -756,7 +768,7 @@ export function createCommandRunner(deps) {
 				markdown: true,
 				replyContext,
 			})
-			await refreshShortcutCard({ openid, replyContext, fromCard })
+			await refreshShortcutCard({ openid, replyContext, fromCard, page })
 			return { handled: true }
 		}
 		const session = sessions.get(sessionId)
@@ -767,7 +779,7 @@ export function createCommandRunner(deps) {
 				markdown: true,
 				replyContext,
 			})
-			await refreshShortcutCard({ openid, replyContext, fromCard })
+			await refreshShortcutCard({ openid, replyContext, fromCard, page })
 			return { handled: true }
 		}
 		const before = resolved.item.sessionId
@@ -778,13 +790,13 @@ export function createCommandRunner(deps) {
 				markdown: true,
 				replyContext,
 			})
-			await refreshShortcutCard({ openid, replyContext, fromCard })
+			await refreshShortcutCard({ openid, replyContext, fromCard, page })
 			return { handled: true }
 		}
 		const result = state.setShortcutSession(openid, resolved.item.id, sessionId)
 		if (!result?.ok) {
 			await deps.reply({ openid, content: result?.error ?? '改不了（状态异常），再试一次。', markdown: true, replyContext })
-			await refreshShortcutCard({ openid, replyContext, fromCard })
+			await refreshShortcutCard({ openid, replyContext, fromCard, page })
 			return { handled: true }
 		}
 		state.flush()
@@ -797,7 +809,7 @@ export function createCommandRunner(deps) {
 			markdown: true,
 			replyContext,
 		})
-		await refreshShortcutCard({ openid, replyContext, fromCard })
+		await refreshShortcutCard({ openid, replyContext, fromCard, page })
 		return { handled: true }
 	}
 
@@ -808,7 +820,7 @@ export function createCommandRunner(deps) {
 	 * 但删多了会留窟窿，用户要的是"我自己决定什么时候压一次"（2026-10-18 要求）。
 	 * 这个子命令**不注册**进指令面板与自定义菜单（用户明确要求"不出现在列表菜单"）。
 	 */
-	async function packShortcuts({ openid, replyContext }) {
+	async function packShortcuts({ openid, replyContext, page }) {
 		const before = state.shortcutsOf(openid)
 		if (before.length === 0) {
 			await deps.reply({
@@ -850,7 +862,7 @@ export function createCommandRunner(deps) {
 	}
 
 	/** `快捷 备注 #3 <新备注>`（`rename`/`r`）：改备注（留空 = 清掉，改回显示会话标题）。 */
-	async function renameShortcut({ openid, replyContext, fromCard }, tokens) {
+	async function renameShortcut({ openid, replyContext, fromCard, page }, tokens) {
 		if (tokens.length < 2) {
 			await deps.reply({ openid, content: usageText('快捷'), replyContext })
 			return { handled: true }
@@ -858,14 +870,14 @@ export function createCommandRunner(deps) {
 		const resolved = resolveShortcut(openid, tokens, { headOnly: true })
 		if (!resolved || resolved.error) {
 			await deps.reply({ openid, content: shortcutMissText(openid, tokens[0]), markdown: true, replyContext })
-			await refreshShortcutCard({ openid, replyContext, fromCard })
+			await refreshShortcutCard({ openid, replyContext, fromCard, page })
 			return { handled: true }
 		}
 		const name = tokens.slice(1).join(' ').trim()
 		const bad = shortcutNameError(name)
 		if (bad) {
 			await deps.reply({ openid, content: `${bad}\n\n${usageText('快捷')}`, replyContext })
-			await refreshShortcutCard({ openid, replyContext, fromCard })
+			await refreshShortcutCard({ openid, replyContext, fromCard, page })
 			return { handled: true }
 		}
 		const clash = state
@@ -878,7 +890,7 @@ export function createCommandRunner(deps) {
 				markdown: true,
 				replyContext,
 			})
-			await refreshShortcutCard({ openid, replyContext, fromCard })
+			await refreshShortcutCard({ openid, replyContext, fromCard, page })
 			return { handled: true }
 		}
 		const updated = state.renameShortcut(openid, resolved.item.id, name)
@@ -891,7 +903,7 @@ export function createCommandRunner(deps) {
 			markdown: true,
 			replyContext,
 		})
-		await refreshShortcutCard({ openid, replyContext, fromCard })
+		await refreshShortcutCard({ openid, replyContext, fromCard, page })
 		return { handled: true }
 	}
 
@@ -902,14 +914,14 @@ export function createCommandRunner(deps) {
 	 *     **会打断**它正在跑的轮次）。
 	 * 目标可以是 `#编号`、备注、或**会话id**（`<目录> <会话id>` 也认）。
 	 */
-	async function goShortcut({ openid, replyContext, quote = '', fromCard }, parsed) {
+	async function goShortcut({ openid, replyContext, quote = '', fromCard, page }, parsed) {
 		const resolved = resolveShortcut(openid, parsed.tokens)
 		if (resolved?.error === 'no-such-id') {
 			await deps.reply({ openid, content: shortcutMissText(openid, `#${resolved.id}`), markdown: true, replyContext })
-			await refreshShortcutCard({ openid, replyContext, fromCard })
+			await refreshShortcutCard({ openid, replyContext, fromCard, page })
 			return { handled: true }
 		}
-		if (resolved) return aimAtSession({ openid, replyContext, quote, fromCard }, {
+		if (resolved) return aimAtSession({ openid, replyContext, quote, fromCard, page }, {
 			sessionId: resolved.item.sessionId,
 			rest: resolved.rest,
 			tag: `**#${resolved.item.id} ${shortcutLabel(resolved.item)}**`,
@@ -920,11 +932,11 @@ export function createCommandRunner(deps) {
 		const ref = sessions.resolveRef(parsed.tokens)
 		if (ref?.error) {
 			await deps.reply({ openid, content: `${ref.error}\n\n${usageText('快捷')}`, replyContext })
-			await refreshShortcutCard({ openid, replyContext, fromCard })
+			await refreshShortcutCard({ openid, replyContext, fromCard, page })
 			return { handled: true }
 		}
 		if (ref?.sessionId && ref.sessionId !== 'none') {
-			return aimAtSession({ openid, replyContext, quote, fromCard }, {
+			return aimAtSession({ openid, replyContext, quote, fromCard, page }, {
 				sessionId: ref.sessionId,
 				rest: String(ref.content ?? '').trim(),
 				tag: `**${sessions.label(ref.sessionId)}**`,
@@ -934,7 +946,7 @@ export function createCommandRunner(deps) {
 	}
 
 	/** 切过去 or 只投递：`rest` 为空就切换绑定，否则只投递（不切换）。 */
-	async function aimAtSession({ openid, replyContext, quote = '', fromCard }, { sessionId, rest, tag, cleanup = '' }) {
+	async function aimAtSession({ openid, replyContext, quote = '', fromCard, page }, { sessionId, rest, tag, cleanup = '' }) {
 		const session = sessions.get(sessionId)
 		if (!session) {
 			await deps.reply({
@@ -943,7 +955,7 @@ export function createCommandRunner(deps) {
 				markdown: true,
 				replyContext,
 			})
-			await refreshShortcutCard({ openid, replyContext, fromCard })
+			await refreshShortcutCard({ openid, replyContext, fromCard, page })
 			return { handled: true }
 		}
 		if (sessions.isArchived(sessionId)) {
@@ -953,7 +965,7 @@ export function createCommandRunner(deps) {
 				markdown: true,
 				replyContext,
 			})
-			await refreshShortcutCard({ openid, replyContext, fromCard })
+			await refreshShortcutCard({ openid, replyContext, fromCard, page })
 			return { handled: true }
 		}
 
@@ -966,7 +978,7 @@ export function createCommandRunner(deps) {
 				markdown: true,
 				replyContext,
 			})
-			await refreshShortcutCard({ openid, replyContext, fromCard })
+			await refreshShortcutCard({ openid, replyContext, fromCard, page })
 			return { handled: true }
 		}
 
@@ -984,7 +996,7 @@ export function createCommandRunner(deps) {
 			markdown: true,
 			replyContext,
 		})
-		await refreshShortcutCard({ openid, replyContext, fromCard })
+		await refreshShortcutCard({ openid, replyContext, fromCard, page })
 		return { handled: true }
 	}
 
