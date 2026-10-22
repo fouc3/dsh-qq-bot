@@ -1060,7 +1060,7 @@ test('快捷卡片：一条一个回调按钮（点一下直接切），末行�
 	for (const row of card.keyboard.content.rows) assert.ok(row.buttons.length <= 5)
 })
 
-test('快捷卡片：空列表只给「加当前会话」+ 引导；超上限只列前 N 条并说明用编号直达', () => {
+test('快捷卡片：空列表只给「加当前会话」+ 引导；超过一页就翻页（翻页在「加当前会话」两侧）', () => {
 	const empty = buildShortcutCard({ items: [], currentLabel: '' })
 	assert.match(empty.content, /还没有快捷会话/)
 	assert.deepEqual(
@@ -1069,14 +1069,53 @@ test('快捷卡片：空列表只给「加当前会话」+ 引导；超上限只
 	)
 	assert.match(empty.content, /`none`（未绑定）/)
 
-	const many = buildShortcutCard({
-		items: Array.from({ length: SHORTCUT_MAX_BUTTONS + 4 }, (_, i) => ({ id: i + 1, label: `项目 ${i + 1}`, current: false })),
+	// 用户要求（2026-10-18）：9 条放不下 → 翻页；末行是 `[上一页] 加当前会话 [下一页]`，
+	// 上一页/下一页只有真存在时才出现。
+	const nine = Array.from({ length: 9 }, (_, i) => ({ id: i + 1, label: `项目 ${i + 1}`, current: i === 0 }))
+	const page1 = buildShortcutCard({ items: nine, currentLabel: '', page: 1 })
+	assert.match(page1.content, /共 9 个 · 第 1\/2 页（每页 8 个）/)
+	assert.deepEqual(
+		page1.keyboard.content.rows.map((row) => row.buttons.map((b) => b.render_data.label)),
+		[
+			['#1 项目 1', '#2 项目 2'],
+			['#3 项目 3', '#4 项目 4'],
+			['#5 项目 5', '#6 项目 6'],
+			['#7 项目 7', '#8 项目 8'],
+			['加当前会话', '下一页'], // 第 1 页没有「上一页」
+		],
+	)
+	const page1Buttons = page1.keyboard.content.rows.flatMap((row) => row.buttons)
+	const nextButton = page1Buttons.at(-1)
+	assert.deepEqual(parseCallback(nextButton.action.data), { kind: 'shortcut', action: 'page', arg: '2' })
+
+	const page2 = buildShortcutCard({ items: nine, currentLabel: '', page: 2 })
+	assert.match(page2.content, /第 2\/2 页/)
+	assert.deepEqual(
+		page2.keyboard.content.rows.map((row) => row.buttons.map((b) => b.render_data.label)),
+		[
+			['#9 项目 9'],
+			['上一页', '加当前会话'], // 最后一页没有「下一页」
+		],
+	)
+	const page2Buttons = page2.keyboard.content.rows.flatMap((row) => row.buttons)
+	assert.deepEqual(parseCallback(page2Buttons.at(-2).action.data), { kind: 'shortcut', action: 'page', arg: '1' })
+	assert.deepEqual(parseCallback(page2Buttons.at(-1).action.data), { kind: 'shortcut', action: 'add', arg: '' })
+
+	// 正好一页（8 条）：末行只有「加当前会话」，两侧的翻页按钮都不出现
+	const exact = buildShortcutCard({
+		items: Array.from({ length: SHORTCUT_MAX_BUTTONS }, (_, i) => ({ id: i + 1, label: `项目 ${i + 1}`, current: false })),
 		currentLabel: '',
 	})
-	const buttons = many.keyboard.content.rows.flatMap((row) => row.buttons)
-	assert.equal(buttons.length, SHORTCUT_MAX_BUTTONS + 1, `${SHORTCUT_MAX_BUTTONS} 条 + 加按钮`)
-	assert.match(many.content, new RegExp(`按钮只放得下前 ${SHORTCUT_MAX_BUTTONS} 个`))
-	assert.ok(many.keyboard.content.rows.length <= 5)
-	assert.deepEqual(parseCallback(buttons.at(-1).action.data), { kind: 'shortcut', action: 'add', arg: '' })
+	assert.deepEqual(exact.keyboard.content.rows.at(-1).buttons.map((b) => b.render_data.label), ['加当前会话'])
+	assert.doesNotMatch(exact.content, /页/)
+
+	// 越界页码夹回合法范围（回调里 page 被改坏时不至于发一张空卡片）
+	const clamped = buildShortcutCard({ items: nine, currentLabel: '', page: 99 })
+	assert.match(clamped.content, /第 2\/2 页/)
+	assert.equal(clamped.keyboard.content.rows.length, 2)
+
+	// 平台硬限制：≤5 行、每行 ≤5 个；坏回调要当成坏数据
+	assert.ok(page1.keyboard.content.rows.length <= 5)
+	for (const row of page1.keyboard.content.rows) assert.ok(row.buttons.length <= 5)
 	assert.equal(parseCallback('qqb:sc'), null, '缺动作的回调要当成坏数据')
 })

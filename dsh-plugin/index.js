@@ -678,12 +678,14 @@ export function apply(ctx, rawConfig) {
 	}
 
 	/**
-	 * 快捷卡片：一条一个回调按钮（点一下**直接切过去**），末行是「加当前会话」。
+	 * 快捷卡片：一条一个回调按钮（点一下**直接切过去**），末行是
+	 * `[上一页] 加当前会话 [下一页]`（用户 2026-10-18 要求：超过一页就翻页，
+	 * 翻页按钮就在「加当前会话」左右两侧，没有上一页/下一页时不出现）。
 	 *
 	 * 和会话选择卡片的关键区别：那张卡片的会话按钮是**指令按钮**（只把命令填进输入框），
 	 * 这张是**回调按钮**（当场切）——"快捷"要的就是少点两下，再让用户自己发一次就白快捷了。
 	 */
-	async function showShortcutCard({ openid, replyContext = {} }) {
+	async function showShortcutCard({ openid, replyContext = {}, page = 1 }) {
 		const bound = state.bindingOf(openid)
 		const items = state.shortcutsOf(openid).map((item) => ({
 			id: item.id,
@@ -694,6 +696,7 @@ export function apply(ctx, rawConfig) {
 		const card = buildShortcutCard({
 			items,
 			currentLabel: bound && bound !== 'none' ? sessions.label(bound) : '',
+			page,
 		})
 		await io.sendCard({ openid, content: card.content, keyboard: card.keyboard, context: replyContext })
 		logger.info?.('已发快捷卡片', { count: items.length })
@@ -2085,16 +2088,22 @@ export function apply(ctx, rawConfig) {
 			await continueInterrupted({ openid, replyContext: ctxReply, sessionIds: [parsed.sessionId] })
 			code = 0
 		} else if (parsed.kind === 'shortcut') {
-			// 快捷卡片：go（点某条 = 直接切过去）/ add（把当前会话加进来）。
+			// 快捷卡片：go（点某条 = 直接切过去）/ add（把当前会话加进来）/ page（翻页，原地重发）。
 			// 语义全在 commands.js 里，这里只把按钮翻译成等价的命令文本，避免两套实现。
 			// `fromCard: true` 让命令侧做完把卡片重发一遍（标出新的「当前」）。
 			const ctxReply = { eventId: event.eventId, msgId: event.msgId ?? '' }
-			const tokens = parsed.action === 'add' ? ['加'] : [`#${parsed.arg}`]
-			await commands.run(
-				{ openid, replyContext: ctxReply, quote: '', fromCard: true },
-				{ name: '快捷', tokens, rest: tokens.join(' ') },
-			)
-			code = 0
+			if (parsed.action === 'page') {
+				// 翻页不是命令，直接重发那一页（和「运行中会话」的翻页同款做法）。
+				await showShortcutCard({ openid, page: Number(parsed.arg) || 1, replyContext: ctxReply })
+				code = 0
+			} else {
+				const tokens = parsed.action === 'add' ? ['加'] : [`#${parsed.arg}`]
+				await commands.run(
+					{ openid, replyContext: ctxReply, quote: '', fromCard: true },
+					{ name: '快捷', tokens, rest: tokens.join(' ') },
+				)
+				code = 0
+			}
 		} else if (parsed.kind === 'preset') {
 			// 角色预设卡片上的按钮：切成这个预设，并把卡片重发一遍（标出新的"当前"）。
 			// 被 dsh 的守卫拒绝（会话已开跑）时如实回绝 —— 与 Web 端把 refusal 显示出来一致。

@@ -735,37 +735,45 @@ export function buttonsPerRowFor(count, { preferred = 2, maxRows = KEYBOARD_MAX_
 
 // ── 快捷卡片 ─────────────────────────────────────────────────────────────
 //
-// 固定末尾留一行「加当前会话」，所以装得下的条数 =（5-1）行 × 每行 2 个 = 8。
-// 超出的条数不翻页、只在正文里说明"用 `快捷 #编号` 直达"：
-// 快捷本来就是"少点两下"，翻页反而比打字更麻烦。
+// 固定末尾留一行：`[上一页] 加当前会话 [下一页]`，所以装得下的条数 =（5-1）行 × 每行 2 个 = 8。
+// 用户要求（2026-10-18）：超过 8 条要**翻页**，翻页按钮放在「加当前会话」左右两侧
+// （左边「上一页」、右边「下一页」，只有真存在上一页/下一页时才出现）。
 
 /** 快捷按钮每行 2 个（`#编号 + 备注` 比目录名长，挤到 3 个就看不全了）。 */
 export const SHORTCUT_BUTTONS_PER_ROW = 2
 /** 快捷按钮 label 宽度上限（比默认宽：要让 `#3 K-Vault-Next` 这种完整显示）。 */
 export const SHORTCUT_LABEL_WIDTH_LIMIT = 24
-/** 卡片上最多列几个（剩下的用命令直达）。 */
+/** 一页最多列几个（4 行内容 × 2 个；第 5 行留给「上一页 / 加当前会话 / 下一页」）。 */
 export const SHORTCUT_MAX_BUTTONS = (KEYBOARD_MAX_ROWS - 1) * SHORTCUT_BUTTONS_PER_ROW
 
 /**
  * 快捷卡片：一条一个**回调按钮**（点一下**直接切过去**，不像会话选择卡片那样只填输入框）。
  *
+ * 翻页（用户要求 2026-10-18）：末行是 `[上一页] 加当前会话 [下一页]`——
+ * 只有真存在上一页/下一页时才出现对应按钮，单页时就是原来的「加当前会话」一行。
+ *
  * @param {object} input
  * @param {Array<{id:number, label:string, current:boolean}>} input.items 已排好序的条目
  * @param {string} [input.currentLabel] 当前绑定会话的显示名（没有就空）
+ * @param {number} [input.page] 第几页（1 起；越界自动夹到合法范围）
  */
-export function buildShortcutCard({ items = [], currentLabel = '' }) {
-	const shown = items.slice(0, SHORTCUT_MAX_BUTTONS)
+export function buildShortcutCard({ items = [], currentLabel = '', page = 1 }) {
+	const size = SHORTCUT_MAX_BUTTONS
+	const pages = Math.max(1, Math.ceil(items.length / size))
+	const current = Math.min(Math.max(1, Number(page) || 1), pages)
+	const shown = items.slice((current - 1) * size, current * size)
 	const lines = ['**快捷**', `> 当前会话：${currentLabel ? `\`${currentLabel}\`` : '`none`（未绑定）'}`]
 	if (items.length === 0) {
 		lines.push('', '还没有快捷会话。发 `快捷 加 [备注]` 把当前会话存成 `#1`（点下面的按钮也一样）。')
 	} else {
-		lines.push(`共 ${items.length} 个；编号**只增不重用**（删掉的不补位，\`#3\` 永远指同一个会话）。`)
+		lines.push(
+			pages > 1
+				? `共 ${items.length} 个 · 第 ${current}/${pages} 页（每页 ${size} 个）；编号**只增不重用**（删掉的不补位）。`
+				: `共 ${items.length} 个；编号**只增不重用**（删掉的不补位，\`#3\` 永远指同一个会话）。`,
+		)
 		lines.push('', '点按钮**直接切过去**；`快捷 #2 <消息>` 是**只投消息不切换**（会打断它正在跑的轮次）。')
 		lines.push('加：`快捷 加 [备注]` ｜ 删：`快捷 删 #2` ｜ 改名：`快捷 备注 #2 <新备注>`（也认 `add a` / `delete d` / `list l`）。')
 		lines.push('> 备注里不能有 `#`（那是编号专用），而且备注要唯一。')
-		if (items.length > shown.length) {
-			lines.push(`> 按钮只放得下前 ${shown.length} 个，其余的用 \`快捷 #编号\` 直达。`)
-		}
 	}
 
 	const buttons = shown.map((item) =>
@@ -778,15 +786,22 @@ export function buildShortcutCard({ items = [], currentLabel = '' }) {
 		}),
 	)
 	const rows = rowsOf(buttons, SHORTCUT_BUTTONS_PER_ROW)
-	rows.push({
-		buttons: [
-			callbackButton('加当前会话', data.shortcut('add'), {
-				style: BUTTON_STYLE.neutral,
-				visited: '已加入',
-				id: 'sc_add',
-			}),
-		],
-	})
+	// 末行：上一页（有才出现）｜ 加当前会话 ｜ 下一页（有才出现）
+	const lastRow = []
+	if (current > 1) {
+		lastRow.push(callbackButton('上一页', data.shortcut('page', current - 1), { style: BUTTON_STYLE.neutral, id: 'sc_prev' }))
+	}
+	lastRow.push(
+		callbackButton('加当前会话', data.shortcut('add'), {
+			style: BUTTON_STYLE.neutral,
+			visited: '已加入',
+			id: 'sc_add',
+		}),
+	)
+	if (current < pages) {
+		lastRow.push(callbackButton('下一页', data.shortcut('page', current + 1), { style: BUTTON_STYLE.neutral, id: 'sc_next' }))
+	}
+	rows.push({ buttons: lastRow })
 	return { content: lines.join('\n'), keyboard: keyboardOf(clampRows(rows)) }
 }
 

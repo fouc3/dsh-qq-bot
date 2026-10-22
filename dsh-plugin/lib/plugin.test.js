@@ -3289,3 +3289,65 @@ test('端到端：上次运行被打断 —— 启动发提醒；「全部继续
 	})
 	boot.dispose()
 })
+
+// 用户要求（2026-10-18）：快捷卡片超过 8 条要翻页，翻页按钮放在「加当前会话」左右两侧
+// （左「上一页」右「下一页」，不存在时不出现）。
+test('端到端：快捷卡片翻页 —— 9 条时第 1 页 8 个 + 「下一页」，点它重发第 2 页', async (t) => {
+	const sessions = Array.from({ length: 9 }, (_, i) => ({
+		sessionId: `session-${i + 1}`,
+		cwd: `/home/u/p${i + 1}`,
+		updatedAt: 20 - i,
+		running: false,
+	}))
+	const stateSeed = {
+		shortcuts: {
+			U1: {
+				seq: 9,
+				items: Array.from({ length: 9 }, (_, i) => ({
+					id: i + 1,
+					sessionId: `session-${i + 1}`,
+					name: `项目${i + 1}`,
+					at: '2026-10-18T00:00:00.000Z',
+				})),
+			},
+		},
+	}
+	const boot = bootPlugin(t, { sessions, stateSeed })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', {
+		openids: [{ openid: 'U1' }],
+		panel: { enabled: true, users: ['U1'] },
+		menu: { enabled: true },
+	})
+	await drainFor(boot.socketPath, 60)
+
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '快捷 列出', msgId: 'M1' })
+	const card1 = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 120)
+		return list.find((c) => c.kind === 'send_c2c' && /\*\*快捷\*\*/.test(String(c.args.content))) ?? null
+	})
+	assert.match(String(card1.args.content), /共 9 个 · 第 1\/2 页/)
+	const rows1 = card1.args.keyboard.content.rows
+	assert.equal(rows1.length, 5, '4 行条目 + 1 行底部（加当前会话/翻页）')
+	assert.deepEqual(rows1.at(-1).buttons.map((b) => b.render_data.label), ['加当前会话', '下一页'], '第 1 页不该有「上一页」')
+	const nextButton = rows1.at(-1).buttons.at(-1)
+	assert.equal(nextButton.action.data, 'qqb:sc:page:2')
+
+	// 点「下一页」→ 重发第 2 页（只剩 #9，底部变成「上一页 + 加当前会话」）
+	await rpc(boot.socketPath, 'event', {
+		kind: 'interaction',
+		openid: 'U1',
+		buttonData: nextButton.action.data,
+		eventId: 'INT-P',
+		msgId: 'CARD-S',
+	})
+	const card2 = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 120)
+		return list.find((c) => c.kind === 'send_c2c' && /第 2\/2 页/.test(String(c.args.content))) ?? null
+	})
+	const rows2 = card2.args.keyboard.content.rows
+	assert.deepEqual(rows2[0].buttons.map((b) => b.render_data.label), ['#9 项目9'])
+	assert.deepEqual(rows2.at(-1).buttons.map((b) => b.render_data.label), ['上一页', '加当前会话'], '最后一页不该有「下一页」')
+
+	boot.dispose()
+})
