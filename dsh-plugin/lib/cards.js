@@ -768,8 +768,8 @@ export function buildShortcutCard({ items = [], currentLabel = '', page = 1 }) {
 	} else {
 		lines.push(
 			pages > 1
-				? `共 ${items.length} 个 · 第 ${current}/${pages} 页（每页 ${size} 个）；编号**只增不重用**（删掉的不补位）。`
-				: `共 ${items.length} 个；编号**只增不重用**（删掉的不补位，\`#3\` 永远指同一个会话）。`,
+				? `共 ${items.length} 个 · 第 ${current}/${pages} 页（每页 ${size} 个）；编号**只增不重用**（删了不补位，要连号发 \`快捷 补位\`）。`
+				: `共 ${items.length} 个；编号**只增不重用**（删了不补位，\`#3\` 永远指同一个会话；要连号发 \`快捷 补位\`）。`,
 		)
 		lines.push('', '点按钮**直接切过去**；`快捷 #2 <消息>` 是**只投消息不切换**（会打断它正在跑的轮次）。')
 		lines.push('加：`快捷 加 [备注]` ｜ 删：`快捷 删 #2` ｜ 改名：`快捷 备注 #2 <新备注>`（也认 `add a` / `delete d` / `list l`）。')

@@ -375,6 +375,35 @@ export function createState({ file, logger, seed, debounceMs = 200 } = {}) {
 			return { ok: true, item: { ...item, sessionId } }
 		},
 		/** 改备注。找不到返回 null。 */
+		/**
+		 * **手动补位**：把编号按现有顺序压成 1..N 连号（`#1 #3 #7` → `#1 #2 #3`）。
+		 *
+		 * 编号默认"只增不重用"（删了不补位，`#3` 永远指同一个会话）—— 这保证旧记录不会指错人，
+		 * 但删多了会留下窟窿。用户要的就是"我自己决定什么时候压一次"（2026-10-18），
+		 * 所以补位做成**手动**命令、不自动跑；压完 `seq` 也降到 N，之后新加的从 N+1 继续。
+		 *
+		 * @returns {{changed:Array<{from:number,to:number}>, items:Array<object>}}
+		 */
+		renumberShortcuts(openid) {
+			const items = data.shortcuts?.[openid]?.items
+			if (!Array.isArray(items) || items.length === 0) return { changed: [], items: [] }
+			const changed = []
+			items.forEach((item, index) => {
+				const to = index + 1
+				const from = Number(item?.id)
+				if (Number.isFinite(from) && from !== to) changed.push({ from, to })
+			})
+			if (changed.length === 0) return { changed: [], items: items.map((item) => ({ ...item })) }
+			this.update((s) => {
+				const book = s.shortcuts?.[openid]
+				if (!book || !Array.isArray(book.items)) return
+				book.items.forEach((item, index) => {
+					item.id = index + 1
+				})
+				book.seq = book.items.length
+			})
+			return { changed, items: items.map((item) => ({ ...item })) }
+		},
 		renameShortcut(openid, id, name) {
 			let found = null
 			this.update((s) => {

@@ -597,6 +597,73 @@ test('快捷 改 #编号 不带会话id：当前没绑定会话就明确报错�
 	)
 })
 
+// 用户 2026-10-18：「新增补位命令，因为目前它是不补位的；补位命令就是手动执行补位，
+// 补位命令不出现在列表菜单」。
+test('快捷 补位：手动把编号压成 1..N 连号（指向与备注不动，seq 跟着降）', async () => {
+	const { runner, calls, state: s } = makeRunner({ seed: boundSeed() })
+	// 造窟窿：#1 #2 #3 依次加，然后删掉 #2
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 加 甲'))
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('切换会话 session-2'))
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 加 乙'))
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('切换会话 session-3'))
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 加 丙'))
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 删 #2'))
+	assert.deepEqual(
+		s.shortcutsOf('U1').map((item) => [item.id, item.sessionId, item.name]),
+		[
+			[1, 'session-1', '甲'],
+			[3, 'session-3', '丙'],
+		],
+		'删了不补位：#3 还在原来的编号上',
+	)
+
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 补位'))
+	assert.deepEqual(
+		s.shortcutsOf('U1').map((item) => [item.id, item.sessionId, item.name]),
+		[
+			[1, 'session-1', '甲'],
+			[2, 'session-3', '丙'],
+		],
+		'编号压成连号，指向与备注都不动',
+	)
+	const reply = calls.replies.at(-1).content
+	assert.match(reply, /已补位/)
+	assert.match(reply, /`#3` → `#2`/, '要告诉用户哪一条挪了')
+	assert.match(reply, /之后新加的从 `#3` 开始/)
+	assert.match(reply, /手动发一次/, '说明为什么要手动')
+
+	// 补完位后 `#2` 指的就是原来 #3（session-3），而不是被删掉的那条
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 #2'))
+	assert.equal(s.bindingOf('U1'), 'session-3', '补位后 #2 必须指向原来 #3 的那个会话')
+	// 新加的从 #3 继续（seq 已降到 2；换个还没存过的会话才叫"新加"）
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('切换会话 session-2'))
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 加 丁'))
+	assert.deepEqual(s.shortcutsOf('U1').map((item) => item.id), [1, 2, 3])
+
+	// 已经连号：再补一次是空操作，只回一句
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 补位'))
+	assert.match(calls.replies.at(-1).content, /已经是连号/)
+	// 英文别名也认（`pack` / `renumber`）
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 pack'))
+	assert.match(calls.replies.at(-1).content, /已经是连号/)
+
+	// 一条都没有：说清楚没法补，别静默
+	const empty = makeRunner({ seed: boundSeed() })
+	await empty.runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 补位'))
+	assert.match(empty.calls.replies.at(-1).content, /还没有快捷会话/)
+})
+
+// 「补位」是 `快捷` 的子命令，**不注册**进指令面板/自定义菜单（用户明确要求）。
+test('补位不出现在列表菜单（指令面板与自定义菜单里都没有它）', async () => {
+	const menuNames = menuItems().flatMap((item) => [item.name, ...(item.children ?? []).map((child) => child.name)])
+	assert.ok(!menuNames.includes('补位'), '自定义菜单里不该出现「补位」')
+	assert.deepEqual(
+		panelItems().map((item) => item.name).filter((name) => name === '补位'),
+		[],
+		'指令面板里也不该出现「补位」',
+	)
+})
+
 test('快捷：英文缩写与中文等价（add/a、delete/d、list/l、rename/r，大小写不敏感）', async () => {
 	const { runner, calls, state: s } = makeRunner({ seed: boundSeed() })
 	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('快捷 add 前端'))

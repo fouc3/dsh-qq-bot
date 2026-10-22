@@ -31,7 +31,7 @@ export const COMMANDS = [
 		purpose: '把常用会话存成快捷入口（每条自带 `#编号`，可配自定义备注）。',
 		usage: '快捷 #编号 [<消息>]',
 		usageAlt: '快捷 <会话id|备注> [<消息>]',
-		usageAlt2: '快捷 加 [备注] [会话id] | 改 #编号 [会话id] | 删 #编号 | 备注 #编号 <新备注> | 列出',
+		usageAlt2: '快捷 加 [备注] [会话id] | 改 #编号 [会话id] | 删 #编号 | 备注 #编号 <新备注> | 补位 | 列出',
 		// 通用排版（一段 `作用` + 一行 `用法：A 或 B 或 C`）在快捷这里读起来很乱（用户提过）：
 		// 它有三类动作、还叠着"带消息不切换"的细节，所以单独给一份**分节**的说明，
 		// 由 usageText() 原样返回（命令表仍是唯一来源）。
@@ -50,9 +50,10 @@ export const COMMANDS = [
 			'- `快捷 改 #2 <会话id>` 让 #2 **改指向**另一个会话（编号、备注都不动）',
 			'- `快捷 改 #2`（不写会话id）= 改到**当前会话**',
 			'- `快捷 删 #2` / `快捷 备注 #2 <新备注>`',
+			'- `快捷 补位` 把编号**手动**压成 1..N 连号（`#1 #3 #7` → `#1 #2 #3`）',
 			'',
-			'> 英文缩写：`add`/`a`、`delete`/`d`、`list`/`l`、`rename`/`r`、`set`/`retarget`',
-			'> 备注不能有 `#`、不能是纯数字、不能重名；编号**只增不重用**',
+			'> 英文缩写：`add`/`a`、`delete`/`d`、`list`/`l`、`rename`/`r`、`set`/`retarget`、`pack`/`renumber`',
+			'> 备注不能有 `#`、不能是纯数字、不能重名；编号**只增不重用**（删了不补位，要连号就 `快捷 补位`）',
 		].join('\n'),
 	},
 	{
@@ -461,6 +462,9 @@ export function createCommandRunner(deps) {
 	const SHORTCUT_DEL = new Set(['删', '删除', '移除', 'delete', 'del', 'd'])
 	const SHORTCUT_RENAME = new Set(['备注', '改名', '重命名', 'rename', 'r'])
 	const SHORTCUT_SET = new Set(['改', '改目标', '指向', 'retarget', 'set'])
+	// 「补位」：把编号压成 1..N 连号。**手动**执行（自动补位会毁掉"#3 永远指同一个会话"这条保证），
+	// 也不注册进指令面板/自定义菜单（用户 2026-10-18 要求"补位命令不出现在列表菜单"）。
+	const SHORTCUT_PACK = new Set(['补位', '压缩', '整理', 'renumber', 'pack', 'compact'])
 	const SHORTCUT_LIST = new Set(['列表', '列出', 'list', 'l', 'ls'])
 	const SHORTCUT_HELP = new Set(['帮助', '用法', 'help', 'h', '?'])
 
@@ -542,6 +546,7 @@ export function createCommandRunner(deps) {
 		if (SHORTCUT_DEL.has(word)) return dropShortcut(context, tokens.slice(1))
 		if (SHORTCUT_RENAME.has(word)) return renameShortcut(context, tokens.slice(1))
 		if (SHORTCUT_SET.has(word)) return retargetShortcut(context, tokens.slice(1))
+		if (SHORTCUT_PACK.has(word)) return packShortcuts(context)
 		return goShortcut(context, parsed)
 	}
 
@@ -793,6 +798,54 @@ export function createCommandRunner(deps) {
 			replyContext,
 		})
 		await refreshShortcutCard({ openid, replyContext, fromCard })
+		return { handled: true }
+	}
+
+	/**
+	 * `快捷 补位`（`renumber` / `pack` / `压缩`）：把编号按现有顺序压成 1..N 连号。
+	 *
+	 * 为什么是**手动**：编号默认"只增不重用"（删了不补位），这条保证让旧记录/口头约定不会指错人；
+	 * 但删多了会留窟窿，用户要的是"我自己决定什么时候压一次"（2026-10-18 要求）。
+	 * 这个子命令**不注册**进指令面板与自定义菜单（用户明确要求"不出现在列表菜单"）。
+	 */
+	async function packShortcuts({ openid, replyContext }) {
+		const before = state.shortcutsOf(openid)
+		if (before.length === 0) {
+			await deps.reply({
+				openid,
+				content: '还没有快捷会话，没得补位。发 `快捷 加 [备注]` 存一条。',
+				markdown: true,
+				replyContext,
+			})
+			return { handled: true }
+		}
+		const beforeIds = before.map((item) => Number(item.id))
+		const result = state.renumberShortcuts(openid)
+		if (!result.changed || result.changed.length === 0) {
+			await deps.reply({
+				openid,
+				content: `已经是连号了（${beforeIds.map((id) => `#${id}`).join(' ')}），不用补位。`,
+				markdown: true,
+				replyContext,
+			})
+			return { handled: true }
+		}
+		state.flush()
+		logger?.info?.('快捷：已补位', { before: beforeIds, after: result.items.map((item) => item.id) })
+		const lines = [
+			`已补位：${beforeIds.map((id) => `#${id}`).join(' ')} → ${result.items.map((item) => `#${item.id}`).join(' ')}（共 ${result.items.length} 条）`,
+			'',
+		]
+		for (const change of result.changed) {
+			const item = result.items.find((entry) => Number(entry.id) === Number(change.to))
+			lines.push(`- \`#${change.from}\` → \`#${change.to}\`${item ? `（${shortcutLabel(item)}）` : ''}`)
+		}
+		lines.push(
+			'',
+			`> 只改编号，指向的会话和备注都没动；之后新加的从 \`#${result.items.length + 1}\` 开始。`,
+			'> 编号默认"只增不重用"，所以补位要你手动发一次（不会自己跑）。',
+		)
+		await deps.reply({ openid, content: lines.join('\n'), markdown: true, replyContext })
 		return { handled: true }
 	}
 
