@@ -1251,6 +1251,8 @@ export function describeInboxItem(item) {
 			return `${head} · ⚠️ **无法识别**：平台没有给出转写文本，请先删除它再「发送」`
 		case 'oversize':
 			return `${head} · ⚠️ 未下载（${item.note || '超过自动下载上限'}）`
+		case 'no-url':
+			return `${head} · ⚠️ **拿不到内容**（平台没给下载地址，删掉它或换个方式给我）`
 		default:
 			return `${head} · ⚠️ 未下载（${item.note || '自动下载失败'}）`
 	}

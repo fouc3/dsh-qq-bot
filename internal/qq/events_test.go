@@ -188,16 +188,35 @@ func TestDecideC2CForwardsAttachments(t *testing.T) {
 		}
 	})
 
-	t.Run("没有下载地址的附件被丢掉，不产生空条目", func(t *testing.T) {
+	// 2026-10-22 用户报「md 文件发进输入态没反应」：QQ 单聊的文件消息可能只给文件名/大小、
+	// 不给下载直链。以前这种附件被整条丢掉 ⇒ 事件看起来"什么都没有" ⇒ 按空文本静默丢弃
+	// （日志只有 reason=空文本）。现在**保留**（url 为空），让插件如实告诉用户"拿不到内容"。
+	t.Run("没有下载地址但有元数据的附件：保留并转发（不再静默丢弃）", func(t *testing.T) {
 		got := DecideC2C(&qqbotsdk.C2CMessageCreateData{
-			ID: "M-NOURL", Content: "", MessageType: 7, Author: author,
-			Attachments: []qqbotsdk.MessageAttachment{{ContentType: qqbotsdk.AttachmentContentTypePNG}},
+			ID: "M-NOURL", Content: "", MessageType: 0, Author: author,
+			Attachments: []qqbotsdk.MessageAttachment{{ContentType: "file", Filename: "notes.md", Size: 2048}},
+		}, allowOne)
+		if !got.Forward {
+			t.Fatalf("带元数据的附件应当转发（reason=%q）", got.Reason)
+		}
+		if len(got.Event.Attachments) != 1 {
+			t.Fatalf("附件应被保留：%+v", got.Event.Attachments)
+		}
+		if got.Event.Attachments[0].Filename != "notes.md" || got.Event.Attachments[0].URL != "" {
+			t.Errorf("附件字段不对：%+v", got.Event.Attachments[0])
+		}
+	})
+
+	t.Run("连元数据都没有的空壳附件：仍然丢弃，且 reason 里带原始附件数", func(t *testing.T) {
+		got := DecideC2C(&qqbotsdk.C2CMessageCreateData{
+			ID: "M-EMPTY", Content: "", MessageType: 7, Author: author,
+			Attachments: []qqbotsdk.MessageAttachment{{}},
 		}, allowOne)
 		if got.Forward {
-			t.Fatal("没有可下载内容的附件消息不该转发")
+			t.Fatal("什么都没有的附件消息不该转发")
 		}
-		if !strings.Contains(got.Reason, "没有可读内容") {
-			t.Errorf("Reason = %q", got.Reason)
+		if !strings.Contains(got.Reason, "没有可读内容") || !strings.Contains(got.Reason, "原始附件=1") {
+			t.Errorf("Reason = %q（要能看出事件里到底有没有附件）", got.Reason)
 		}
 	})
 

@@ -98,6 +98,28 @@ test('输入态：文字累加成一条正文，清空与取消各归各位', ()
 	assert.equal(state.inboxOf('U1'), null)
 })
 
+// 用户 2026-10-22 报「发附件到发送指令的输入态没反应，这是一个 md 文件」。
+// 网关侧的根因是"没有下载地址的附件被整条丢掉"（已修）；插件侧也要如实报出来，
+// 而不是把它当成"已下载"静默带进消息。
+test('平台没给下载地址的附件：如实记成 no-url（不发请求、进"拿不到内容"清单）', async () => {
+	const { inbox, fetchImpl } = makeInbox({ routes: {} })
+	inbox.begin({ openid: 'U1', sessionId: 's-1' })
+	await inbox.addAttachments({
+		openid: 'U1',
+		attachments: [{ kind: 'file', contentType: 'file', filename: 'notes.md', size: 2048, url: '' }],
+	})
+	const items = inbox.active('U1').items
+	assert.equal(items.length, 1)
+	assert.equal(items[0].status, ATTACH_STATUS.noUrl, '不能当成已下载')
+	assert.match(items[0].note, /平台没给下载地址/)
+	assert.deepEqual(fetchImpl.calls, [], '没有地址就不该发下载请求')
+	assert.deepEqual(
+		inbox.unavailable(inbox.active('U1')).map((item) => item.id),
+		['A1'],
+		'发送时要把它列进"拿不到内容"',
+	)
+})
+
 test('附件入列：图片走图片服务、文件走文件服务、超限不下载、下载失败如实记录', async () => {
 	const { inbox, attachments, fetchImpl } = makeInbox({
 		config: { maxAttachmentBytes: 1000 },

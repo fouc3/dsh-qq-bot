@@ -31,6 +31,8 @@ export const ATTACH_STATUS = {
 	voice: 'voice',
 	/** 语音：平台没有给转写，**拦住发送**直到删除。 */
 	voiceUnrecognized: 'voice-unrecognized',
+	/** 平台**根本没给下载地址**（QQ 单聊的文件消息可能只给文件名/大小）—— 拿不到内容。 */
+	noUrl: 'no-url',
 }
 
 /** 正文总量上限：防止有人往输入态里灌一部长篇小说。 */
@@ -215,6 +217,15 @@ export function createInbox({ state, attachments, config = {}, logger, fetchImpl
 			item.note = item.asrText ? '' : '平台没有给出转写文本'
 			return item
 		}
+		if (!item.url) {
+			// 用户 2026-10-22 报：md 文件发进输入态"没反应"。平台对文件消息可能不给下载直链，
+			// 网关以前把这种附件整条丢掉（连提示都没有）。现在留一条明确的失败项：
+			// 卡片上写清「平台没给下载地址」，用户知道要换个方式（比如把文本直接贴过来）。
+			item.status = ATTACH_STATUS.noUrl
+			item.note = '平台没给下载地址（拿不到文件内容）'
+			logger?.warn?.('附件没有下载地址', { id, filename: item.filename, kind: item.kind })
+			return item
+		}
 		if (item.size && item.size > autoCap) {
 			item.status = ATTACH_STATUS.oversize
 			item.note = `${formatBytes(item.size)} 超过自动下载上限 ${formatBytes(autoCap)}`
@@ -279,7 +290,11 @@ export function createInbox({ state, attachments, config = {}, logger, fetchImpl
 
 	function unavailable(entry) {
 		return (entry?.items ?? []).filter(
-			(item) => item.status === ATTACH_STATUS.oversize || item.status === ATTACH_STATUS.failed,
+			(item) =>
+				item.status === ATTACH_STATUS.oversize ||
+				item.status === ATTACH_STATUS.failed ||
+				// 平台没给下载地址：也归到"未下载"，发送时要如实报出来（别假装带上了文件）
+				item.status === ATTACH_STATUS.noUrl,
 		)
 	}
 

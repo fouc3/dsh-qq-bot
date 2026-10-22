@@ -88,15 +88,22 @@ func attachmentKind(contentType string) string {
 	}
 }
 
-// attachmentsOf 把平台附件列表归一化；只有地址和内容类型都在的才转发
-// （没有下载地址的附件对插件毫无用处，留着只会让投递端多一类分支）。
+// attachmentsOf 把平台附件列表归一化。
+//
+// 用户 2026-10-22 报「md 文件发进输入态没反应」。根因就在以前这行 `url 为空就 continue`：
+// QQ 单聊的**文件**消息可能只给文件名/大小/内容类型、不给下载直链，于是整条被丢掉，
+// `DecideC2C` 再判定"什么都没有"→ 按空文本丢弃（日志只有 `reason=空文本`，完全看不出是附件）。
+// 现在：**只要还有文件名/大小/内容类型就保留**（url 留空），让插件如实回一句
+// 「平台没给下载地址」，而不是静默吞掉用户的文件。
 func attachmentsOf(raw []qqbotsdk.MessageAttachment) []Attachment {
 	if len(raw) == 0 {
 		return nil
 	}
 	out := make([]Attachment, 0, len(raw))
 	for _, item := range raw {
-		if strings.TrimSpace(item.URL) == "" {
+		url := strings.TrimSpace(item.URL)
+		if url == "" && strings.TrimSpace(item.Filename) == "" && item.Size <= 0 && strings.TrimSpace(item.ContentType) == "" {
+			// 连"这是什么"都说不出来的空壳：真的没东西可转
 			continue
 		}
 		out = append(out, Attachment{
@@ -104,7 +111,7 @@ func attachmentsOf(raw []qqbotsdk.MessageAttachment) []Attachment {
 			ContentType: item.ContentType,
 			Filename:    item.Filename,
 			Size:        item.Size,
-			URL:         item.URL,
+			URL:         url,
 			VoiceWavURL: item.VoiceWavURL,
 			ASRText:     strings.TrimSpace(item.ASRReferText),
 		})
@@ -255,10 +262,14 @@ func DecideC2C(data *qqbotsdk.C2CMessageCreateData, allowed func(string) bool) D
 	attachments := attachmentsOf(data.Attachments)
 	ark := arkOf(data.ArkData)
 	if text == "" && quote == "" && len(attachments) == 0 && ark == nil {
+		// 诊断信息要能一眼看出"事件里到底有没有东西"：只看 reason=空文本 完全没法排查
+		// （2026-10-22 那个"md 文件没反应"就是因为这里没写原始附件数）。
+		detail := fmt.Sprintf("message_type=%d, content=%d字, 原始附件=%d, 可用附件=%d, ark=%t",
+			data.MessageType, len([]rune(text)), len(data.Attachments), len(attachments), data.ArkData != nil)
 		if data.MessageType != qqbotsdk.EventMsgTypeText {
-			return Decision{OpenID: openid, Reason: fmt.Sprintf("非文本消息且没有可读内容（message_type=%d, attachments=%d）", data.MessageType, len(data.Attachments))}
+			return Decision{OpenID: openid, Reason: fmt.Sprintf("非文本消息且没有可读内容（%s）", detail)}
 		}
-		return Decision{OpenID: openid, Reason: "空文本"}
+		return Decision{OpenID: openid, Reason: fmt.Sprintf("空文本（%s）", detail)}
 	}
 	return Decision{
 		Forward: true,
@@ -357,6 +368,14 @@ func RegisterHandlers(reg Registrar, client *Client, allowed func(string) bool, 
 		if !d.Forward {
 			logDrop(log, "丢弃私聊消息（不在白名单）", d)
 			return nil
+		}
+		// 附件没有下载地址时留一条明确日志（插件只能回"拿不到"，但运维要看得出是平台没给 url）。
+		for _, att := range d.Event.Attachments {
+			if att.URL == "" {
+				log.Warn("附件没有下载地址（平台没给 url）",
+					"filename", att.Filename, "kind", att.Kind, "content_type", att.ContentType,
+					"size", att.Size, "openid", RedactOpenID(d.Event.OpenID))
+			}
 		}
 		return emitWithRetry(ctx, emit, d.Event, log)
 	}
