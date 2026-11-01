@@ -140,6 +140,17 @@ export const COMMANDS = [
 		usage: '角色预设',
 		usageAlt: '角色预设 <名字|序号>             # 直接切（默认当前会话）',
 	},
+	{
+		name: '加载会话',
+		desc: '把会话加载进内存（无参=当前会话）',
+		hiddenInMenu: true,
+		purpose:
+			'把某个会话**强制加载**进内存（走 dsh 自己恢复冷会话那条路：`sessionController.resolveAgent`，' +
+			'带上该会话存着的**模型与角色预设**）。**不跑轮次、不发消息、不花 token**——只是让 "没有活跃的 agent" ' +
+			'变成"空闲"，之后 `状态` 就能读到它的动作与输出。不带参数时作用于**当前绑定会话**。',
+		usage: '加载会话',
+		usageAlt: '加载会话 <会话id>              # 加载指定会话',
+	},
 ]
 
 const BY_NAME = new Map(COMMANDS.map((cmd) => [cmd.name, cmd]))
@@ -246,6 +257,10 @@ export function menuItems() {
 	}).filter(Boolean)
 
 	for (const cmd of COMMANDS) {
+		// `hiddenInMenu: true` 的命令**不进底部自定义菜单**（仍可用打字/指令面板触发）：
+		// 底部菜单顶层硬上限 10 项、二级每组 5 项，早已占满（7 平铺 + 管理 + 2 个 dsh 子菜单），
+		// 再平铺一条会把 dsh 命令子菜单挤掉。这种"低频但要有"的命令就先只给面板+打字。
+		if (cmd.hiddenInMenu) continue
 		if (!mentioned.has(cmd.name)) items.push({ name: cmd.name, sendMessage: cmd.name })
 	}
 	return items
@@ -266,6 +281,7 @@ export function menuItems() {
  *   @param {(sessionId:string)=>Promise<{ok:boolean, reason?:string}>} deps.archiveSession
  *   @param {(req:object)=>Promise<void>} deps.showModelCard 发/刷新模型选择卡片（提供商列表）
  *   @param {(req:object)=>Promise<{ok:boolean, text?:string, error?:string}|null>} deps.setModel 切某个会话的模型
+ *   @param {(sessionId:string)=>Promise<{ok:boolean, error?:string}>} deps.loadSession 把会话加载进内存
  */
 export function createCommandRunner(deps) {
 	const { sessions, state, logger } = deps
@@ -307,6 +323,8 @@ export function createCommandRunner(deps) {
 				return modelMode(context, parsed)
 			case '角色预设':
 				return presetMode(context, parsed)
+			case '加载会话':
+				return loadSession(context, parsed)
 			default:
 				return { handled: false }
 		}
@@ -377,13 +395,65 @@ export function createCommandRunner(deps) {
 		return { handled: true }
 	}
 
+	/**
+	 * 加载会话：把会话**强制加载**进内存（`sessionController.resolveAgent`），
+	 * 不跑轮次、不发消息、不花 token。无参 = 当前绑定会话。
+	 *
+	 * 与 `状态` 的区别：`状态` 只读（冷会话就显示"没有活跃的 agent"）；本命令会真的把它唤醒，
+	 * 之后 `状态` 才能读到它的动作/输出（显示"空闲"）。
+	 */
+	async function loadSession({ openid, replyContext }, parsed) {
+		let sessionId = ''
+		if (parsed.tokens.length === 0) {
+			const bound = state.bindingOf(openid)
+			if (!bound || bound === 'none') {
+				await deps.reply({
+					openid,
+					content: '当前没有绑定会话。用 `加载会话 <会话id>` 可以直接加载某个会话。',
+					markdown: true,
+					replyContext,
+				})
+				return { handled: true }
+			}
+			sessionId = bound
+		} else {
+			const target = sessions.resolveRef(parsed.tokens)
+			if (target?.error) {
+				await deps.reply({ openid, content: `${target.error}\n\n${usageText('加载会话')}`, replyContext })
+				return { handled: true }
+			}
+			if (!target || !target.sessionId || target.sessionId === 'none') {
+				await deps.reply({ openid, content: usageText('加载会话'), replyContext })
+				return { handled: true }
+			}
+			sessionId = target.sessionId
+		}
+
+		const result = (await deps.loadSession(sessionId)) ?? { ok: false, error: '加载失败（无返回）' }
+		if (!result.ok) {
+			await deps.reply({
+				openid,
+				content: `加载 **${sessions.describe(sessionId)}** 失败：${result.error ?? '未知错误'}\n\n${usageText('加载会话')}`,
+				markdown: true,
+				replyContext,
+			})
+			return { handled: true }
+		}
+		await deps.reply({
+			openid,
+			content: `已加载 **${sessions.describe(sessionId)}**（会话在内存里了，现在是"空闲"）\n> 它没在跑、也没发消息；之后发 \`状态\` 就能读到它的动作与输出。`,
+			markdown: true,
+			replyContext,
+		})
+		return { handled: true }
+	}
+
 	async function switchSession({ openid, replyContext }, parsed) {
 		if (parsed.tokens.length === 0) {
 			// 不带参数 = 会话选择命令
 			await deps.showSessionCard({ openid, replyContext })
 			return { handled: true }
-		}
-		const target = sessions.resolveRef(parsed.tokens)
+		}		const target = sessions.resolveRef(parsed.tokens)
 		if (target?.error) {
 			await deps.reply({ openid, content: `${target.error}\n\n${usageText('切换会话')}`, replyContext })
 			return { handled: true }

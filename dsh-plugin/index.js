@@ -1612,6 +1612,21 @@ export function apply(ctx, rawConfig) {
 			const snapshot = agent ? snapshotProgress(agent) : null
 			return { content: renderProgress({ label, snapshot, sessionId, model, permission, stats }) }
 		},
+		// 「加载会话」：走 dsh 自己的冷会话恢复入口（`agentFor` → `resolveAgent`），
+		// 只把会话拉进内存（带模型与预设），**不跑轮次、不发消息、不花 token**。
+		// 返回 {ok, error}；失败时把 resolveAgent 给的原因如实带回（会话不存在/被占用等）。
+		loadSession: async (sessionId) => {
+			try {
+				const before = ctx.agents.get(sessionId)
+				const agent = await agentFor(sessionId)
+				if (!agent) {
+					return { ok: false, error: '会话控制器没能给出 agent（会话不存在、已被归档，或被别的进程占用）' }
+				}
+				return { ok: true, already: Boolean(before) }
+			} catch (error) {
+				return { ok: false, error: describeError(error) }
+			}
+		},
 		deliver: ({ sessionId, openid, text, interrupt, interruptHinted = false, startHinted = false }) =>
 			deliver({ sessionId, openid, text, interrupt, interruptHinted, startHinted, origin: 'qq', context: {} }),
 		stopSession: async (sessionId) => {

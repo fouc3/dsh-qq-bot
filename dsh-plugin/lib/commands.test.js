@@ -37,12 +37,13 @@ function makeSessions() {
 	}
 }
 
-function makeRunner({ seed = {}, modelResult = { ok: true, text: '**DeepSeek / DeepSeek Chat**' } } = {}) {
+function makeRunner({ seed = {}, modelResult = { ok: true, text: '**DeepSeek / DeepSeek Chat**' }, loadResult = { ok: true } } = {}) {
 	const calls = {
 		replies: [],
 		delivered: [],
 		stopped: [],
 		archived: [],
+		loaded: [],
 		cards: [],
 		inputs: [],
 		modelCards: [],
@@ -85,6 +86,10 @@ function makeRunner({ seed = {}, modelResult = { ok: true, text: '**DeepSeek / D
 			calls.archived.push(sessionId)
 			return { ok: true }
 		},
+		loadSession: async (sessionId) => {
+			calls.loaded.push(sessionId)
+			return loadResult
+		},
 	})
 	return { runner, calls, state }
 }
@@ -120,7 +125,7 @@ test('需要参数的命令无参时回作用与用法', () => {
 
 test('面板条目与菜单条目都由同一张命令表派生', () => {
 	const items = panelItems()
-	assert.equal(items.length, 12)
+	assert.equal(items.length, 13)
 	assert.deepEqual(items.map((i) => i.name), [
 		'切换会话',
 		'运行中会话',
@@ -134,8 +139,9 @@ test('面板条目与菜单条目都由同一张命令表派生', () => {
 		'权限',
 		'模型',
 		'角色预设',
+		'加载会话',
 	])
-	assert.equal(items.at(-1).desc, '看/切角色预设（生存/冒险…）')
+	assert.equal(items.at(-1).desc, '把会话加载进内存（无参=当前会话）')
 
 	// 自定义菜单：顶层仍只有 8 项（7 个平铺 + 1 个「管理」二级菜单）——
 	// 平台顶层最多 10，得给 dsh 命令的二级菜单留位，所以新命令进「管理」。
@@ -151,12 +157,16 @@ test('面板条目与菜单条目都由同一张命令表派生', () => {
 		manage.children.map((it) => it.sendMessage),
 		['停止', '归档', '权限', '运行中会话', '角色预设'],
 	)
-	// 每条命令都还在菜单里（平铺或二级菜单），不能因为收编而消失
+	// 除 `hiddenInMenu`（底部菜单放不下、只在面板+打字可用）的命令外，
+	// 每条命令都得在菜单里出现（平铺或二级菜单），不能因为收编而消失。
 	const shown = new Set([
 		...menu.filter((it) => it.type !== 'menu').map((it) => it.name),
 		...manage.children.map((it) => it.name),
 	])
-	assert.deepEqual([...shown].sort(), items.map((i) => i.name).sort())
+	const expectInMenu = items.map((i) => i.name).filter((name) => name !== '加载会话')
+	assert.deepEqual([...shown].sort(), expectInMenu.sort())
+	// `加载会话` 明确不进底部菜单（顶层/二级都已满）
+	assert.ok(!shown.has('加载会话'))
 })
 
 // 用户要求（2026-10-16）：新增 `运行中会话`（无参发卡片；带会话id 直接切）。
@@ -333,6 +343,40 @@ test('未绑定会话时停止/归档会提示', async () => {
 	await runner.run({ openid: 'U9', replyContext: {} }, parseCommand('停止'))
 	assert.match(calls.replies.at(-1).content, /当前没有绑定会话/)
 	assert.equal(calls.stopped.length, 0)
+})
+
+test('加载会话：无参加载当前绑定会话；带会话id 加载指定会话；未绑定提示；目标不存在报错', async () => {
+	const { runner, calls } = makeRunner({ seed: boundSeed() })
+
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('加载会话'))
+	assert.deepEqual(calls.loaded, ['session-1'])
+	assert.match(calls.replies.at(-1).content, /已加载/)
+	assert.match(calls.replies.at(-1).content, /空闲/)
+
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('加载会话 session-2'))
+	assert.deepEqual(calls.loaded, ['session-1', 'session-2'])
+
+	// 未绑定会话、也没给 id：提示用 `加载会话 <会话id>`
+	const noBind = makeRunner()
+	await noBind.runner.run({ openid: 'U9', replyContext: {} }, parseCommand('加载会话'))
+	assert.match(noBind.calls.replies.at(-1).content, /当前没有绑定会话/)
+	assert.equal(noBind.calls.loaded.length, 0)
+
+	// 认不出的会话 id：明确报错 + 用法，不误调 loadSession
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('加载会话 session-nope'))
+	assert.equal(calls.loaded.length, 2)
+	assert.match(calls.replies.at(-1).content, /没找到会话|目录/)
+})
+
+test('加载会话失败时如实回报原因', async () => {
+	const { runner, calls } = makeRunner({
+		seed: boundSeed(),
+		loadResult: { ok: false, error: '会话不存在、已被归档，或被别的进程占用' },
+	})
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('加载会话'))
+	assert.deepEqual(calls.loaded, ['session-1'])
+	assert.match(calls.replies.at(-1).content, /加载.*失败/)
+	assert.match(calls.replies.at(-1).content, /被别的进程占用/)
 })
 
 test('模型：不带参数发提供商卡片；带参数直接切；末尾可选会话id（默认当前会话）', async () => {
