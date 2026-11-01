@@ -1031,6 +1031,70 @@ export function buildModelConfirmCard({ group, model, label = '' }) {
 }
 
 /**
+ * 模型卡片 2.5 级：**思考等级**卡片（用户要求：有推理档位的模型，选完模型后要再选一次思考等级）。
+ *
+ * 只在模型 `reasoning.efforts` 非空时出现（`模型` 卡片流程里由 index.js 决定跳不跳这一步）：
+ *   - 每一档一个**交互式**回调按钮（`data.model('effort', '<provider>:<model>:<effortId>')`）；
+ *   - 默认档（`defaultEffort`）与当前档（`current` 命中的那个）在正文标出来；
+ *   - 「返回」回该提供商的模型列表（不改任何东西）。
+ *
+ * 点一档 = 立刻把「这个模型 + 这一档」应用到刚才选中的目标（当前会话），
+ * 走的是和确认卡片「应用到当前会话」同一条落地路径（见 index.js）。
+ *
+ * @param {object} input
+ * @param {{id:string,name:string}} input.group
+ * @param {{id:string,name:string,description?:string,reasoning?:{efforts:Array,defaultEffort?:string}}} input.model
+ * @param {{provider:string,model:string,reasoningEffort?:string}|null} [input.current] 当前生效（用来标"当前"）
+ * @param {string} [input.label] 当前会话显示名
+ */
+export function buildModelReasoningCard({ group, model, current = null, label = '' }) {
+	const efforts = model?.reasoning?.efforts ?? []
+	const defaultEffort = model?.reasoning?.defaultEffort ?? ''
+	// "当前档"：只有当这个会话现在用的就是本卡片这个模型时才算，否则不标（免得标错）。
+	const currentEffort =
+		current?.provider === group?.id && current?.model === model?.id
+			? String(current?.reasoningEffort ?? '').trim()
+			: ''
+
+	const lines = [
+		'**模型 · 思考等级**',
+		`> 会话：${label || '（当前会话）'}`,
+		`> 模型：**${group?.name ?? ''} / ${model?.name ?? ''}**（\`${group?.id}/${model?.id}\`）`,
+		'',
+		'选一档**思考等级**（推理强度）：',
+	]
+	for (const effort of efforts) {
+		const marks = []
+		if (effort.id === defaultEffort) marks.push('默认')
+		if (effort.id === currentEffort) marks.push('当前')
+		const tail = marks.length > 0 ? `（${marks.join(' · ')}）` : ''
+		lines.push(`- **${effort.name}**${tail}${effort.description ? ` — ${effort.description}` : ''}`)
+	}
+	lines.push('', '> 点一档就应用到上面这个会话；只想换模型不设档位，点「返回」。')
+
+	const rows = rowsOf(
+		efforts.map((effort) =>
+			callbackButton(effort.name, data.model('effort', `${group.id}:${model.id}:${effort.id}`), {
+				style: effort.id === currentEffort ? BUTTON_STYLE.primary : BUTTON_STYLE.neutral,
+				visited: effort.id === currentEffort ? '当前' : effort.name,
+				labelLimit: MODEL_ACTION_LABEL_WIDTH_LIMIT,
+				id: `cb_effort_${effort.id}`,
+			}),
+		),
+		2,
+	)
+	rows.push({
+		buttons: [
+			callbackButton('返回', data.model('back', group.id), {
+				style: BUTTON_STYLE.neutral,
+				id: 'cb_effort_back',
+			}),
+		],
+	})
+	return { content: lines.join('\n'), keyboard: keyboardOf(clampRows(rows)) }
+}
+
+/**
  * 「切到其他会话」之后那张"等会话id"的提示卡片：自带一个明确的「取消」。
  *
  * @param {object} input

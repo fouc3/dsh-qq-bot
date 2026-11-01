@@ -39,6 +39,7 @@ import {
 	buildModelConfirmCard,
 	buildModelListCard,
 	buildModelProviderCard,
+	buildModelReasoningCard,
 	buildModelSessionPromptCard,
 	buildPermissionCard,
 	buildPresetCard,
@@ -394,6 +395,32 @@ export function apply(ctx, rawConfig) {
 	}
 
 	/**
+	 * 模型卡片 2.5 级：**思考等级**卡片（用户要求：有推理档位的模型，选完模型后要再选一次思考等级）。
+	 *
+	 * 只在模型带 `reasoning.efforts` 时才会走到这里（由 pick 分支判断）。
+	 */
+	async function showModelReasoningCard({ openid, sessionId, providerId, modelId, replyContext = {} }) {
+		const found = await lookupModel(providerId, modelId)
+		if (found.error) {
+			await sendText({ openid, content: found.error, markdown: true, context: replyContext })
+			return null
+		}
+		if (!found.model.reasoning?.efforts?.length) {
+			// 兜底：走到这里说明模型实际不带宽档位（目录变了）。退回确认卡片。
+			return showModelConfirmCard({ openid, sessionId, providerId, modelId, replyContext })
+		}
+		const current = await models.current(sessionId)
+		const card = buildModelReasoningCard({
+			group: found.group,
+			model: found.model,
+			current,
+			label: sessions.get(sessionId) ? sessions.label(sessionId) : sessionId,
+		})
+		await io.sendCard({ openid, content: card.content, keyboard: card.keyboard, context: replyContext })
+		return card
+	}
+
+	/**
 	 * 「切到其他会话」：进"等会话id"状态并发一张提示卡片（自带「取消」）。
 	 *
 	 * 用户明确要求这里是**交互式**的（而不是"把命令填进输入框"）：
@@ -430,14 +457,20 @@ export function apply(ctx, rawConfig) {
 
 	/**
 	 * 把某个会话的模型切成 spec（`提供商/模型名字`）指定的那一档。
+	 * @param {object} input
+	 * @param {string} [input.reasoningEffort] 可选的思考档位（有档位的模型才会带）；缺省 = 不用档位
 	 * @returns {Promise<{ok:boolean, text?:string, error?:string}|null>}
 	 */
-	async function setModelForSession({ openid, sessionId, spec }) {
+	async function setModelForSession({ openid, sessionId, spec, reasoningEffort = '' }) {
 		const catalog = await models.catalog()
 		if (!catalog.ok) return { ok: false, error: catalog.error }
 		const resolved = models.resolveToken(spec, catalog.groups)
 		if (!resolved.ok) return { ok: false, error: resolved.error }
-		const result = await models.set(sessionId, { provider: resolved.group.id, model: resolved.model.id })
+		const result = await models.set(sessionId, {
+			provider: resolved.group.id,
+			model: resolved.model.id,
+			reasoningEffort: String(reasoningEffort ?? '').trim(),
+		})
 		if (!result.ok) return result
 		return { ok: true, value: `${resolved.group.id}/${resolved.model.id}`, text: models.describe(resolved.group, resolved.model) }
 	}	/**
@@ -2014,10 +2047,48 @@ export function apply(ctx, rawConfig) {
 				})
 				code = 0
 			} else if (parsed.action === 'pick') {
-				// 点模型**不立刻切**：先给确认卡片（应用到当前会话 / 切到其他会话 / 返回）。
+				// 点模型**不立刻切**：
+				//  - 模型带推理档位 → 先给「思考等级」卡片（用户要求，多一步）；
+				//  - 否则 → 确认卡片（应用到当前会话 / 切到其他会话 / 返回）。
 				const [providerId, modelId] = splitOnce(parsed.arg)
-				await showModelConfirmCard({ openid, sessionId: bound, providerId, modelId, replyContext: ctxReply })
-				code = 0
+				const found = await lookupModel(providerId, modelId)
+				if (found.error) {
+					await sendText({ openid, content: found.error, markdown: true, context: ctxReply })
+					code = 1
+				} else if (found.model.reasoning?.efforts?.length) {
+					await showModelReasoningCard({ openid, sessionId: bound, providerId, modelId, replyContext: ctxReply })
+					code = 0
+				} else {
+					await showModelConfirmCard({ openid, sessionId: bound, providerId, modelId, replyContext: ctxReply })
+					code = 0
+				}
+			} else if (parsed.action === 'effort') {
+				// 思考等级卡片上点了一档：arg = `provider:model:effortId`（档位 id 里没有冒号）。
+				// 从**右边**切出档位，再切出 provider/model（provider/model 里可能带冒号）。
+				const rest = String(parsed.arg ?? '')
+				const lastColon = rest.lastIndexOf(':')
+				const target = lastColon < 0 ? rest : rest.slice(0, lastColon)
+				const effortId = lastColon < 0 ? '' : rest.slice(lastColon + 1)
+				const [providerId, modelId] = splitOnce(target)
+				const result = await setModelForSession({
+					openid,
+					sessionId: bound,
+					spec: `${providerId}/${modelId}`,
+					reasoningEffort: effortId,
+				})
+				if (!result?.ok) {
+					await sendText({ openid, content: result?.error ?? '切换模型失败。', markdown: true, context: ctxReply })
+					code = 1
+				} else {
+					await showModelListCard({
+						openid,
+						sessionId: bound,
+						providerId,
+						chosen: { provider: providerId, model: modelId },
+						replyContext: ctxReply,
+					})
+					code = 0
+				}
 			} else if (parsed.action === 'apply') {
 				// 确认卡片上的「应用到当前会话」：切完把模型列表卡片重发一遍（标出新当前 + ✅）。
 				const [providerId, modelId] = splitOnce(parsed.arg)

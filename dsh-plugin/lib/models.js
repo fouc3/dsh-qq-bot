@@ -3,8 +3,9 @@
  *
  * 对应 dsh Web 里那个模型选择器（`/model` 弹窗与输入框旁那个座位）：
  *   服务是 `ctx.sessionController`（`@deepseek-ai/dsh-api-session-controller`）：
- *   - `modelCatalog()` → `{ default, routableProviders, groups: [{id,name,models:[{id,name,description?}]}], failures }`
+ *   - `modelCatalog()` → `{ default, routableProviders, groups: [{id,name,models:[{id,name,description?,reasoning?}]}], failures }`
  *     —— 只列出**当前可路由**的提供商与模型；某个提供商查失败会单独进 `failures`；
+ *        支持推理档位的模型带 `reasoning: { efforts:[{id,name,description?}], defaultEffort? }`；
  *   - `selectModel({ sessionId, provider, model, reasoningEffort? })` → `{ selected }`
  *     —— 注释里写明"会显式 resume 该会话"，所以冷会话也能切（不用先启动 agent）；
  *   - `projections({ sessionId })` → `{ asOfSeq, values: { 'model/selection': { lastUsed, pending } } }`
@@ -25,6 +26,38 @@ function normalizeToken(token) {
 /** 更松的归一化：连 `-` `.` `_` 一起去掉（"gpt-5.2" ≈ "gpt52"）。 */
 function looseToken(token) {
 	return normalizeToken(token).replace(/[^a-z0-9\u4e00-\u9fa5]/g, '')
+}
+
+/**
+ * 归一化一个模型声明的思考档位（`ModelReasoning`）。
+ *
+ * 形状（dsh 的 `ModelCatalogModel.reasoning`）：
+ *   `{ efforts: [{ id, name, description? }], defaultEffort? }`
+ *
+ * 规则：
+ *   - 没有 `reasoning`（或缺 `efforts` / 空数组）→ `null`，表示"这个模型不能选思考等级"，
+ *     卡片就**不**多出这一步（用户只在能选时才看到选）；
+ *   - 有档位就逐项保留 `id/name/description`，`defaultEffort` 只在确实落在档位里才带上
+ *     （否则上游给的默认值和列表对不上，当作没给）。
+ *
+ * 注：只有一档 `off` 的模型也照实返回 —— 语义是"只能关思考"，让用户明确选一次 Off，
+ * 而不是猜。这不影响"没有档位 = 不显示"的判定（后者是 `reasoning` 整个缺失）。
+ */
+export function normalizeReasoning(reasoning) {
+	if (!reasoning || typeof reasoning !== 'object') return null
+	const efforts = Array.isArray(reasoning.efforts)
+		? reasoning.efforts
+				.filter((effort) => effort && typeof effort.id === 'string' && effort.id.trim())
+				.map((effort) => ({
+					id: effort.id.trim(),
+					name: typeof effort.name === 'string' && effort.name.trim() ? effort.name.trim() : effort.id.trim(),
+					description: typeof effort.description === 'string' ? effort.description : '',
+				}))
+		: []
+	if (efforts.length === 0) return null
+	const wanted = typeof reasoning.defaultEffort === 'string' ? reasoning.defaultEffort.trim() : ''
+	const defaultEffort = wanted && efforts.some((effort) => effort.id === wanted) ? wanted : ''
+	return { efforts, defaultEffort }
 }
 
 /** 把 `a:b:c` 按第一个冒号切成两段（模型选择卡片的回调 data 用）。 */
@@ -118,6 +151,8 @@ export function createModels({ ctx, logger }) {
 									id: model.id,
 									name: typeof model.name === 'string' && model.name ? model.name : model.id,
 									description: typeof model.description === 'string' ? model.description : '',
+									// 适配器声明的思考档位，没有就是 null（卡片据此决定要不要多出「思考等级」这一步）。
+									reasoning: normalizeReasoning(model.reasoning),
 								})),
 						}))
 						.filter((group) => group.models.length > 0)
@@ -140,7 +175,7 @@ export function createModels({ ctx, logger }) {
 
 	/**
 	 * 某个会话当前生效的模型（pending 优先，其次 lastUsed）。
-	 * @returns {Promise<{provider:string, model:string}|null>}
+	 * @returns {Promise<{provider:string, model:string, reasoningEffort?:string}|null>}
 	 */
 	async function current(sessionId) {
 		if (!sessionId || typeof service()?.projections !== 'function') return null
@@ -149,7 +184,12 @@ export function createModels({ ctx, logger }) {
 			const value = baseline?.values?.['model/selection']
 			const selection = value?.pending ?? value?.lastUsed ?? null
 			if (!selection || typeof selection.provider !== 'string' || typeof selection.model !== 'string') return null
-			return { provider: selection.provider, model: selection.model }
+			const reasoningEffort =
+				typeof selection.reasoningEffort === 'string' ? selection.reasoningEffort.trim() : ''
+			// 只有在真的选了档位时才带上这个字段（空档位不塞进去，免得到处多一个空串）。
+			return reasoningEffort
+				? { provider: selection.provider, model: selection.model, reasoningEffort }
+				: { provider: selection.provider, model: selection.model }
 		} catch (error) {
 			// 读不到就只是"卡片上不标当前"，不该让整个面板失败。
 			logger?.debug?.('读取会话模型失败（忽略）', { sessionId, error: String(error) })
@@ -288,20 +328,26 @@ export function createModels({ ctx, logger }) {
 	}
 
 	/**
-	 * 把某个会话的模型切到 {provider, model}。
+	 * 把某个会话的模型切到 {provider, model, reasoningEffort?}。
 	 * @returns {Promise<{ok:true, selected:object}|{ok:false, error:string}>}
 	 */
 	async function set(sessionId, selection) {
 		if (!available()) return { ok: false, error: '这个部署没有模型服务（`ctx.sessionController`）。' }
 		const provider = String(selection?.provider ?? '').trim()
 		const model = String(selection?.model ?? '').trim()
+		const reasoningEffort = String(selection?.reasoningEffort ?? '').trim()
 		if (!sessionId || !provider || !model) return { ok: false, error: '会话或模型没给全。' }
+		// 只有给了档位才把 `reasoningEffort` 带进请求；空串表示"沿用该模型/提供商默认行为"
+		// （dsh 的语义：`reasoningEffort` 缺省 = 不做额外设置）。
+		const request = reasoningEffort
+			? { sessionId, provider, model, reasoningEffort }
+			: { sessionId, provider, model }
 		try {
-			const value = await service().selectModel({ sessionId, provider, model })
-			logger?.info?.('已切换会话模型', { sessionId, provider, model })
-			return { ok: true, selected: value?.selected ?? { provider, model } }
+			const value = await service().selectModel(request)
+			logger?.info?.('已切换会话模型', { sessionId, provider, model, reasoningEffort })
+			return { ok: true, selected: value?.selected ?? request }
 		} catch (error) {
-			logger?.warn?.('切换会话模型失败', { sessionId, provider, model, error: String(error) })
+			logger?.warn?.('切换会话模型失败', { sessionId, provider, model, reasoningEffort, error: String(error) })
 			return { ok: false, error: `切换失败：${String(error?.message ?? error)}` }
 		}
 	}

@@ -11,6 +11,7 @@ import {
 	buildModelConfirmCard,
 	buildModelListCard,
 	buildModelProviderCard,
+	buildModelReasoningCard,
 	buildModelSessionPromptCard,
 	buildNewSessionCard,
 	buildNoticeCard,
@@ -963,6 +964,66 @@ test('模型卡片·确认卡片：应用到当前会话 / 切到其他会话（
 	})
 	assert.deepEqual(parseCallback(buttons[2].action.data), { kind: 'model', action: 'back', arg: 'deepseek' })
 	assert.ok(card.keyboard.content.rows.length <= 5)
+})
+
+test('模型卡片·思考等级：每档一个回调按钮，标默认/当前，返回回列表', () => {
+	const group = { id: 'deepseek', name: 'DeepSeek' }
+	const model = {
+		id: 'deepseek-reasoner',
+		name: 'DeepSeek Reasoner',
+		reasoning: {
+			efforts: [
+				{ id: 'low', name: 'Low' },
+				{ id: 'medium', name: 'Medium' },
+				{ id: 'high', name: 'High', description: '难任务用' },
+			],
+			defaultEffort: 'medium',
+		},
+	}
+	// 当前会话用的正是这个模型的 high 档：应标出「当前」，high 按钮蓝色。
+	const card = buildModelReasoningCard({
+		group,
+		model,
+		current: { provider: 'deepseek', model: 'deepseek-reasoner', reasoningEffort: 'high' },
+		label: '项目甲(session-1)',
+	})
+	assert.match(card.content, /\*\*模型 · 思考等级\*\*/)
+	assert.match(card.content, /DeepSeek \/ DeepSeek Reasoner/)
+	assert.match(card.content, /Medium\*\*（默认）/)
+	assert.match(card.content, /High\*\*（当前）/)
+	assert.match(card.content, /难任务用/)
+
+	const rows = card.keyboard.content.rows
+	const labels = rows.flatMap((row) => row.buttons.map((b) => b.render_data.label))
+	assert.deepEqual(labels, ['Low', 'Medium', 'High', '返回'])
+	const buttons = rows.flatMap((row) => row.buttons)
+	assert.ok(buttons.every((b) => b.action.type === 1), '都是交互式回调按钮')
+	const effortBtn = buttons.find((b) => b.render_data.label === 'High')
+	assert.equal(effortBtn.render_data.style, 1, '当前档＝蓝')
+	assert.deepEqual(parseCallback(effortBtn.action.data), {
+		kind: 'model',
+		action: 'effort',
+		arg: 'deepseek:deepseek-reasoner:high',
+	})
+	assert.deepEqual(parseCallback(buttons.at(-1).action.data), { kind: 'model', action: 'back', arg: 'deepseek' })
+	assert.ok(rows.length <= 5)
+})
+
+test('模型卡片·思考等级：没有档位（或当前不是本模型）时不误标"当前"', () => {
+	const group = { id: 'deepseek', name: 'DeepSeek' }
+	const model = {
+		id: 'deepseek-reasoner',
+		name: 'DeepSeek Reasoner',
+		reasoning: { efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }], defaultEffort: '' },
+	}
+	// 当前会话用的是别的模型：不标"当前"。
+	const card = buildModelReasoningCard({
+		group,
+		model,
+		current: { provider: 'openai', model: 'gpt-5.2', reasoningEffort: 'high' },
+	})
+	assert.doesNotMatch(card.content, /（当前）/)
+	assert.doesNotMatch(card.content, /（默认）/)
 })
 
 test('模型卡片·「切到其他会话」提示卡片：等用户发会话id，自带「取消」', () => {

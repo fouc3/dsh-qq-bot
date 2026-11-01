@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { createModels, splitOnce } from './models.js'
+import { createModels, normalizeReasoning, splitOnce } from './models.js'
 
 /** 一份两提供商的假目录。 */
 const GROUPS = [
@@ -10,7 +10,19 @@ const GROUPS = [
 		name: 'DeepSeek',
 		models: [
 			{ id: 'deepseek-chat', name: 'DeepSeek Chat', description: '通用对话' },
-			{ id: 'deepseek-reasoner', name: 'DeepSeek Reasoner', description: '深度推理' },
+			{
+				id: 'deepseek-reasoner',
+				name: 'DeepSeek Reasoner',
+				description: '深度推理',
+				reasoning: {
+					efforts: [
+						{ id: 'low', name: 'Low' },
+						{ id: 'medium', name: 'Medium' },
+						{ id: 'high', name: 'High', description: '难任务用' },
+					],
+					defaultEffort: 'medium',
+				},
+			},
 		],
 	},
 	{
@@ -58,7 +70,13 @@ function fakeCtx({
 		async selectModel(request) {
 			calls.set.push(request)
 			if (selectError) throw new Error(selectError)
-			return { selected: { provider: request.provider, model: request.model } }
+			return {
+				selected: {
+					provider: request.provider,
+					model: request.model,
+					...(request.reasoningEffort ? { reasoningEffort: request.reasoningEffort } : {}),
+				},
+			}
 		},
 		async projections(request) {
 			calls.projections.push(request.sessionId)
@@ -97,6 +115,16 @@ test('模型：读目录（归一化 + 失败提供商如实带上），没有�
 	assert.deepEqual(catalog.groups.map((group) => group.id), ['deepseek', 'openai'])
 	assert.equal(catalog.groups[0].models[0].name, 'DeepSeek Chat')
 	assert.equal(catalog.groups[0].models[0].description, '通用对话')
+	// 带档位的模型：reasoning 保留 efforts + 落在档位里的 defaultEffort；
+	// 不带档位的模型：reasoning 为 null（卡片据此不加"思考等级"这一步）。
+	assert.equal(catalog.groups[0].models[0].reasoning, null, '没有声明的模型 reasoning 必须是 null')
+	const reasoner = catalog.groups[0].models[1]
+	assert.deepEqual(
+		reasoner.reasoning.efforts.map((effort) => effort.id),
+		['low', 'medium', 'high'],
+	)
+	assert.equal(reasoner.reasoning.defaultEffort, 'medium')
+	assert.equal(reasoner.reasoning.efforts[2].description, '难任务用')
 	assert.deepEqual(catalog.failures.map((item) => item.name), ['Broken'])
 	assert.equal(catalog.default.model, 'deepseek-chat')
 
@@ -251,6 +279,49 @@ test('模型：切换会话模型（成功记下出参，失败如实回报）',
 
 	assert.equal((await models.set('', { provider: 'a', model: 'b' })).ok, false)
 	assert.equal((await models.set('s', { provider: 'a' })).ok, false)
+})
+
+test('模型：切换时带推理档位——有档位才把 reasoningEffort 带进请求，空档位不带', async () => {
+	const withEffort = fakeCtx()
+	const m1 = createModels({ ctx: withEffort.ctx })
+	const ok = await m1.set('session-1', { provider: 'deepseek', model: 'deepseek-reasoner', reasoningEffort: 'high' })
+	assert.equal(ok.ok, true)
+	assert.deepEqual(withEffort.calls.set, [
+		{ sessionId: 'session-1', provider: 'deepseek', model: 'deepseek-reasoner', reasoningEffort: 'high' },
+	])
+
+	const noEffort = fakeCtx()
+	const m2 = createModels({ ctx: noEffort.ctx })
+	await m2.set('session-1', { provider: 'deepseek', model: 'deepseek-reasoner', reasoningEffort: '  ' })
+	assert.deepEqual(
+		noEffort.calls.set,
+		[{ sessionId: 'session-1', provider: 'deepseek', model: 'deepseek-reasoner' }],
+		'空档位不能塞一个 reasoningEffort:"" 进去',
+	)
+})
+
+test('normalizeReasoning：没有/空档位 → null；defaultEffort 不在档位里就丢掉；只认合法项', () => {
+	assert.equal(normalizeReasoning(undefined), null)
+	assert.equal(normalizeReasoning(null), null)
+	assert.equal(normalizeReasoning({}), null)
+	assert.equal(normalizeReasoning({ efforts: [] }), null)
+	assert.equal(normalizeReasoning({ efforts: [{ name: '无 id' }] }), null, '没有 id 的档位丢掉')
+
+	const normalized = normalizeReasoning({
+		efforts: [
+			{ id: 'low', name: 'Low' },
+			{ id: 'high' }, // 没 name → 用 id 顶
+			{ id: 'bad', name: 'Bad', description: 'x' },
+		],
+		defaultEffort: 'nope', // 不在档位里 → 丢掉
+	})
+	assert.deepEqual(normalized.efforts.map((effort) => effort.id), ['low', 'high', 'bad'])
+	assert.equal(normalized.efforts[1].name, 'high')
+	assert.equal(normalized.defaultEffort, '')
+
+	const onlyOff = normalizeReasoning({ efforts: [{ id: 'off', name: 'Off' }], defaultEffort: 'off' })
+	assert.deepEqual(onlyOff.efforts.map((effort) => effort.id), ['off'], '只有一档 off 也照实返回')
+	assert.equal(onlyOff.defaultEffort, 'off')
 })
 
 test('splitOnce：按第一个分隔符切两段（模型卡片回调 data 用）', () => {
