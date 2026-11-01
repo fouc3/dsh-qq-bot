@@ -226,9 +226,10 @@ function stepDistanceTag(step, snapshot) {
  * @param {string} input.label 会话显示名（标题(会话id)）
  * @param {string} [input.sessionId] 兜底显示
  * @param {object|null} [input.snapshot] `snapshotProgress(agent)` 的结果；**没有活 agent 时传 null**
- * @param {{provider:string, model:string, source?:'selection'|'log'|'default'}|null} [input.model]
+ * @param {{provider:string, model:string, reasoningEffort?:string, source?:'selection'|'log'|'default'}|null} [input.model]
  *   会话当前模型（`models.effective()` 的结果；读不到就 null）。`source='default'` 时会注明
  *   "部署默认" —— 那是"这个会话以后会用哪个"的预测，不是它自己选过的。
+ *   `reasoningEffort` 有值就单列「推理等级」，没有就写"未指定（用模型默认）"。
  * @param {string} [input.permission] 会话当前权限的显示名（读不到就空串）
  * @param {object|null} [input.stats] `createSessionStats().read()` 的结果（四个投影，缺就是 null）
  */
@@ -246,10 +247,17 @@ export function renderProgress({
 		model?.provider && model?.model
 			? `${model.provider} / ${model.model}${model.source === 'default' ? '（部署默认）' : ''}`
 			: '（读不到）'
+	// 推理等级（思考档位）：与模型联动展示。只有"读到了档位"才单列一行；
+	// 读不到就写清楚"未指定（用模型默认）"，避免让人以为它一定在思考。
+	const effortLine =
+		model?.reasoningEffort
+			? `> 推理等级：**${model.reasoningEffort}**`
+			: '> 推理等级：未指定（沿用模型/提供商默认）'
 	const lines = [
 		'**状态**',
 		`> 会话：${label ?? sessionId}`,
 		`> 模型：${modelText}`,
+		effortLine,
 		`> 权限：${permission || '（读不到）'}`,
 		`> 状态：${describeStatus(snapshot)}`,
 		...statsLines(stats),

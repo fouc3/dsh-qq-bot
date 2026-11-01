@@ -216,7 +216,13 @@ export function createModels({ ctx, logger }) {
 				const config = event.data?.header?.config ?? {}
 				const provider = typeof config.provider === 'string' ? config.provider.trim() : ''
 				const model = typeof config.model === 'string' ? config.model.trim() : ''
-				if (provider && model) return { provider, model }
+				const reasoningEffort =
+					typeof config.reasoningEffort === 'string' ? config.reasoningEffort.trim() : ''
+				if (provider && model) {
+					// 会话日志的 config 里带真实用过的档位（实测有 `reasoningEffort`），
+					// 冷会话也能据此显示"刚才那一轮用的什么思考等级"。
+					return reasoningEffort ? { provider, model, reasoningEffort } : { provider, model }
+				}
 			}
 		} catch (error) {
 			logger?.debug?.('从会话日志读取模型失败（忽略）', { sessionId, error: String(error) })

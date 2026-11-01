@@ -2084,7 +2084,7 @@ export function apply(ctx, rawConfig) {
 						openid,
 						sessionId: bound,
 						providerId,
-						chosen: { provider: providerId, model: modelId },
+						chosen: { provider: providerId, model: modelId, reasoningEffort: effortId },
 						replyContext: ctxReply,
 					})
 					code = 0

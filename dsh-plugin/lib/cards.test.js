@@ -909,6 +909,32 @@ test('模型卡片·模型列表：每行 1 个、翻页、导航行只有「返
 	assert.match(chosenCard.content, /2\. \*\*DeepSeek Reasoner\*\* ✅/)
 })
 
+test('模型卡片·当前模型联动推理等级：当前带档位就写出来，切完 chosen 带档位也写「已切到…推理等级」', () => {
+	const group = {
+		id: 'miyu-auto',
+		name: 'Miyu Auto',
+		models: [{ id: 'auto', name: 'Auto', description: '' }],
+	}
+	// 「当前：」行带推理等级
+	const withEffort = buildModelListCard({
+		group,
+		current: { provider: 'miyu-auto', model: 'auto', reasoningEffort: 'high' },
+	})
+	assert.match(withEffort.content, /> 当前：\*\*Miyu Auto \/ Auto\*\*（`miyu-auto\/auto`） · 推理等级 \*\*high\*\*/)
+
+	// 没有档位时不写那一段（避免误导成"一定在思考"）
+	const noEffort = buildModelListCard({ group, current: { provider: 'miyu-auto', model: 'auto' } })
+	assert.match(noEffort.content, /> 当前：\*\*Miyu Auto \/ Auto\*\*（`miyu-auto\/auto`）\n/)
+	assert.doesNotMatch(noEffort.content, /推理等级/)
+
+	// 刚切完且带档位：✅ 行也带上档位
+	const chosen = buildModelListCard({
+		group,
+		chosen: { provider: 'miyu-auto', model: 'auto', reasoningEffort: 'medium' },
+	})
+	assert.match(chosen.content, /✅ 已切到 \*\*Miyu Auto \/ Auto\*\*，推理等级 \*\*medium\*\*/)
+})
+
 test('模型卡片·提供商/模型：长名字照发（不再自己砍成省略号），只挡病态长名字', () => {
 	const group = {
 		id: 'deepseek-official',

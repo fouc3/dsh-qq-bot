@@ -838,7 +838,7 @@ export const MODEL_ACTION_LABEL_WIDTH_LIMIT = 24
 
 /**
  * 用来标注"当前"的一段文字。
- * @param {{provider:string, model:string}|null} current
+ * @param {{provider:string, model:string, reasoningEffort?:string}|null} current
  * @param {Array} groups
  */
 function currentModelText(current, groups) {
@@ -846,7 +846,9 @@ function currentModelText(current, groups) {
 	const group = groups.find((item) => item.id === current.provider)
 	const model = group?.models?.find((item) => item.id === current.model)
 	const shown = group && model ? `${group.name} / ${model.name}` : `${current.provider} / ${current.model}`
-	return `**${shown}**（\`${current.provider}/${current.model}\`）`
+	const effort = String(current.reasoningEffort ?? '').trim()
+	const effortTag = effort ? ` · 推理等级 **${effort}**` : ''
+	return `**${shown}**（\`${current.provider}/${current.model}\`）${effortTag}`
 }
 
 /**
@@ -913,7 +915,7 @@ export function buildModelProviderCard({ groups = [], failures = [], current = n
  * @param {{provider:string,model:string}|null} [input.current]
  * @param {string} [input.label]
  * @param {number} [input.page]
- * @param {{provider:string,model:string}|null} [input.chosen] 刚切成功的那一个（正文写明"已切到"）
+ * @param {{provider:string,model:string,reasoningEffort?:string}|null} [input.chosen] 刚切成功的那一个（正文写明"已切到"）
  */
 export function buildModelListCard({ group, current = null, label = '', page = 1, chosen = null }) {
 	const models = group?.models ?? []
@@ -936,7 +938,9 @@ export function buildModelListCard({ group, current = null, label = '', page = 1
 	if (chosen) {
 		// chosen 给的是 id（回调 data 里只有 id）：显示名从这一组里查。
 		const picked = models.find((model) => model.id === chosen.model)
-		lines.push(`✅ 已切到 **${group.name} / ${picked?.name ?? chosen.model}**。`)
+		const effort = String(chosen.reasoningEffort ?? '').trim()
+		const effortTag = effort ? `，推理等级 **${effort}**` : ''
+		lines.push(`✅ 已切到 **${group.name} / ${picked?.name ?? chosen.model}**${effortTag}。`)
 	}
 	if (pages > 1) lines.push(`第 ${currentPage}/${pages} 页（每页 ${slots} 个模型）`)
 	lines.push('', '点一个**模型**进确认卡片（要切给当前会话还是别的会话，那里再选）。')

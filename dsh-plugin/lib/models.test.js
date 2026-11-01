@@ -158,6 +158,31 @@ test('模型：当前模型取 pending 优先、其次 lastUsed；读不到就�
 	assert.ok(calls.projections.includes('session-a'))
 })
 
+test('模型：current 带回推理档位（投影里有 reasoningEffort 才带，没有就不塞空串）', async () => {
+	const { ctx } = fakeCtx({
+		projections: {
+			'session-h': { lastUsed: { provider: 'miyu-auto', model: 'auto', reasoningEffort: 'high' }, pending: null },
+			'session-n': { lastUsed: { provider: 'deepseek', model: 'deepseek-chat' }, pending: null },
+		},
+	})
+	const models = createModels({ ctx })
+	assert.deepEqual(await models.current('session-h'), { provider: 'miyu-auto', model: 'auto', reasoningEffort: 'high' })
+	assert.deepEqual(await models.current('session-n'), { provider: 'deepseek', model: 'deepseek-chat' }, '没档位不多一个空字段')
+})
+
+test('模型：effective 从会话日志读模型时也一并读回 reasoningEffort（冷会话也能显示档位）', async () => {
+	const { ctx } = fakeCtx({
+		events: {
+			'session-log': [
+				{ type: 'request/header', seq: 1, data: { header: { config: { provider: 'miyu-auto', model: 'auto', reasoningEffort: 'high' } } } },
+			],
+		},
+	})
+	const models = createModels({ ctx })
+	const eff = await models.effective('session-log')
+	assert.deepEqual(eff, { provider: 'miyu-auto', model: 'auto', reasoningEffort: 'high', source: 'log' })
+})
+
 // 线上反馈：`状态` 卡的「模型」对没点过模型选择器的会话一直显示「（读不到）」。
 // `effective()` 补两级兜底：会话日志里**真正用过**的（冷会话也能读）→ 部署默认（标注出来）。
 test('模型：effective 依次取 选择 → 会话日志里用过的 → 部署默认，不会因为没选过就"读不到"', async () => {

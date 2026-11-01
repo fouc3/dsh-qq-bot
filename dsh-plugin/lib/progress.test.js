@@ -304,6 +304,29 @@ test('renderProgress：模型兜底到布局默认时要注明「部署默认」
 	assert.match(viaDefault, /> 模型：f \/ deepseek-v4\.1-flash（部署默认）/, '部署默认要标出来')
 })
 
+// 用户要求（2026-11-02）：状态卡与模型卡联动展示推理等级。
+test('renderProgress：推理等级随模型联动展示——有档位单列，没有就写明未指定', () => {
+	const withEffort = renderProgress({
+		label: 'x',
+		sessionId: 's',
+		snapshot: null,
+		model: { provider: 'miyu-auto', model: 'auto', reasoningEffort: 'high' },
+	})
+	assert.match(withEffort, /> 模型：miyu-auto \/ auto/)
+	assert.match(withEffort, /> 推理等级：\*\*high\*\*/, '有档位就单列，加粗显示')
+
+	const noEffort = renderProgress({
+		label: 'x',
+		sessionId: 's',
+		snapshot: null,
+		model: { provider: 'deepseek-official', model: 'deepseek-chat' },
+	})
+	assert.match(noEffort, /> 推理等级：未指定（沿用模型\/提供商默认）/, '没档位要说明未指定，而不是留空')
+
+	const noModel = renderProgress({ label: 'x', sessionId: 's', snapshot: null })
+	assert.match(noModel, /> 推理等级：未指定/, '模型都读不到时也不能漏掉这一行')
+})
+
 // 用户要求（2026-10-16）：把 dsh web 会话底部那块「统计」也搬进 QQ。
 // 这里的数字就用用户贴过来的那一份（587分28秒 / 63分12秒 / 8.6秒 / 191 tok/s /
 // 929,074,071 / 99% / 10,314,436 / 916,849,920 / 1,909,715 / 54% ~540K / 1M /
