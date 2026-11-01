@@ -143,30 +143,33 @@ test('面板条目与菜单条目都由同一张命令表派生', () => {
 	])
 	assert.equal(items.at(-1).desc, '把会话加载进内存（无参=当前会话）')
 
-	// 自定义菜单：顶层仍只有 8 项（7 个平铺 + 1 个「管理」二级菜单）——
-	// 平台顶层最多 10，得给 dsh 命令的二级菜单留位，所以新命令进「管理」。
+	// 自定义菜单：顶层仍只有 8 项（6 个平铺 + 「管理」+「管理2」两个二级菜单）——
+	// 平台顶层最多 10（=这 8 项 + 2 个 dsh 命令子菜单），得给 dsh 命令留位。
 	const menu = menuItems()
 	assert.equal(menu.length, 8)
 	assert.deepEqual(
 		menu.filter((it) => it.type !== 'menu').map((it) => it.sendMessage),
-		['切换会话', '快捷', '新建会话', '发送', '延迟发送', '模型', '状态'],
+		['切换会话', '快捷', '新建会话', '发送', '延迟发送', '状态'],
 	)
-	const manage = menu.find((it) => it.type === 'menu')
-	assert.equal(manage.name, '管理')
+	const groups = menu.filter((it) => it.type === 'menu')
+	assert.deepEqual(groups.map((it) => it.name), ['管理', '管理2'])
+	const manage = groups[0]
 	assert.deepEqual(
 		manage.children.map((it) => it.sendMessage),
 		['停止', '归档', '权限', '运行中会话', '角色预设'],
 	)
+	// 「管理2」收「模型」和「加载会话」（用户要求）。
+	const manage2 = groups[1]
+	assert.deepEqual(manage2.children.map((it) => it.sendMessage), ['模型', '加载会话'])
 	// 除 `hiddenInMenu`（底部菜单放不下、只在面板+打字可用）的命令外，
 	// 每条命令都得在菜单里出现（平铺或二级菜单），不能因为收编而消失。
 	const shown = new Set([
 		...menu.filter((it) => it.type !== 'menu').map((it) => it.name),
-		...manage.children.map((it) => it.name),
+		...groups.flatMap((g) => g.children.map((it) => it.name)),
 	])
-	const expectInMenu = items.map((i) => i.name).filter((name) => name !== '加载会话')
-	assert.deepEqual([...shown].sort(), expectInMenu.sort())
-	// `加载会话` 明确不进底部菜单（顶层/二级都已满）
-	assert.ok(!shown.has('加载会话'))
+	const expectInMenu = items.map((i) => i.name).filter((name) => name !== '加载会话' && name !== '模型')
+	assert.deepEqual([...shown].sort(), [...expectInMenu, '模型', '加载会话'].sort())
+	assert.ok(shown.has('模型') && shown.has('加载会话'), '模型与加载会话都在「管理2」里')
 })
 
 // 用户要求（2026-10-16）：新增 `运行中会话`（无参发卡片；带会话id 直接切）。

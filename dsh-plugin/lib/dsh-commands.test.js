@@ -74,10 +74,10 @@ test('二级菜单：每 ≤5 项一组，点击把 /命令 填进输入框', ()
 
 test('完整菜单：桥命令在前，dsh 命令收进后面的二级菜单，且不超顶层 10 项', () => {
 	const bridge = menuItems()
-	// 桥命令顶层：7 个平铺 + 1 个「管理」二级菜单（把 停止/归档/权限 收进去，
-	// 好给「模型」腾位置 —— 顶层总共只有 10 项，10 条桥命令全平铺会挤掉 dsh 命令）。
+	// 桥命令顶层：6 个平铺 + 「管理」+「管理2」两个二级菜单（停止/归档/权限 进「管理」，
+	// 模型/加载会话 进「管理2」，给 dsh 命令腾位置 —— 顶层总共只有 10 项）。
 	assert.equal(bridge.length, 8)
-	assert.equal(bridge.filter((it) => it.type === 'menu').length, 1)
+	assert.equal(bridge.filter((it) => it.type === 'menu').length, 2)
 
 	const menu = buildMenuItems({ bridge, commands: filterCommands(DESCRIPTORS), label: 'dsh 命令' })
 	assert.equal(menu.length, 10, '8 个桥顶层 + 2 个 dsh 二级菜单 = 平台上限 10')
@@ -101,8 +101,8 @@ test('完整菜单：桥命令在前，dsh 命令收进后面的二级菜单，�
 	const many = Array.from({ length: 40 }, (_, i) => ({ name: `cmd${i}`, description: '' }))
 	const wide = buildMenuItems({ bridge, commands: many, label: 'dsh 命令' })
 	assert.equal(wide.length, 10)
-	// 8 条桥命令占了 8 位，剩 2 位给二级菜单（其中 1 位是桥自己的「管理」）
-	assert.equal(wide.filter((it) => it.type === 'menu').length, 3)
+	// 8 条桥命令占了 8 位，剩 2 位给 dsh 二级菜单；桥自己的「管理」「管理2」另占 2 个二级菜单位。
+	assert.equal(wide.filter((it) => it.type === 'menu').length, 4)
 })
 
 test('listCommands：服务缺失/报错都退化成空表（菜单照发）', async () => {

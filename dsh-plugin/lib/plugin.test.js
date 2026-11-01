@@ -562,14 +562,16 @@ test('register → panel：白名单快照 + 十条命令的面板定义（只�
 		'加载会话',
 	])
 	// 扁平键 menuItems：与 Go 侧 PanelDefinition.MenuItems 对齐（大小写不敏感匹配）
-	// 顶层 8 项 = 7 个平铺 + 1 个「管理」二级菜单（停止/归档/权限/运行中会话/角色预设）+ 2 个 dsh 命令二级菜单 = 10（平台上限）。
+	// 顶层 8 项 = 6 个平铺 + 「管理」+「管理2」两个二级菜单 + 2 个 dsh 命令二级菜单 = 10（平台上限）。
 	assert.equal(panel.value.menuItems.length, 8)
 	assert.equal(panel.value.menuItems[0].name, '切换会话')
 	assert.equal(panel.value.menuItems[0].sendMessage, '切换会话')
 	assert.equal(panel.value.menuItems[1].sendMessage, '快捷')
-	const manageGroup = panel.value.menuItems.find((item) => item.type === 'menu')
-	assert.equal(manageGroup.name, '管理')
+	const menuGroups = panel.value.menuItems.filter((item) => item.type === 'menu')
+	assert.deepEqual(menuGroups.map((g) => g.name), ['管理', '管理2'])
+	const manageGroup = menuGroups[0]
 	assert.deepEqual(manageGroup.children.map((child) => child.name), ['停止', '归档', '权限', '运行中会话', '角色预设'])
+	assert.deepEqual(menuGroups[1].children.map((child) => child.name), ['模型', '加载会话'])
 	assert.equal(panel.value.menu, undefined)
 
 	// 白名单落了盘（插件重启后仍能门守）
@@ -1685,11 +1687,11 @@ test('端到端：dsh 内置命令从 QQ 直接执行（不进模型）；技能
 	await waitFor(() => existsSync(boot.socketPath))
 	await rpc(boot.socketPath, 'register', { openids: [{ openid: 'U1' }], panel: { enabled: true, users: ['U1'] }, menu: { enabled: true } })
 
-	// 菜单：桥命令 + 1 个二级菜单（feedback 被排除，只剩 compact/goal）
+	// 菜单：桥命令 + 二级菜单（feedback 被排除，只剩 compact/goal）
 	const panel = await rpc(boot.socketPath, 'panel')
-	// 二级菜单现在有 2 个：桥自己的「管理」+ dsh 命令（feedback 被排除，只剩 compact/goal）
+	// 二级菜单现在有 3 个：桥的「管理」「管理2」+ dsh 命令（feedback 被排除，只剩 compact/goal）
 	const groups = panel.value.menuItems.filter((item) => item.type === 'menu')
-	assert.equal(groups.length, 2, '桥的「管理」与 dsh 命令各占一个二级菜单')
+	assert.equal(groups.length, 3, '桥的「管理」「管理2」与 dsh 命令各占一个二级菜单')
 	const dshGroup = groups.find((item) => item.name === 'dsh 命令')
 	assert.ok(dshGroup, 'dsh 命令应收进二级菜单')
 	assert.deepEqual(
@@ -1698,7 +1700,7 @@ test('端到端：dsh 内置命令从 QQ 直接执行（不进模型）；技能
 		'feedback 不收纳；技能本来就不在命令表里',
 	)
 	assert.equal(dshGroup.children[0].sendMessage, '/compact', '点击把 /命令 填进输入框')
-	assert.equal(panel.value.menuItems.filter((i) => i.type !== 'menu').length, 7, '顶层 7 条平铺桥命令')
+	assert.equal(panel.value.menuItems.filter((i) => i.type !== 'menu').length, 6, '顶层 6 条平铺桥命令')
 
 	// 绑定会话
 	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M1' })
