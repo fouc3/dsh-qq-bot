@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -172,7 +173,7 @@ func bridgeLoop(ctx context.Context, cfg *config.Config, channel *bridge.Client,
 	delay := time.Second
 
 	for ctx.Err() == nil {
-		if err := ensureRegistered(ctx, cfg, channel, exec, logger, true); err != nil {
+		if _, err := ensureRegistered(ctx, cfg, channel, exec, logger, true); err != nil {
 			if ctx.Err() != nil {
 				return
 			}
@@ -203,7 +204,11 @@ func bridgeLoop(ctx context.Context, cfg *config.Config, channel *bridge.Client,
 // ensureRegistered 上报白名单快照并发布指令面板/菜单。
 //
 // verbose 只影响日志级别：首次注册打 INFO，周期性重同步打 DEBUG。
-func ensureRegistered(ctx context.Context, cfg *config.Config, channel *bridge.Client, exec *executor.Executor, logger *slog.Logger, verbose bool) error {
+//
+// 返回值 dshReady：本次同步时菜单里**是否已带上 dsh 命令二级菜单**。网关刚起来时
+// 可能还没有活会话、枚举不到 dsh 内置命令，这时菜单会缺「dsh 命令」子菜单；
+// 调用方可据此走"快速重试"，不必干等满一个重同步周期。
+func ensureRegistered(ctx context.Context, cfg *config.Config, channel *bridge.Client, exec *executor.Executor, logger *slog.Logger, verbose bool) (dshReady bool, err error) {
 	openids := make([]map[string]string, 0, len(cfg.Whitelist.Users))
 	for _, u := range cfg.Whitelist.Users {
 		openids = append(openids, map[string]string{"openid": u.OpenID, "note": u.Note})
@@ -218,7 +223,7 @@ func ensureRegistered(ctx context.Context, cfg *config.Config, channel *bridge.C
 		"version": 1,
 	}
 	if err := channel.Call(ctx, "register", payload, nil); err != nil {
-		return fmt.Errorf("register 失败：%w", err)
+		return false, fmt.Errorf("register 失败：%w", err)
 	}
 
 	// 插件回包兼容两种形状：扁平的 menuItems（新）与嵌套的 menu.items（旧）。
@@ -231,7 +236,7 @@ func ensureRegistered(ctx context.Context, cfg *config.Config, channel *bridge.C
 		} `json:"menu"`
 	}
 	if err := channel.Call(ctx, "panel", struct{}{}, &panelPayload); err != nil {
-		return fmt.Errorf("读取面板定义失败：%w", err)
+		return false, fmt.Errorf("读取面板定义失败：%w", err)
 	}
 	def := panelPayload.PanelDefinition
 	if len(def.MenuItems) == 0 {
@@ -251,10 +256,32 @@ func ensureRegistered(ctx context.Context, cfg *config.Config, channel *bridge.C
 	} else {
 		logger.Debug("已重同步面板", "menu", len(def.MenuItems))
 	}
-	return nil
+	// dsh 内置命令的二级菜单是否已经补齐：网关刚起来时可能还没有活会话，
+	// 枚举不到 dsh 命令 ⇒ 菜单里缺「dsh 命令」子菜单。调用方据此决定要不要"快速重试"。
+	return menuHasDshCommands(def.MenuItems), nil
 }
 
-// panelResyncInterval 是面板/菜单重新同步的间隔。
+// menuHasDshCommands 判断菜单里是否已经带上了 dsh 命令的二级菜单。
+//
+// 判据：存在一个可折叠二级菜单，且它至少有一个子项的 SendMessage 以 "/" 开头。
+// 插件把 dsh 内置命令收进这种二级菜单（子项 sendMessage 是 `/compact`、`/model` 这类斜杠命令）；
+// 桥自己的二级菜单（如「管理」）子项是普通命令名（`停止`/`归档`…），不含 "/"，
+// 所以不会被误判。
+func menuHasDshCommands(items []qq.MenuItem) bool {
+	for _, it := range items {
+		if it.Type != "menu" {
+			continue
+		}
+		for _, child := range it.Children {
+			if strings.HasPrefix(strings.TrimSpace(child.SendMessage), "/") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// panelResyncInterval 是面板/菜单的**常规**重同步间隔。
 //
 // 为什么需要重同步：菜单里的 dsh 内置命令是按 **agent 作用域** 枚举的，
 // 网关启动那一刻可能还没有活会话，二级菜单就是空的；等用户开始用之后再同步
@@ -262,18 +289,57 @@ func ensureRegistered(ctx context.Context, cfg *config.Config, channel *bridge.C
 // 所以这里的代价只是一次通道查询（外加面板的一次幂等更新）。
 const panelResyncInterval = 5 * time.Minute
 
-// panelResyncLoop 周期性重同步面板与菜单。
+// panelResyncFastInterval 是**快速重试**间隔。
+//
+// 场景（2026-11-02 线上）：网关重启那一刻还没有活 agent ⇒ 枚举不到 dsh 命令 ⇒
+// 菜单里缺「dsh 命令」子菜单，按老逻辑要干等满 5 分钟才补。用户当场发现子菜单"消失"。
+// 现在：只要这一轮同步后仍然**没有** dsh 命令子菜单，就按这个短间隔快速重试，
+// 直到补齐（或达到快速重试上限），免得让人对着残缺菜单等好几分钟。
+const panelResyncFastInterval = 10 * time.Second
+
+// panelResyncFastMaxTries 是"缺 dsh 命令子菜单"时连续快速重试的最大次数（≈1 分钟）。
+// 超过就退回常规间隔，避免长时间高频查询通道。
+const panelResyncFastMaxTries = 6
+
+// panelResyncLoop 周期性重同步面板与菜单；缺 dsh 命令子菜单时快速重试补齐。
+//
+// 关键点：**开机第一拍要等短间隔**。网关刚启动时几乎必然还没有活会话、枚举不到
+// dsh 命令，若第一拍就等满 5 分钟，用户会对着缺「dsh 命令」子菜单的面板干等好几分钟。
+// 所以引入 fastTries 状态：只要还缺 dsh 命令子菜单就把等待降到 10 秒快速重试
+// （最多连续 panelResyncFastMaxTries 次），补齐后回到常规 5 分钟周期。
 func panelResyncLoop(ctx context.Context, cfg *config.Config, channel *bridge.Client, exec *executor.Executor, logger *slog.Logger) {
-	ticker := time.NewTicker(panelResyncInterval)
-	defer ticker.Stop()
+	// 初始按"缺 dsh 命令"对待：第一拍就走快速间隔，尽快把子菜单补齐。
+	fastTries := 1
 	for {
-		select {
-		case <-ctx.Done():
+		wait := panelResyncInterval
+		if fastTries > 0 && fastTries <= panelResyncFastMaxTries {
+			wait = panelResyncFastInterval
+		}
+		if !sleepCtx(ctx, wait) {
 			return
-		case <-ticker.C:
-			if err := ensureRegistered(ctx, cfg, channel, exec, logger, false); err != nil && ctx.Err() == nil {
+		}
+		dshReady, err := ensureRegistered(ctx, cfg, channel, exec, logger, false)
+		if err != nil {
+			if ctx.Err() == nil {
 				logger.Debug("周期性重同步面板失败（不影响收发）", "err", err)
 			}
+			// 出错也保持快速重试计数（不越界），下一拍继续尝试补齐。
+			if fastTries < panelResyncFastMaxTries {
+				fastTries++
+			}
+			continue
+		}
+		// 已补齐 → 清零，回到常规周期；仍缺 → 递增快速重试计数（用满后回到常规周期）。
+		if dshReady {
+			if fastTries > 1 {
+				logger.Info("dsh 命令子菜单已补齐")
+			}
+			fastTries = 0
+			continue
+		}
+		if fastTries < panelResyncFastMaxTries {
+			fastTries++
+			logger.Debug("菜单暂缺 dsh 命令子菜单，快速重试", "next", panelResyncFastInterval.String(), "try", fastTries)
 		}
 	}
 }
