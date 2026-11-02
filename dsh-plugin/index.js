@@ -210,6 +210,43 @@ export function apply(ctx, rawConfig) {
 		return next
 	}
 
+	// ── 内置菜单（指令面板里的「dsh 命令」二级菜单）的重同步请求 ──────────────
+	/**
+	 * 为什么需要"请求重同步"：dsh 内置命令是 **agent 作用域**的 —— `ctx.commands.list(agent)`
+	 * 必须先有一个活 agent 才枚举得到。所以**会话没有 agent 时，菜单里就没有 dsh 命令子菜单**
+	 * （线上症状：切到一个冷会话后，QQ 底部菜单里的「dsh 命令」整块消失）。
+	 * 现在"只要有会话被加载进内存"（切会话 / 加载会话 / 发消息唤醒 / 启动预热）都请求网关
+	 * 重发一次面板，菜单就跟着补回来。
+	 *
+	 * 为什么不在插件里自己 `publish_panel`：**面板 remark / 是否发布 的权威在 Go 侧 config.yaml**
+	 * （`cmd/qqbot/main.go` 的 `ensureRegistered`），插件只说"内容变过了，你重新同步一次"。
+	 *
+	 * 合并：一次操作可能连着唤醒好几个会话（启动预热），150ms 内多进来的请求合并成一次；
+	 * 另外加 2s 最小间隔，避免"连续切会话"把网关压成一轮轮 register+panel。
+	 */
+	const MENU_SYNC_DEBOUNCE_MS = 150
+	const MENU_SYNC_MIN_GAP_MS = 2_000
+	let menuSyncReasons = new Set()
+	let menuSyncTimer = null
+	let menuSyncLastAt = 0
+
+	/** 请求网关重同步内置菜单（合并 + 限流；不发重试，下次加载还会再来一次）。 */
+	function requestMenuSync(reason) {
+		menuSyncReasons.add(reason || '未知')
+		if (menuSyncTimer) return
+		const sinceLast = Date.now() - menuSyncLastAt
+		const wait = Math.max(MENU_SYNC_DEBOUNCE_MS, MENU_SYNC_MIN_GAP_MS - sinceLast)
+		menuSyncTimer = setTimeout(() => {
+			menuSyncTimer = null
+			menuSyncLastAt = Date.now()
+			const text = [...menuSyncReasons].join('/')
+			menuSyncReasons = new Set()
+			state.note(`请求网关重同步内置菜单：${text}`)
+			outbox.enqueue('resync_panel', { reason: text })
+		}, wait)
+		if (typeof menuSyncTimer.unref === 'function') menuSyncTimer.unref()
+	}
+
 	/**
 	 * 权限卡片：把 dsh 的权限预设列成按钮（每行 2 个，放不下自动加宽），点一下就切。
 	 */
@@ -566,6 +603,14 @@ export function apply(ctx, rawConfig) {
 	async function agentFor(sessionId) {
 		const live = ctx.agents.get(sessionId)
 		if (live) return live
+		// 走到这儿＝冷会话：**加载成功后请求网关重同步内置菜单**（dsh 命令按 agent 枚举，
+		// 刚有 agent 才能把「dsh 命令」子菜单补齐；见 requestMenuSync 的注释）。
+		// 只在"冷→活"这一跳触发：发消息、切会话、加载会话、启动预热全都经过这里。
+		const markLoaded = (agent) => {
+			state.note(`会话已加载：${String(sessionId).slice(-8)}（请求同步内置菜单）`)
+			requestMenuSync('会话加载')
+			return agent
+		}
 		const controllers = sessionControllers()
 		// 取会话id **尾部** 8 位（`…-7f92ee43`）：全库小日志都用这个口径；以前写成
 		// `slice(0, 8)` ⇒ 每行都只剩 `session-`（前缀把 id 吃光了，多会话时没法归因）。
@@ -579,7 +624,7 @@ export function apply(ctx, rawConfig) {
 				const agent = found?.agent ?? null
 				if (agent) {
 					state.note(`冷会话恢复：resolveAgent ✓ ${short}（${label}）`)
-					return agent
+					return markLoaded(agent)
 				}
 				state.note(`冷会话恢复：resolveAgent 没给出 agent ${short}（${label}）:: ${describeError(found?.error)}`)
 				logger.warn?.('会话控制器没给出 agent', { sessionId, via: label, error: describeError(found?.error) })
@@ -598,7 +643,7 @@ export function apply(ctx, rawConfig) {
 				const agent = await value.resume(sessionId)
 				if (agent) {
 					state.note(`冷会话恢复：resume ✓ ${short}（${label}）`)
-					return agent
+					return markLoaded(agent)
 				}
 			} catch (error) {
 				state.note(`冷会话恢复失败（不回退裸恢复）：${short}（${label}） :: ${describeError(error)}`)
@@ -2322,6 +2367,67 @@ export function apply(ctx, rawConfig) {
 	// ── 本地通道 ─────────────────────────────────────────────────────────────
 	let registered = { panel: { enabled: true, users: [] }, menu: { enabled: true } }
 
+	/**
+	 * 面板/菜单的**内容**（`panel` 方法回给网关的就是它）。
+	 *
+	 * 抽成函数是为了"注册时"与"自检/排查时"能拿到同一份内容 —— 内容只有一份，
+	 * 免得两处各拼一半、慢慢走偏。
+	 */
+	async function buildPanelPayload() {
+		// dsh 内置命令收进二级菜单（顶层留给桥自己的命令）。
+		// 命令是按 agent 作用域的，所以挑一个代表：优先"被 QQ 绑定的活会话"，
+		// 其次任意活会话；都没有时只发桥命令（下次网关重同步时再补齐）。
+		const descriptors = await listCommands(ctx.commands, representativeAgent(), logger)
+		return {
+			scope: 'c2c',
+			targetType: 'specific',
+			// enabled / menuEnabled 只是把 register 收到的意图回显出来，方便直接用
+			// socket 排查；**是否真的发布以 Go 侧 config.yaml 为准**（配置唯一来源在那）。
+			enabled: registered.panel.enabled,
+			menuEnabled: registered.menu.enabled,
+			userOpenIds: registered.panel.users,
+			items: panelItems(),
+			// 扁平键 menuItems：与 Go 侧 PanelDefinition.MenuItems 对齐。
+			menuItems: registered.menu.enabled
+				? buildMenuItems({ bridge: menuItems(), commands: descriptors, label: config.dshMenuLabel })
+				: [],
+		}
+	}
+
+	/**
+	 * 启动预热：把**被 QQ 绑定的会话**加载进内存（fire-and-forget，失败只记日志）。
+	 *
+	 * 为什么要在注册时做：菜单里的「dsh 命令」二级菜单按 agent 枚举，dsh web 刚重启时
+	 * 一个 agent 都没有 ⇒ 菜单缺一块、QQ 里发 `/xxx` 也会被判"没有会话"。把绑定的会话
+	 * 拉起来，菜单和斜杠命令就都回来了。**只加载绑定会话**（不是全部会话）：
+	 * 重启后把几十个会话全塞进内存，内存和启动时间都要遭殃。
+	 *
+	 * 幂等：`agentFor` 对活 agent 直接返回，所以每 5 分钟一次的周期重同步不会重复恢复，
+	 * 也不会重复请求同步菜单（`requestMenuSync` 只在"冷→活"那一跳触发）。
+	 */
+	let warming = false
+	async function warmBoundSessions(reason) {
+		if (warming) return
+		warming = true
+		try {
+			const sessionIds = [...new Set(Object.values(state.get().bindings ?? {}).filter((id) => id && id !== 'none'))]
+			if (sessionIds.length === 0) return
+			let loaded = 0
+			for (const sessionId of sessionIds) {
+				try {
+					const agent = await agentFor(sessionId)
+					if (agent) loaded += 1
+					else state.note(`预热失败（${reason}）：会话打不开 ${String(sessionId).slice(-8)}`)
+				} catch (error) {
+					state.note(`预热失败（${reason}）：${String(sessionId).slice(-8)} :: ${describeError(error)}`)
+				}
+			}
+			state.note(`预热（${reason}）：绑定会话 ${loaded}/${sessionIds.length} 已在内存`)
+		} finally {
+			warming = false
+		}
+	}
+
 	let socketServer = null
 	let socketClosed = false
 	createSocketServer({
@@ -2353,28 +2459,14 @@ export function apply(ctx, rawConfig) {
 				}
 				// 网关连上了 = 现在发 QQ 才有意义：这时才做"上次被打断"的启动提醒（只发一次）。
 				void notifyInterruptedOnce()
+				// 绑定会话加载进内存（fire-and-forget）：加载完会自己 requestMenuSync，
+				// 网关那边"菜单缺 dsh 命令"的快速重试也会兜住这一次。
+				void warmBoundSessions('注册同步').catch((error) =>
+					logger.warn?.('预热绑定会话失败', { error: String(error) }),
+				)
 				return { ok: true }
 			},
-			panel: async () => {
-				// dsh 内置命令收进二级菜单（顶层留给桥自己的命令）。
-				// 命令是按 agent 作用域的，所以挑一个代表：优先"被 QQ 绑定的活会话"，
-				// 其次任意活会话；都没有时只发桥命令（下次网关重同步时再补齐）。
-				const descriptors = await listCommands(ctx.commands, representativeAgent(), logger)
-				return {
-					scope: 'c2c',
-					targetType: 'specific',
-					// enabled / menuEnabled 只是把 register 收到的意图回显出来，方便直接用
-					// socket 排查；**是否真的发布以 Go 侧 config.yaml 为准**（配置唯一来源在那）。
-					enabled: registered.panel.enabled,
-					menuEnabled: registered.menu.enabled,
-					userOpenIds: registered.panel.users,
-					items: panelItems(),
-					// 扁平键 menuItems：与 Go 侧 PanelDefinition.MenuItems 对齐。
-					menuItems: registered.menu.enabled
-						? buildMenuItems({ bridge: menuItems(), commands: descriptors, label: config.dshMenuLabel })
-						: [],
-				}
-			},
+			panel: async () => buildPanelPayload(),
 			event: async (args) => {
 				// 立即返回，异步处理：QQ 的事件回调不该被这里拖住。
 				void onQQEvent(args).catch((error) => logger.warn?.('处理 QQ 事件失败', { error: String(error) }))

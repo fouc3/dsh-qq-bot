@@ -16,6 +16,9 @@ const RETRANSMIT_ON_FAILURE = {
 	respond_interaction: true,
 	recall_c2c: false,
 	publish_panel: false,
+	// "请重同步内置菜单" 只是"内容变过了"的提示：失败了下次会话加载还会再发一次，
+	// 而且网关自己每 5 分钟也会重同步，无需重投（重投反而可能在断线时堆一串）。
+	resync_panel: false,
 }
 
 /** 平台错误码里明确"过一会儿再来"的。 */

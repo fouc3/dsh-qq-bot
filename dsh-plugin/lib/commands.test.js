@@ -238,10 +238,29 @@ test('切换会话：无参=会话选择；带会话id=绑定；none=解绑', as
 	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('切换会话 session-2'))
 	assert.equal(s.bindingOf('U1'), 'session-2')
 	assert.match(calls.replies.at(-1).content, /已接入/)
+	// 切过去就把会话加载进内存（用户要求：加载会话 ⇒ 立刻同步内置菜单；
+	// dsh 内置命令按 agent 枚举，没有活 agent 时菜单里那一块会消失）。
+	assert.deepEqual(calls.loaded, ['session-2'])
 
 	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('切换会话 none'))
 	assert.equal(s.bindingOf('U1'), null)
 	assert.match(calls.replies.at(-1).content, /解除绑定/)
+	assert.deepEqual(calls.loaded, ['session-2'], '解绑不该去加载任何会话')
+})
+
+// 加载失败**不影响绑定**（刻意的）：菜单少一块不该让人切不了会话，
+// 但失败原因要如实写在回复里，别让人以为"切好了、菜单怎么还是缺的"。
+test('切换会话：加载失败仍然绑定，并在回复里如实说明（不影响发消息）', async () => {
+	const { runner, calls, state: s } = makeRunner({
+		seed: boundSeed(),
+		loadResult: { ok: false, error: '会话控制器没能给出 agent（会话不存在、已被归档，或被别的进程占用）' },
+	})
+	await runner.run({ openid: 'U1', replyContext: {} }, parseCommand('切换会话 session-2'))
+	assert.equal(s.bindingOf('U1'), 'session-2', '绑定必须生效')
+	const content = calls.replies.at(-1).content
+	assert.match(content, /已接入/)
+	assert.match(content, /没能加载进内存/)
+	assert.match(content, /不影响发消息/)
 })
 
 test('切换会话：归档会话不能接入', async () => {

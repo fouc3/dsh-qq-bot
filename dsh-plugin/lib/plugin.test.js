@@ -1268,6 +1268,88 @@ test('冷会话恢复：没有任何控制器恢复入口时**绝不**裸恢复�
 	boot.dispose()
 })
 
+// ── 会话加载 ⇄ 内置菜单同步 ─────────────────────────────────────────────────
+// dsh 内置命令是 **agent 作用域**的（`ctx.commands.list(agent)`），所以"会话没有活 agent"
+// ⇒ 菜单里没有「dsh 命令」二级菜单（线上症状：切到冷会话后那一块整块消失）。
+// 约定：**每次有会话被加载进内存，就请求网关重同步一次菜单**；网关侧 `resync_panel`
+// 落到 `ensureRegistered`（面板 remark/开关的权威在 Go 的 config.yaml）。
+
+test('端到端：切会话即加载——目标会话进内存，并请求网关重同步内置菜单', async (t) => {
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: {} })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', {
+		openids: [{ openid: 'U1' }],
+		panel: { enabled: true, users: ['U1'] },
+		menu: { enabled: true },
+	})
+
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-2', msgId: 'M1' })
+	// 不用等第一条消息：切过去就加载了（有 agent 才有 dsh 命令菜单）
+	await waitFor(() => boot.ctx.agents.get('session-2') ?? null)
+	assert.ok(boot.ctx.sessionController.resolvedVia.includes('session-2'), '走控制器的 resolveAgent')
+
+	const sync = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'resync_panel') ?? null
+	})
+	assert.match(String(sync.args?.reason ?? ''), /会话加载/, '要说明为什么要求重同步（排查用）')
+
+	boot.dispose()
+})
+
+test('端到端：注册同步时预热绑定会话（重启后菜单不再缺 dsh 命令；不碰没绑定的会话）', async (t) => {
+	const boot = bootPlugin(t, {
+		sessions: SUMMARIES,
+		live: {},
+		stateSeed: { bindings: { U1: 'session-2' } },
+	})
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', {
+		openids: [{ openid: 'U1' }],
+		panel: { enabled: true, users: ['U1'] },
+		menu: { enabled: true },
+	})
+
+	// 绑定会话被拉进内存（fire-and-forget，不阻塞注册）
+	await waitFor(() => boot.ctx.agents.get('session-2') ?? null)
+	assert.equal(boot.ctx.agents.get('session-1'), undefined, '只加载绑定会话，不把全部会话塞进内存')
+
+	const sync = await waitFor(async () => {
+		const list = await drainFor(boot.socketPath, 80)
+		return list.find((c) => c.kind === 'resync_panel') ?? null
+	})
+	assert.match(String(sync.args?.reason ?? ''), /会话加载/)
+
+	boot.dispose()
+})
+
+// 高频道上的事：发消息唤醒冷会话也算"加载"，同样要同步菜单；
+// 但**已经在内存里的会话再发消息不该再请求**（否则每条消息都多一轮 register+panel）。
+test('端到端：消息唤醒冷会话也请求重同步；活着的会话不再重复请求', async (t) => {
+	const boot = bootPlugin(t, { sessions: SUMMARIES, live: {}, stateSeed: { bindings: { U1: 'session-2' } } })
+	await waitFor(() => existsSync(boot.socketPath))
+	await rpc(boot.socketPath, 'register', {
+		openids: [{ openid: 'U1' }],
+		panel: { enabled: true, users: ['U1'] },
+		menu: { enabled: true },
+	})
+	// 先把"注册预热"那一轮同步收干净，下面只看"发消息"这一次
+	await waitFor(() => boot.ctx.agents.get('session-2') ?? null)
+	await waitFor(async () => (await drainFor(boot.socketPath, 80)).find((c) => c.kind === 'resync_panel') ?? null)
+
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '再来一条', msgId: 'M2' })
+	const agent = boot.ctx.agents.get('session-2')
+	await waitFor(() => agent.followed.length > 0)
+	const afterLive = await drainFor(boot.socketPath, 120)
+	assert.equal(
+		afterLive.filter((c) => c.kind === 'resync_panel').length,
+		0,
+		'agent 已经在内存里了，不该再请求同步',
+	)
+
+	boot.dispose()
+})
+
 test('端到端：agent 作用域收不到事件时，根作用域的 session/event 也能认领轮次并发出「已结束」', async (t) => {
 	const agent = makeAgent('session-1')
 	const boot = bootPlugin(t, { sessions: SUMMARIES, live: { 'session-1': agent } })

@@ -109,6 +109,19 @@ test('撤回失败不重投（尽力而为）', async () => {
 	assert.deepEqual(await outbox.poll({ waitSeconds: 0 }), [])
 })
 
+// `resync_panel` 只是一句"内容变过了"的提示：网关自己有周期重同步，下次加载会话
+// 还会再发一次。断线时重投只会堆一串过期请求，所以失败就不管它。
+test('请求重同步内置菜单失败不重投（下次加载会话会再发）', async () => {
+	const outbox = createOutbox({})
+	outbox.enqueue('resync_panel', { reason: '会话加载' })
+	const commands = await outbox.poll({ waitSeconds: 0 })
+	assert.equal(commands[0].kind, 'resync_panel')
+	outbox.ack({ id: commands[0].id, ok: false, errorCode: 50002, error: '频率限制' })
+
+	assert.equal(outbox.depth(), 0, '即使是可以重试的限速错，也不该重投')
+	assert.deepEqual(await outbox.poll({ waitSeconds: 0 }), [])
+})
+
 test('超时未 ack 的命令会重新排到待下发，且沿用原 id', async () => {
 	let clock = 0
 	const outbox = createOutbox({ inflightTimeoutMs: 100, now: () => clock })

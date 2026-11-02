@@ -486,9 +486,17 @@ export function createCommandRunner(deps) {
 		}
 		state.setBinding(openid, target.sessionId)
 		state.setLastCard(openid, null)
+		// 切过去就**把这个会话加载进内存**（用户要求：加载会话 ⇒ 立即同步内置菜单）。
+		// dsh 内置命令是按 agent 作用域枚举的：目标会话没有活 agent 时，QQ 菜单里的
+		// 「dsh 命令」整块会消失（线上症状），所以绑定完立刻唤醒一次。
+		// **加载失败不影响绑定**（这是刻意的）：菜单少一块不该让人切不了会话；
+		// 之后发第一条消息时 `deliver` 还会再唤醒一次，失败原因也如实体现在回复里。
+		const canLoad = typeof deps.loadSession === 'function'
+		const loaded = canLoad ? ((await deps.loadSession(target.sessionId)) ?? { ok: false, error: '加载失败（无返回）' }) : null
+		const loadHint = loaded && !loaded.ok ? `\n> 但会话没能加载进内存（${loaded.error ?? '未知原因'}）；不影响发消息，发第一条时会再唤醒一次。` : ''
 		await deps.reply({
 			openid,
-			content: `已接入 **${sessions.describe(target.sessionId)}**\n> 直接发消息就会进这个会话；会话在跑时会先打断。`,
+			content: `已接入 **${sessions.describe(target.sessionId)}**\n> 直接发消息就会进这个会话；会话在跑时会先打断。${loadHint}`,
 			markdown: true,
 			replyContext,
 		})
