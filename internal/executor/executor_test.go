@@ -7,6 +7,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -490,3 +491,62 @@ func TestPublishPanelCommand(t *testing.T) {
 }
 
 func sContains(s, sub string) bool { return strings.Contains(s, sub) }
+
+// `resync_panel` 是插件发来的"内容变过了，你重新同步面板"的请求：
+// 真正的面板定义/remark/开关在 Go 侧（config.yaml 是唯一权威），所以这里只调注入的实现。
+func TestResyncPanelCommand(t *testing.T) {
+	exec, acker, rec := setup(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{}`))
+	}, qq.MediaConfig{})
+
+	calls := 0
+	exec.SetResync(func(context.Context) error {
+		calls++
+		return nil
+	})
+
+	exec.Run(context.Background(), []bridge.Command{command(t, "c-resync", "resync_panel", map[string]any{
+		"reason": "会话加载",
+	})})
+
+	acks := acker.list()
+	if len(acks) != 1 || !acks[0].OK {
+		t.Fatalf("重同步菜单应成功：%+v", acks)
+	}
+	if calls != 1 {
+		t.Fatalf("应恰好调用一次注入的重同步实现，实际 %d 次", calls)
+	}
+	if len(rec.list()) != 0 {
+		t.Errorf("重同步由注入实现负责，执行器自己不该直接打 QQ 接口：%+v", rec.list())
+	}
+}
+
+// 注入失败时要如实 ack 失败（插件侧不重投，但日志/排查能看到原因）。
+func TestResyncPanelReportsFailure(t *testing.T) {
+	exec, acker, _ := setup(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{}`))
+	}, qq.MediaConfig{})
+	exec.SetResync(func(context.Context) error { return errors.New("register 失败：通道断开") })
+
+	exec.Run(context.Background(), []bridge.Command{command(t, "c-resync-bad", "resync_panel", map[string]any{})})
+
+	acks := acker.list()
+	if len(acks) != 1 || acks[0].OK || !strings.Contains(acks[0].Error, "register 失败") {
+		t.Fatalf("重同步失败要如实回报：%+v", acks)
+	}
+}
+
+// 没注入实现（理论上 main 一定会注入）：明确报错，不要静默成功 —— 否则"菜单没同步"
+// 会变成一个查不出原因的悬案。
+func TestResyncPanelWithoutHookIsAnError(t *testing.T) {
+	exec, acker, _ := setup(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{}`))
+	}, qq.MediaConfig{})
+
+	exec.Run(context.Background(), []bridge.Command{command(t, "c-resync-nil", "resync_panel", map[string]any{})})
+
+	acks := acker.list()
+	if len(acks) != 1 || acks[0].OK || !strings.Contains(acks[0].Error, "未注入") {
+		t.Fatalf("没注入实现时应报错：%+v", acks)
+	}
+}

@@ -118,6 +118,13 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// 插件在"某个会话的 agent 刚被加载"之后会发 `resync_panel`：这里把它接到同一个
+	// ensureRegistered 上 —— 面板定义/remark/开关的权威都在 Go 侧，插件只请求同步。
+	exec.SetResync(func(resyncCtx context.Context) error {
+		_, err := ensureRegistered(resyncCtx, cfg, channel, exec, logger, false)
+		return err
+	})
+
 	// 本地通道：注册 + 面板发布（重试到成功）+ outbox 长轮询。
 	go bridgeLoop(ctx, cfg, channel, exec, logger)
 	go panelResyncLoop(ctx, cfg, channel, exec, logger)

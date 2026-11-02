@@ -20,6 +20,12 @@ type Acker interface {
 	Ack(ctx context.Context, a bridge.Ack) error
 }
 
+// ResyncFunc 让网关立即重算并发布指令面板与自定义菜单。
+//
+// 插件在"某个会话的 agent 刚被加载"（切会话、加载会话、发消息拉起冷会话、启动加载绑定会话）
+// 之后调一次，好让菜单里的 dsh 内置命令当场补齐，而不是等下一个重同步周期。
+type ResyncFunc func(ctx context.Context) error
+
 // Executor 执行出站命令（docs/protocol.md 第 4 节）。
 type Executor struct {
 	qq     *qq.Client
@@ -27,6 +33,9 @@ type Executor struct {
 	dedupe *Dedupe
 	media  qq.MediaConfig
 	log    *slog.Logger
+	// resync 是 `resync_panel` 出站命令的落地：由 main 注入（它才持有 cfg/channel）。
+	// 面板内容/remark/开关的权威都在 Go 侧，所以插件只发"请求同步"，不自己拼面板定义。
+	resync ResyncFunc
 }
 
 // New 构造执行器。
@@ -38,6 +47,14 @@ func New(client *qq.Client, acker Acker, dedupe *Dedupe, media qq.MediaConfig, l
 		dedupe = &Dedupe{limit: 512, seen: map[string]struct{}{}}
 	}
 	return &Executor{qq: client, acker: acker, dedupe: dedupe, media: media, log: log}
+}
+
+// SetResync 注入"立即重同步面板"的实现（`resync_panel` 出站命令用）。
+//
+// 单独做成 setter 而不是改 New 的参数：New 在测试里被大量调用，
+// 而重同步依赖 cfg/channel/exec 三者，只有 main 组装得起来。
+func (e *Executor) SetResync(fn ResyncFunc) {
+	e.resync = fn
 }
 
 // Run 处理一批命令：逐条执行并逐条 ack。
@@ -89,9 +106,23 @@ func (e *Executor) execute(ctx context.Context, cmd bridge.Command) (string, err
 		return "", e.respond(ctx, cmd.Args)
 	case "publish_panel":
 		return "", e.publishPanel(ctx, cmd.Args)
+	case "resync_panel":
+		return "", e.resyncPanel(ctx)
 	default:
 		return "", fmt.Errorf("未知出站命令类型 %q", cmd.Kind)
 	}
+}
+
+// resyncPanel 处理插件发来的"立即重同步面板"请求。
+//
+// 不带参数：真正的面板定义、remark、开关都在 Go 侧（config.yaml 是唯一权威），
+// 所以这里只调 main 注入的 ensureRegistered —— 它会重新向插件要 register+panel 并发布，
+// 幂等（菜单内容相同则跳过）。
+func (e *Executor) resyncPanel(ctx context.Context) error {
+	if e.resync == nil {
+		return errors.New("网关未配置面板重同步（resync 未注入）")
+	}
+	return e.resync(ctx)
 }
 
 type sendArgs struct {
