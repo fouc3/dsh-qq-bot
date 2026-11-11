@@ -560,6 +560,7 @@ test('register → panel：白名单快照 + 十条命令的面板定义（只�
 		'模型',
 		'角色预设',
 		'加载会话',
+		'命令菜单',
 	])
 	// 扁平键 menuItems：与 Go 侧 PanelDefinition.MenuItems 对齐（大小写不敏感匹配）
 	// 顶层 8 项 = 6 个平铺 + 「管理」+「管理2」两个二级菜单 + 2 个 dsh 命令二级菜单 = 10（平台上限）。
@@ -1787,6 +1788,19 @@ test('端到端：dsh 内置命令从 QQ 直接执行（不进模型）；技能
 	// 绑定会话
 	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '切换会话 session-1', msgId: 'M1' })
 	await waitFor(async () => (await pumpQueue(boot.socketPath)).length > 0)
+
+	// 「命令菜单」：把 dsh 内置命令列成**文本列表**，只有命令那截是可点击标签（点击填输入框）
+	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '命令菜单', msgId: 'M1b' })
+	const menuCard = await waitFor(async () => {
+		const list = await pumpQueue(boot.socketPath)
+		return list.find((c) => c.kind === 'send_c2c' && String(c.args.content).includes('dsh 内置命令')) ?? null
+	})
+	const menuContent = String(menuCard.args.content)
+	assert.match(menuContent, /<qqbot-cmd-input text="%2Fcompact"/, '命令应做成"点击填输入框"的标签')
+	assert.match(menuContent, /压缩以上对话内容/, '介绍要在（且不可点）')
+	assert.ok(!menuContent.includes('feedback'), 'feedback 仍被排除')
+	assert.ok(!menuContent.includes('/feedback'), 'feedback 的命令串也不该出现')
+	assert.equal(menuCard.args.markdown, true, '标签要靠 markdown 才生效')
 
 	// /compact 直接执行，且不进模型
 	await rpc(boot.socketPath, 'event', { kind: 'c2c_message', openid: 'U1', text: '/compact', msgId: 'M2' })

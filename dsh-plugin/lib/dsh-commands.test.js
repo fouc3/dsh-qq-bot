@@ -3,14 +3,17 @@ import assert from 'node:assert/strict'
 
 import {
 	EXCLUDED_COMMANDS,
+	buildDshCommandList,
 	buildMenuItems,
 	buildSubMenus,
+	cmdInputTag,
 	filterCommands,
 	isSlashLine,
 	listCommands,
 	runCommand,
 	splitModeCommand,
 	splitSlashLine,
+	stripTextInteractionTags,
 } from './dsh-commands.js'
 import { menuItems } from './commands.js'
 
@@ -157,8 +160,7 @@ test('runCommand：解析不到返回 handled=false；成功/失败都如实回�
 	assert.deepEqual(await runCommand(undefined, agent, '/compact', {}), { handled: false })
 })
 
-test('splitModeCommand：/plan 带文本拆成「命令 + 消息」；模式词与别的命令不拆', () => {
-	// `/plan <文本>` → 命令只留 /plan，文本交给本桥投递
+test('splitModeCommand：/plan 带文本拆成「命令 + 消息」；模式词与别的命令不拆', () => {	// `/plan <文本>` → 命令只留 /plan，文本交给本桥投递
 	assert.deepEqual(splitModeCommand(splitSlashLine('/plan 参考：/tmp/api.md 来写修改计划')), {
 		command: '/plan',
 		message: '参考：/tmp/api.md 来写修改计划',
@@ -178,4 +180,64 @@ test('splitModeCommand：/plan 带文本拆成「命令 + 消息」；模式词�
 	// 别的命令一律原样
 	assert.deepEqual(splitModeCommand(splitSlashLine('/compact 别的东西')), { command: '/compact 别的东西', message: '' })
 	assert.deepEqual(splitModeCommand(null), { command: '', message: '' })
+})
+
+test('cmdInputTag：点击填入输入框的标签（text/show 都要 urlencode）', () => {
+	assert.equal(
+		cmdInputTag('/compact'),
+		'<qqbot-cmd-input text="%2Fcompact" show="%2Fcompact" reference="false" />',
+	)
+	// show 与 text 不同（显示更短的中文），两个属性都要编码
+	const tag = cmdInputTag('/goal pause', '目标')
+	assert.match(tag, /text="%2Fgoal%20pause"/)
+	assert.match(tag, /show="%E7%9B%AE%E6%A0%87"/)
+	assert.match(tag, /reference="false"/)
+	// 超长文本兜底截到 100 字符
+	const long = cmdInputTag('/x ' + 'a'.repeat(300))
+	const decoded = decodeURIComponent(/text="([^"]*)"/.exec(long)[1])
+	assert.equal(decoded.length, 100)
+})
+
+test('stripTextInteractionTags：剥掉用户点标签后平台回传的 qqbot-cmd-* 标签', () => {
+	// 真实形态（AstrBot #8755）：标签跟着消息正文一起回来
+	assert.equal(
+		stripTextInteractionTags('你好 <qqbot-cmd-input text="/快速英雄云图 " show="快速云图" reference="false" />'),
+		'你好',
+	)
+	// 整条就只有一个标签 → 空串
+	assert.equal(stripTextInteractionTags('<qqbot-cmd-input text="/compact" show="/compact" reference="false" />'), '')
+	// enter 型也剥（标签去掉后余下「前  后」，两端 trim）
+	assert.equal(stripTextInteractionTags('前 <qqbot-cmd-enter text="/compact" /> 后'), '前  后')
+	// 无标签原样返回（不改写、不 trim 内部），非字符串给空串
+	assert.equal(stripTextInteractionTags('普通消息'), '普通消息')
+	assert.equal(stripTextInteractionTags(undefined), '')
+	assert.equal(stripTextInteractionTags(null), '')
+})
+
+test('buildDshCommandList：文本列表，每条「介绍 + 可点命令」，命令带 hint', () => {
+	const commands = filterCommands(DESCRIPTORS)
+	const { content, count, truncated } = buildDshCommandList(commands, { title: 'dsh 内置命令' })
+	assert.equal(count, commands.length)
+	assert.equal(truncated, 0)
+	assert.match(content, /^\*\*dsh 内置命令\*\*/)
+	// 第一行是 compact：介绍在前（不可点）、命令在 <qqbot-cmd-input> 里（可点）
+	assert.match(content, /- 压缩以上对话内容 <qqbot-cmd-input text="%2Fcompact" show="%2Fcompact"/)
+	// 带参数提示：提示写进介绍里（不可点），可点的只有 `/goal` 本身（不塞占位符）
+	const withHint = buildDshCommandList(
+		[{ name: 'goal', description: '设置或查看长期任务目标', hint: '[pause|resume]' }],
+		{ title: 't' },
+	).content
+	assert.match(withHint, /- 设置或查看长期任务目标（\[pause\|resume\]） <qqbot-cmd-input text="%2Fgoal" show="%2Fgoal"/)
+	assert.ok(!/%2Fgoal%20/.test(withHint), '可点的那截不该塞 [hint] 占位符')
+	// 没有 markdown 表格 / 按钮
+	assert.doesNotMatch(content, /\|/)
+	// 空命令表给一句说明，不抛
+	const empty = buildDshCommandList([], {})
+	assert.equal(empty.count, 0)
+	assert.match(empty.content, /没有可用的 dsh 命令/)
+	// limit 超限时如实报"还有 N 条没列出"
+	const cut = buildDshCommandList(commands, { limit: 3 })
+	assert.equal(cut.count, 3)
+	assert.equal(cut.truncated, commands.length - 3)
+	assert.match(cut.content, new RegExp(`还有 ${commands.length - 3} 条没列出`))
 })

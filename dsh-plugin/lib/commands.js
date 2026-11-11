@@ -7,6 +7,8 @@
  * 通用规则：需要参数却没给参数的命令，回复"作用 + 用法"。
  */
 
+import { buildDshCommandList } from './dsh-commands.js'
+
 /** 命令表。selection 为真的命令在无参时进入"会话选择"语义而不是回用法。 */
 export const COMMANDS = [
 	{
@@ -149,6 +151,18 @@ export const COMMANDS = [
 			'变成"空闲"，之后 `状态` 就能读到它的动作与输出。不带参数时作用于**当前绑定会话**。',
 		usage: '加载会话',
 		usageAlt: '加载会话 <会话id>              # 加载指定会话',
+	},
+	{
+		name: '命令菜单',
+		desc: '列出 dsh 命令（点即填输入框）',
+		// 底部自定义菜单顶层早已占满 10 项（6 平铺 + 「管理」+「管理2」+ 2 个 dsh 子菜单），
+		// 这条又是"低频但要有"的列表出口：只在指令面板 + 打字可用（同「快捷 补位」的思路）。
+		hiddenInMenu: true,
+		purpose:
+			'把**这个会话可用的 dsh 内置命令**（`/compact` 压缩、`/goal`、`/plan`、`/permission`…）' +
+			'列成一段**文本列表**：每条是「介绍 + 命令」，**只有命令那一截可点击**，点一下把命令' +
+			'**填进输入框**（不直接发），自己再按发送。不是子菜单、也不是按钮，就是一段文本。',
+		usage: '命令菜单',
 	},
 ]
 
@@ -325,6 +339,8 @@ export function createCommandRunner(deps) {
 				return presetMode(context, parsed)
 			case '加载会话':
 				return loadSession(context, parsed)
+			case '命令菜单':
+				return dshCommandMenu(context, parsed)
 			default:
 				return { handled: false }
 		}
@@ -445,6 +461,41 @@ export function createCommandRunner(deps) {
 			markdown: true,
 			replyContext,
 		})
+		return { handled: true }
+	}
+
+	/**
+	 * `命令菜单`：把 dsh 内置命令列成**文本列表**（不是子菜单、不是按钮）。
+	 *
+	 * 每行「介绍 + 命令」，命令那一截用 `<qqbot-cmd-input>` 做成可点击、点了**填进输入框**；
+	 * 介绍不可点。数据来自 `deps.listDshCommands`（就是 `ctx.commands.list(agent)`，
+	 * 与「dsh 命令」二级菜单同一个来源）。
+	 */
+	async function dshCommandMenu({ openid, replyContext }, parsed) {
+		// 允许 `命令菜单 <会话id>` 看某个会话的可用命令（大多是同一套，但作用域命令可能不同）。
+		let sessionId = currentSessionId(openid)
+		if (parsed.tokens.length > 0) {
+			const target = sessions.resolveRef(parsed.tokens)
+			if (target?.error) {
+				await deps.reply({ openid, content: `${target.error}\n\n${usageText('命令菜单')}`, replyContext })
+				return { handled: true }
+			}
+			if (target?.sessionId && target.sessionId !== 'none') sessionId = target.sessionId
+		}
+		if (!sessionId || sessionId === 'none') {
+			await deps.reply({
+				openid,
+				content:
+					'当前没有绑定会话，列不出 dsh 命令。先 `切换会话` 接一个，再用 `命令菜单`；' +
+					'或用 `命令菜单 <会话id>` 看某个会话的。',
+				markdown: true,
+				replyContext,
+			})
+			return { handled: true }
+		}
+		const commands = (await deps.listDshCommands?.(sessionId)) ?? []
+		const list = buildDshCommandList(commands, { title: `dsh 内置命令（${sessions.label(sessionId)}）` })
+		await deps.reply({ openid, content: list.content, markdown: true, replyContext })
 		return { handled: true }
 	}
 

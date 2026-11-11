@@ -1,10 +1,12 @@
 /**
  * dsh 内置命令（Human-command registry）与 QQ 之间的桥。
  *
- * 两件事：
+ * 三件事：
  *   1. 枚举某个 agent 当前的有效命令（`ctx.commands.list(agent)`），用于把
  *      **dsh 内置命令收进 QQ 菜单的二级菜单**（顶层留给桥自己的命令）；
- *   2. 把 QQ 里发来的 `/xxx` 直接交给 `ctx.commands.execute(agent, line, [], signal)`
+ *   2. 把同一个命令表渲染成**文本列表菜单**（`命令菜单` 命令）：每条「介绍 + 命令」，
+ *      只有命令这部分用 `<qqbot-cmd-input>` 做成可点击、点了**填进输入框**（介绍不可点）；
+ *   3. 把 QQ 里发来的 `/xxx` 直接交给 `ctx.commands.execute(agent, line, [], signal)`
  *      执行 —— 这是一条不经过模型的"人类命令"通路。
  *
  * 边界（用户明确要求）：
@@ -92,6 +94,92 @@ export function buildSubMenus(commands, { label = 'dsh 命令', topLevelBudget =
 			sendMessage: `/${cmd.name}`,
 		})),
 	}))
+}
+
+/**
+ * 文本交互标签：`<qqbot-cmd-input>` / `<qqbot-cmd-enter>`。
+ *
+ * 这两个是 QQ 的**内容语法**（不是请求字段），直接写在 markdown 正文里就能变成
+ * 可点击的文本标签（官方《文本交互》文档）：
+ *   - `qqbot-cmd-input`：点击把 text **填进输入框**，用户自己编辑/发送 —— 本桥要的就是这个；
+ *   - `qqbot-cmd-enter`：点击**直接发送**（单聊可用，群聊不支持），不是我们要的语义。
+ *
+ * 坑：用户点了这种标签后，QQ 会把**标签本身**跟着消息一起回传，例如
+ *   `你好 <qqbot-cmd-input text="/compact" show="/compact" reference="false" />`
+ * （见 AstrBot #8755 的真实反馈）。不清掉它，标签会原样投给 AI 污染上下文，
+ * 也会让本桥的命令解析失效，所以入站统一先剥掉。
+ */
+const CMD_TAG_RE = /<qqbot-cmd-(?:input|enter)\b[^>]*\/?>/gi
+
+/** 从正文里剥掉 `<qqbot-cmd-input>` / `<qqbot-cmd-enter>` 标签（入站用）。 */
+export function stripTextInteractionTags(text) {
+	if (typeof text !== 'string' || !text.includes('<qqbot-cmd-')) return typeof text === 'string' ? text : ''
+	return text.replace(CMD_TAG_RE, '').trim()
+}
+
+/** 把一段文本编码进标签属性（官方要求 urlencode；`show` 也是）。 */
+function tagAttr(text) {
+	return encodeURIComponent(String(text))
+}
+
+/**
+ * 可点击的「填入输入框」文本标签。`show` 是用户在消息里**看到的**文字（不填默认取 text），
+ * 两处都限制 ≤100 字符，这里给个兜底断言式截断。
+ */
+export function cmdInputTag(text, show) {
+	const value = String(text ?? '')
+	const shown = String(show ?? text ?? '')
+	return `<qqbot-cmd-input text="${tagAttr(value.slice(0, 100))}" show="${tagAttr(shown.slice(0, 100))}" reference="false" />`
+}
+
+/** 去掉行内就失效的 markdown 符号（这些行末尾要拼标签，带 `*`/`` ` `` 会把标签吞进格式里）。 */
+function plainInline(text) {
+	return String(text ?? '').replace(/[*_`~]/g, '').replace(/\s+/g, ' ').trim()
+}
+
+/** 介绍部分最多留多少字（平台标签上限 100，多留点余量给命令）。 */
+const LIST_DESC_LIMIT = 48
+
+/**
+ * 把命令表渲染成**文本列表菜单**（用户 2026-11-12 的要求）。
+ *
+ * 用户明确要求：
+ *   - **不是子菜单、不是按钮**，就是一段文本列表；
+ *   - 每条是「介绍 + 命令」，**只有命令那部分可点击**，介绍不可点；
+ *   - 点击的效果是**把命令填进输入框**（不是直接发送）。
+ *
+ * 所以每行形如 `- 压缩以上对话内容 /compact`，但把 `/compact` 换成
+ * `<qqbot-cmd-input text="/compact" show="/compact">` —— 客户端把它渲染成一个可点标签，
+ * 点了就把 `/compact` 塞进输入框。
+ *
+ * @param {Array<{name:string, description?:string, hint?:string}>} commands
+ * @param {object} [options]
+ * @param {string} [options.title] 列表标题
+ * @param {number} [options.limit] 最多列几条（默认 0 = 全列）
+ * @returns {{content:string, count:number, truncated:number}}
+ */
+export function buildDshCommandList(commands, { title = 'dsh 内置命令', limit = 0 } = {}) {
+	const all = Array.isArray(commands) ? commands : []
+	const shown = limit > 0 ? all.slice(0, limit) : all
+	const lines = [`**${title}**`, '> 点命令那一截 = 填进输入框（不直接发），再自己按发送。']
+	if (shown.length === 0) {
+		lines.push('', '这个会话现在没有可用的 dsh 命令（可能没有活会话，先 `切换会话` 接一个再来）。')
+		return { content: lines.join('\n'), count: 0, truncated: 0 }
+	}
+	lines.push('')
+	for (const cmd of shown) {
+		// 介绍先截断，再拼参数提示 —— 否则会把 `（[pause|resume]）` 从中间切断（`（[pa`）。
+		let desc = plainInline(cmd.description || '').slice(0, LIST_DESC_LIMIT)
+		const hint = plainInline(cmd.hint || '')
+		// 参数提示放在**介绍里**（不可点），不要塞进可点命令 —— 否则点一下输入框里
+		// 会多出 `[pause|resume]` 这种占位符，用户还得先删掉。
+		if (hint) desc = desc ? `${desc}（${hint}）` : `（${hint}）`
+		// 可点的那一截只有 `/命令`：点了正好把命令填进输入框。
+		lines.push(desc ? `- ${desc} ${cmdInputTag(`/${cmd.name}`)}` : `- ${cmdInputTag(`/${cmd.name}`)}`)
+	}
+	const truncated = all.length - shown.length
+	if (truncated > 0) lines.push('', `> 还有 ${truncated} 条没列出（输入框标签有长度限制）。`)
+	return { content: lines.join('\n'), count: shown.length, truncated }
 }
 
 /** 组装完整菜单：桥命令在前，dsh 命令收进后面的二级菜单。 */

@@ -37,7 +37,7 @@ function makeSessions() {
 	}
 }
 
-function makeRunner({ seed = {}, modelResult = { ok: true, text: '**DeepSeek / DeepSeek Chat**' }, loadResult = { ok: true } } = {}) {
+function makeRunner({ seed = {}, modelResult = { ok: true, text: '**DeepSeek / DeepSeek Chat**' }, loadResult = { ok: true }, listResult = null } = {}) {
 	const calls = {
 		replies: [],
 		delivered: [],
@@ -52,6 +52,7 @@ function makeRunner({ seed = {}, modelResult = { ok: true, text: '**DeepSeek / D
 		runningCards: [],
 		presetCards: [],
 		presets: [],
+		dshCommandLists: [],
 	}
 	const state = createState({ seed })
 	const runner = createCommandRunner({
@@ -90,6 +91,14 @@ function makeRunner({ seed = {}, modelResult = { ok: true, text: '**DeepSeek / D
 			calls.loaded.push(sessionId)
 			return loadResult
 		},
+		listDshCommands: async (sessionId) => {
+			calls.dshCommandLists.push(sessionId)
+			if (listResult) return listResult
+			return [
+				{ name: 'compact', description: 'Compact older conversation history', hint: '' },
+				{ name: 'goal', description: 'Set or view the goal for a long-running task', hint: '[pause|resume]' },
+			]
+		},
 	})
 	return { runner, calls, state }
 }
@@ -125,7 +134,7 @@ test('需要参数的命令无参时回作用与用法', () => {
 
 test('面板条目与菜单条目都由同一张命令表派生', () => {
 	const items = panelItems()
-	assert.equal(items.length, 13)
+	assert.equal(items.length, 14)
 	assert.deepEqual(items.map((i) => i.name), [
 		'切换会话',
 		'运行中会话',
@@ -140,8 +149,9 @@ test('面板条目与菜单条目都由同一张命令表派生', () => {
 		'模型',
 		'角色预设',
 		'加载会话',
+		'命令菜单',
 	])
-	assert.equal(items.at(-1).desc, '把会话加载进内存（无参=当前会话）')
+	assert.equal(items.at(-1).desc, '列出 dsh 命令（点即填输入框）')
 
 	// 自定义菜单：顶层仍只有 8 项（6 个平铺 + 「管理」+「管理2」两个二级菜单）——
 	// 平台顶层最多 10（=这 8 项 + 2 个 dsh 命令子菜单），得给 dsh 命令留位。
@@ -167,9 +177,48 @@ test('面板条目与菜单条目都由同一张命令表派生', () => {
 		...menu.filter((it) => it.type !== 'menu').map((it) => it.name),
 		...groups.flatMap((g) => g.children.map((it) => it.name)),
 	])
-	const expectInMenu = items.map((i) => i.name).filter((name) => name !== '加载会话' && name !== '模型')
+	const expectInMenu = items
+		.map((i) => i.name)
+		.filter((name) => name !== '加载会话' && name !== '模型' && name !== '命令菜单')
 	assert.deepEqual([...shown].sort(), [...expectInMenu, '模型', '加载会话'].sort())
 	assert.ok(shown.has('模型') && shown.has('加载会话'), '模型与加载会话都在「管理2」里')
+})
+
+// 用户要求（2026-11-12）：新增 `命令菜单` —— 把 dsh 内置命令列成**文本列表**（不是子菜单、
+// 不是按钮），每条「介绍 + 命令」，只有命令那截可点击、点了**填进输入框**。
+test('命令菜单：文本列表 + 只有命令可点（qqbot-cmd-input），介绍不可点', async () => {
+	const { runner, calls } = makeRunner({ seed: boundSeed() })
+	const out = await runner.run({ openid: 'U1', quote: '' }, { name: '命令菜单', tokens: [], rest: '' })
+	assert.equal(out.handled, true)
+	assert.deepEqual(calls.dshCommandLists, ['session-1'], '按当前绑定会话枚举 dsh 命令')
+
+	const content = calls.replies.at(-1).content
+	// 是列表，不是按钮/子菜单：没有 markdown 表格，也没有任何按钮语义
+	assert.doesNotMatch(content, /\|.*\|/, '不该是表格')
+	assert.doesNotMatch(content, /menu|button/i, '不该出现按钮/子菜单字样')
+	// 每条：介绍 + 可点击命令
+	assert.match(content, /Compact older conversation history/)
+	assert.match(content, /<qqbot-cmd-input text="%2Fcompact" show="%2Fcompact" reference="false" \/>/)
+	// 带参数提示的命令：可点的只有 `/goal`，hint 写在介绍里（不塞进输入框）
+	assert.match(content, /text="%2Fgoal" show="%2Fgoal"/)
+	assert.ok(!/%2Fgoal%20/.test(content), '可点的那截不该塞 [hint] 占位符')
+	// 介绍文本本身不在标签里（不可点）——介绍原样留在标签之外
+	assert.match(content, /^- Compact older conversation history <qqbot-cmd-input/m)
+})
+
+test('命令菜单：没绑定会话时明确回绝（不炸、不列空表）', async () => {
+	const { runner, calls } = makeRunner()
+	const out = await runner.run({ openid: 'U1', quote: '' }, { name: '命令菜单', tokens: [], rest: '' })
+	assert.equal(out.handled, true)
+	assert.equal(calls.dshCommandLists.length, 0, '没有会话就不枚举')
+	assert.match(calls.replies.at(-1).content, /没有绑定会话/)
+})
+
+test('命令菜单 <会话id>：看指定会话的可用命令', async () => {
+	const { runner, calls } = makeRunner({ seed: boundSeed() })
+	const out = await runner.run({ openid: 'U1', quote: '' }, { name: '命令菜单', tokens: ['session-2'], rest: 'session-2' })
+	assert.equal(out.handled, true)
+	assert.deepEqual(calls.dshCommandLists, ['session-2'])
 })
 
 // 用户要求（2026-10-16）：新增 `运行中会话`（无参发卡片；带会话id 直接切）。

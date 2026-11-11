@@ -64,6 +64,7 @@ import {
 	runCommand,
 	splitSlashLine,
 	splitModeCommand,
+	stripTextInteractionTags,
 } from './lib/dsh-commands.js'
 
 export const name = 'dsh-qq-bot'
@@ -1672,6 +1673,12 @@ export function apply(ctx, rawConfig) {
 				return { ok: false, error: describeError(error) }
 			}
 		},
+		// 「命令菜单」：把这个会话可用的 dsh 内置命令列成文本列表（与「dsh 命令」二级菜单同源）。
+		// 冷会话先按标准路径拉起来（`agentFor`），命令是 **agent 作用域**的，没 agent 就是空表。
+		listDshCommands: async (sessionId) => {
+			const agent = await agentFor(sessionId)
+			return listCommands(ctx.commands, agent, logger)
+		},
 		deliver: ({ sessionId, openid, text, interrupt, interruptHinted = false, startHinted = false }) =>
 			deliver({ sessionId, openid, text, interrupt, interruptHinted, startHinted, origin: 'qq', context: {} }),
 		stopSession: async (sessionId) => {
@@ -1851,6 +1858,12 @@ export function apply(ctx, rawConfig) {
 	async function onMessage(event) {
 		const openid = event.openid
 		const context = { msgId: event.msgId ?? '' }
+
+		// 0) 剥掉 QQ 的文本交互标签（`<qqbot-cmd-input>` / `<qqbot-cmd-enter>`）。
+		//    用户点了「命令菜单」里那种可点标签后，平台会**把标签本身跟着消息回传**；
+		//    不剥掉既会污染投给 AI 的上下文，也会让下面的命令解析/斜杠解析全失效。
+		//    无标签时是同一个字符串（stripTextInteractionTags 只在命中时改写），不影响别处。
+		event = { ...event, text: stripTextInteractionTags(event.text) }
 
 		// 1) 桥命令最优先：**即使正在等提问作答，命令也必须先执行** ——
 		//    否则 `停止`/`状态` 这类命令会被提问桥当「其他」答案吃掉。
